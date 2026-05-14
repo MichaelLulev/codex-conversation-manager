@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Codex Conversation Reader</title>
+    <link rel="icon" type="image/png" href="/assets/codex-conversation-reader.png">
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <img class="brand-mark" src="/assets/codex-conversation-reader.png" alt="" aria-hidden="true">
+          <div class="brand-copy">
+            <h1>Codex Conversation Reader</h1>
+            <p id="address-line">Address loading...</p>
+            <p id="source-line">Reading Codex conversations</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button id="refresh-button" type="button">Refresh</button>
+          <button id="export-button" type="button" disabled>Export JSON</button>
+          <button id="copy-id-button" type="button" disabled>Copy ID</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <aside class="thread-panel">
+          <div class="mode-tabs" aria-label="Conversation type">
+            <button id="main-mode-button" type="button" class="active">Main</button>
+            <button id="side-mode-button" type="button">Side</button>
+          </div>
+          <div class="search-row">
+            <input id="search-input" type="search" placeholder="Search main conversations" autocomplete="off">
+          </div>
+          <div class="filter-row" id="main-filter-row">
+            <select id="main-filter-select" aria-label="Main conversation filter">
+              <option value="all">All conversations</option>
+              <option value="with_side">With side conversations</option>
+              <option value="with_forks">With forks</option>
+              <option value="forked">Forked conversations</option>
+            </select>
+          </div>
+          <div class="thread-stats" id="thread-stats">Loading...</div>
+          <div class="thread-list" id="thread-list" aria-label="Conversations"></div>
+        </aside>
+
+        <section class="reader-panel">
+          <div class="notice" id="notice">
+            Main conversations are read from saved Codex rollout transcripts.
+          </div>
+
+          <div id="empty-state" class="empty-state">
+            <div class="empty-brand">
+              <img src="/assets/codex-conversation-reader.png" alt="" aria-hidden="true">
+              <span id="empty-state-message">Select a conversation to read it.</span>
+            </div>
+          </div>
+
+          <article id="conversation-view" class="conversation-view hidden">
+            <div class="conversation-header">
+              <div>
+                <h2 id="conversation-title">Conversation</h2>
+                <p id="conversation-meta"></p>
+              </div>
+              <dl class="meta-grid">
+                <div>
+                  <dt>Thread ID</dt>
+                  <dd id="meta-id"></dd>
+                </div>
+                <div>
+                  <dt>Messages</dt>
+                  <dd id="meta-count"></dd>
+                </div>
+                <div>
+                  <dt>Model</dt>
+                  <dd id="meta-model"></dd>
+                </div>
+                <div>
+                  <dt>Working Dir</dt>
+                  <dd id="meta-cwd"></dd>
+                </div>
+              </dl>
+              <div id="related-panel" class="related-panel hidden"></div>
+              <div class="conversation-search" id="conversation-search">
+                <input id="conversation-search-input" type="search" placeholder="Search this conversation" autocomplete="off" disabled>
+                <div class="conversation-search-actions">
+                  <span id="conversation-search-count" class="conversation-search-count">No search</span>
+                  <button id="conversation-search-prev" type="button" disabled>Prev</button>
+                  <button id="conversation-search-next" type="button" disabled>Next</button>
+                  <button id="conversation-search-clear" type="button" disabled>Clear</button>
+                </div>
+              </div>
+              <fieldset class="message-filters" id="message-filters">
+                <legend>Show</legend>
+                <div class="message-filter-options" id="message-filter-options"></div>
+                <div class="message-filter-actions">
+                  <button id="message-filter-defaults" type="button">Defaults</button>
+                  <button id="message-filter-all" type="button">All</button>
+                </div>
+              </fieldset>
+            </div>
+            <div id="messages" class="messages"></div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
