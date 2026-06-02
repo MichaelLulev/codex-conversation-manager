@@ -352,6 +352,7 @@ function installMessagesFrameResizeSync() {
   }
   if ("ResizeObserver" in window) {
     state.messagesFrameResizeObserver = new ResizeObserver(() => {
+      syncAskCodexLayout();
       scheduleMessagesFrameSync({ frames: 3, delays: [40, 120] });
     });
     for (const element of [
@@ -360,7 +361,8 @@ function installMessagesFrameResizeSync() {
       els.conversationHeader,
       els.relatedPanel,
       els.messageFilters,
-      els.askCodexPanel
+      els.askCodexPanel,
+      els.askCodexQuestion
     ]) {
       if (element) {
         state.messagesFrameResizeObserver.observe(element);
@@ -587,7 +589,9 @@ function resetAskCodex() {
   els.askSelectedButton.disabled = true;
   els.askCodexStatus.textContent = "Uses a compact filtered export.";
   els.askCodexAnswer.classList.add("hidden");
+  els.askCodexPanel.classList.remove("has-answer");
   els.askCodexAnswer.replaceChildren();
+  syncAskCodexLayout();
 }
 
 function updateSelectedTranscriptText() {
@@ -1525,8 +1529,33 @@ function toggleRelatedSection(section, list, toggle) {
 }
 
 function syncConversationChromeResize() {
+  syncAskCodexLayout();
   syncMessagesFrameViewport();
   scheduleMessagesFrameSync({ frames: 4, delays: [40, 120, 300] });
+}
+
+function syncAskCodexLayout() {
+  const panel = els.askCodexPanel;
+  const content = panel?.querySelector(".ask-codex-content");
+  if (!panel || !content) {
+    return false;
+  }
+  if (!panel.open || !panel.classList.contains("has-answer")) {
+    content.style.height = "";
+    content.style.maxHeight = "";
+    content.style.minHeight = "";
+    return false;
+  }
+  const summary = panel.querySelector(".ask-codex-summary");
+  const summaryHeight = Math.ceil(summary?.getBoundingClientRect().height || 0);
+  const availableHeight = Math.max(96, Math.floor(panel.clientHeight - summaryHeight));
+  const heightPx = `${availableHeight}px`;
+  if (content.style.height !== heightPx) {
+    content.style.height = heightPx;
+    content.style.maxHeight = heightPx;
+    content.style.minHeight = "0";
+  }
+  return true;
 }
 
 function renderCompactionItem(checkpoint, summary) {
@@ -4101,6 +4130,7 @@ function prepareAskCodexQuestion(question, statusText) {
   els.askCodexButton.disabled = false;
   els.askCodexStatus.textContent = statusText;
   els.askCodexAnswer.classList.add("hidden");
+  els.askCodexPanel.classList.remove("has-answer");
   els.askCodexAnswer.replaceChildren();
   window.requestAnimationFrame(() => {
     els.askCodexQuestion.focus({ preventScroll: true });
@@ -4124,6 +4154,7 @@ async function askCodexAboutCurrentThread() {
   els.askCodexButton.textContent = "Asking...";
   els.askCodexStatus.textContent = `Sending compact filtered export (${askContext.messageCount} messages, ${formatCount(askContext.context.length)} chars) to Codex...`;
   els.askCodexAnswer.classList.add("hidden");
+  els.askCodexPanel.classList.remove("has-answer");
   els.askCodexAnswer.replaceChildren();
   clearAskCodexNavigationHighlights();
   try {
@@ -4154,6 +4185,8 @@ async function askCodexAboutCurrentThread() {
     if (requestId === state.askCodex.requestId && !isAbortError(error)) {
       els.askCodexAnswer.textContent = error.message || String(error);
       els.askCodexAnswer.classList.remove("hidden");
+      els.askCodexPanel.classList.add("has-answer");
+      syncAskCodexLayout();
       els.askCodexStatus.textContent = "Ask Codex failed.";
     }
   } finally {
@@ -4172,6 +4205,8 @@ function renderAskCodexAnswer(answer) {
   const textValue = String(answer || "");
   els.askCodexAnswer.replaceChildren(renderAskCodexAnswerText(textValue));
   els.askCodexAnswer.classList.toggle("hidden", textValue === "");
+  els.askCodexPanel.classList.toggle("has-answer", textValue !== "");
+  syncAskCodexLayout();
 }
 
 function renderAskCodexAnswerText(value) {
