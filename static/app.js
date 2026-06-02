@@ -585,7 +585,7 @@ function resetAskCodex() {
   els.askCodexQuestion.value = "";
   els.askCodexButton.disabled = true;
   els.askSelectedButton.disabled = true;
-  els.askCodexStatus.textContent = "Uses the full filtered export.";
+  els.askCodexStatus.textContent = "Uses a compact filtered export.";
   els.askCodexAnswer.classList.add("hidden");
   els.askCodexAnswer.replaceChildren();
 }
@@ -4122,7 +4122,7 @@ async function askCodexAboutCurrentThread() {
   const askContext = currentAskCodexContext();
   els.askCodexButton.disabled = true;
   els.askCodexButton.textContent = "Asking...";
-  els.askCodexStatus.textContent = `Sending full filtered export (${askContext.messageCount} messages, ${formatCount(askContext.context.length)} chars) to Codex...`;
+  els.askCodexStatus.textContent = `Sending compact filtered export (${askContext.messageCount} messages, ${formatCount(askContext.context.length)} chars) to Codex...`;
   els.askCodexAnswer.classList.add("hidden");
   els.askCodexAnswer.replaceChildren();
   clearAskCodexNavigationHighlights();
@@ -4218,7 +4218,7 @@ function isValidConversationMessageNumber(messageNumber) {
 
 function currentAskCodexContext() {
   const exportThread = currentFilteredExportThread({ includeNavigationRefs: true });
-  const context = JSON.stringify(exportThread, null, 2);
+  const context = conversationAsCompactAskExport(exportThread);
   return {
     context,
     truncated: false,
@@ -4228,6 +4228,163 @@ function currentAskCodexContext() {
 
 function formatCount(value) {
   return new Intl.NumberFormat().format(value);
+}
+
+function conversationAsCompactAskExport(detail) {
+  const summary = detail.summary || {};
+  const messages = detail.messages || [];
+  const lines = [
+    "CODEX_COMPACT_EXPORT v=1",
+    "FORMAT MSG headers use original message numbers; nav values are clickable GUI targets.",
+    compactObjectLine("SUMMARY", summary, [
+      "id",
+      "kind",
+      "preview",
+      "started",
+      "ended",
+      "updated",
+      "model",
+      "cwd",
+      "app_version",
+      "parent_thread_id",
+      "message_count"
+    ]),
+    compactObjectLine("COUNTS", summary, [
+      "user_count",
+      "assistant_count",
+      "message_count",
+      "log_rows"
+    ])
+  ].filter(Boolean);
+
+  if (detail.metadata) {
+    lines.push(compactObjectLine("META", detail.metadata, Object.keys(detail.metadata).sort()));
+  }
+  if (detail.recovery_note) {
+    lines.push(compactObjectLine("NOTE", { recovery: detail.recovery_note }, ["recovery"]));
+  }
+
+  appendCompactRelated(lines, detail.related || {});
+  appendCompactCheckpoints(lines, "COMPACTION", detail.compactions || []);
+  appendCompactCheckpoints(lines, "ROLLBACK", detail.rollbacks || []);
+
+  lines.push(`MESSAGES count=${messages.length}`);
+  for (const [index, message] of messages.entries()) {
+    const messageNumber = Number.isInteger(message.message_number) ? message.message_number : index + 1;
+    lines.push(compactObjectLine(`MSG ${messageNumber}`, message, [
+      "role",
+      "assistant_stage",
+      "navigation_href",
+      "time",
+      "phase",
+      "line_number",
+      "rolled_back",
+      "rolled_back_at",
+      "rollback_group",
+      "rollback_turns"
+    ]));
+    lines.push("TEXT", message.text || "", "ENDMSG");
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function appendCompactRelated(lines, related) {
+  for (const key of ["parents", "forks", "side"]) {
+    const items = Array.isArray(related[key]) ? related[key] : [];
+    if (items.length === 0) {
+      continue;
+    }
+    lines.push(`RELATED ${key} count=${items.length}`);
+    for (const item of items) {
+      lines.push(compactObjectLine(`REL ${key}`, item, [
+        "id",
+        "kind",
+        "preview",
+        "started",
+        "ended",
+        "updated",
+        "model",
+        "cwd",
+        "parent_thread_id",
+        "meta_label",
+        "message_count",
+        "user_count",
+        "assistant_count"
+      ]));
+    }
+  }
+}
+
+function appendCompactCheckpoints(lines, label, checkpoints) {
+  if (!Array.isArray(checkpoints) || checkpoints.length === 0) {
+    return;
+  }
+  lines.push(`${label}S count=${checkpoints.length}`);
+  for (const checkpoint of checkpoints) {
+    lines.push(compactObjectLine(label, checkpoint, [
+      "ordinal",
+      "line_number",
+      "copy_line_count",
+      "time",
+      "kind",
+      "label",
+      "rollback_turns",
+      "message_index",
+      "summary"
+    ]));
+  }
+}
+
+function compactObjectLine(prefix, object, keys) {
+  const attrs = [];
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(object || {}, key)) {
+      continue;
+    }
+    const value = compactAttributeValue(object[key]);
+    if (value !== "") {
+      attrs.push(`${compactAttributeName(key)}=${value}`);
+    }
+  }
+  return attrs.length > 0 ? `${prefix} ${attrs.join(" ")}` : prefix;
+}
+
+function compactAttributeName(key) {
+  return {
+    app_version: "cli",
+    assistant_count: "assistant",
+    assistant_stage: "stage",
+    copy_line_count: "copy_lines",
+    line_number: "line",
+    message_count: "messages",
+    message_index: "msg_index",
+    navigation_href: "nav",
+    parent_thread_id: "parent",
+    role: "r",
+    rollback_group: "rb_group",
+    rollback_turns: "rb_turns",
+    rolled_back: "rb",
+    rolled_back_at: "rb_at",
+    time: "t",
+    user_count: "user"
+  }[key] || key;
+}
+
+function compactAttributeValue(value) {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+  if (value === false) {
+    return "";
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  const normalized = collapseWhitespace(String(value));
+  if (!normalized) {
+    return "";
+  }
+  return /^[^\s"=]+$/.test(normalized) ? normalized : JSON.stringify(normalized);
 }
 
 function exportCurrentThread() {

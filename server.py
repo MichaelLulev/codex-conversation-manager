@@ -302,12 +302,13 @@ def build_ask_codex_prompt(
         f"Context truncated: {'yes' if context_truncated else 'no'}",
     ]
     return (
-        "You are answering a question about a saved Codex conversation JSON export.\n"
+        "You are answering a question about a saved Codex conversation compact tagged export.\n"
         "Use only the provided export and metadata. Do not inspect files, run commands, "
         "modify files, browse the web, or infer facts that are not supported by the export.\n"
         "If the export is insufficient, say what is missing. When useful, refer to message "
-        "numbers, message_number fields, or role headings from the export. When a reference should be clickable in "
-        "the GUI, use markdown links with the navigation_href target, for example "
+        "numbers from MSG headers or role headings from the export. In MSG headers, r is role, "
+        "stage is assistant stage, t is time, and nav is the GUI scroll target. When a reference should be clickable in "
+        "the GUI, use markdown links with the nav target from the MSG header, for example "
         "[message 123](codex-message:123). To link to specific text inside a message, use a "
         "short exact quote as the label and URL-encode it in the text parameter, for example "
         "[quoted text](codex-message:123?text=quoted%20text).\n\n"
@@ -315,7 +316,7 @@ def build_ask_codex_prompt(
         f"{question}\n\n"
         "Conversation metadata:\n"
         + "\n".join(f"- {item}" for item in metadata)
-        + "\n\nConversation export JSON:\n"
+        + "\n\nConversation compact export:\n"
         f"{context}\n"
     )
 
