@@ -2672,7 +2672,7 @@ function renderMessage(message, index = 0, options = {}) {
 
     const role = document.createElement("span");
     role.className = "role";
-    role.textContent = roleLabel(message.role);
+    role.textContent = messageRoleLabel(message);
     roleElement.append(icon, role);
 
     const headingText = collapsedMessageHeading(message.text || "");
@@ -2686,7 +2686,7 @@ function renderMessage(message, index = 0, options = {}) {
   } else {
     roleElement = document.createElement("span");
     roleElement.className = "role";
-    roleElement.textContent = roleLabel(message.role);
+    roleElement.textContent = messageRoleLabel(message);
   }
 
   const phase = message.phase ? ` | ${message.phase}` : "";
@@ -3462,6 +3462,13 @@ function roleLabel(role) {
   return "You";
 }
 
+function messageRoleLabel(message) {
+  if (message?.role === "assistant") {
+    return message.__finalAssistantReply ? "Assistant reply" : "Assistant interim";
+  }
+  return roleLabel(message?.role);
+}
+
 function renderFormattedText(value) {
   if (String(value).length > MAX_FORMATTED_TEXT_LENGTH) {
     return renderLongPlainText(value);
@@ -4070,7 +4077,7 @@ function conversationAsPlainText(detail) {
 }
 
 function exportRoleLabel(message) {
-  const label = roleLabel(message.role);
+  const label = messageRoleLabel(message);
   return message.rolled_back ? `${label} (rolled back)` : label;
 }
 
