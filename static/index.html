@@ -111,6 +111,20 @@
                   </div>
                 </div>
               </details>
+              <details class="ask-codex-panel" id="ask-codex-panel">
+                <summary class="ask-codex-summary">
+                  <span class="ask-codex-icon" aria-hidden="true"></span>
+                  <span>Ask Codex</span>
+                </summary>
+                <div class="ask-codex-content">
+                  <textarea id="ask-codex-question" rows="3" placeholder="Ask about this conversation" spellcheck="true"></textarea>
+                  <div class="ask-codex-actions">
+                    <button id="ask-codex-button" type="button" disabled>Ask</button>
+                    <span id="ask-codex-status" class="ask-codex-status">Uses the currently filtered conversation text.</span>
+                  </div>
+                  <div id="ask-codex-answer" class="ask-codex-answer hidden"></div>
+                </div>
+              </details>
             </div>
             <iframe id="messages-frame" class="messages-frame" title="Conversation messages" aria-hidden="true" tabindex="-1" scrolling="yes"></iframe>
           </article>

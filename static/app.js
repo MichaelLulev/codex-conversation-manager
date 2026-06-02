@@ -32,6 +32,7 @@ const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
 const SEARCH_WORKER_URL = "/static/search-worker.js";
+const ASK_CODEX_CONTEXT_CHAR_LIMIT = 120000;
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
 const SEARCH_TEXT_CACHE = new WeakMap();
 const MESSAGE_FILTER_STORAGE_KEY = "codex-reader-message-filters";
@@ -101,6 +102,10 @@ const state = {
     resolve: null,
     previousFocus: null
   },
+  askCodex: {
+    requestId: 0,
+    abortController: null
+  },
   conversationSearch: {
     matchGroups: [],
     totalMatches: 0,
@@ -155,6 +160,11 @@ const els = {
   conversationSearchClear: document.getElementById("conversation-search-clear"),
   messageFilterOptions: document.getElementById("message-filter-options"),
   messageFilters: document.getElementById("message-filters"),
+  askCodexPanel: document.getElementById("ask-codex-panel"),
+  askCodexQuestion: document.getElementById("ask-codex-question"),
+  askCodexButton: document.getElementById("ask-codex-button"),
+  askCodexStatus: document.getElementById("ask-codex-status"),
+  askCodexAnswer: document.getElementById("ask-codex-answer"),
   messageFilterDefaults: document.getElementById("message-filter-defaults"),
   messageFilterAll: document.getElementById("message-filter-all"),
   confirmModal: document.getElementById("confirm-modal"),
@@ -332,7 +342,8 @@ function installMessagesFrameResizeSync() {
       els.conversationView,
       els.conversationHeader,
       els.relatedPanel,
-      els.messageFilters
+      els.messageFilters,
+      els.askCodexPanel
     ]) {
       if (element) {
         state.messagesFrameResizeObserver.observe(element);
@@ -539,6 +550,23 @@ function cancelConversationSearchWork() {
       revision: state.conversationSearch.workerRevision
     });
   }
+}
+
+function cancelAskCodexRequest() {
+  state.askCodex.requestId += 1;
+  if (state.askCodex.abortController) {
+    state.askCodex.abortController.abort();
+    state.askCodex.abortController = null;
+  }
+}
+
+function resetAskCodex() {
+  cancelAskCodexRequest();
+  els.askCodexQuestion.value = "";
+  els.askCodexButton.disabled = true;
+  els.askCodexStatus.textContent = "Uses the currently filtered conversation text.";
+  els.askCodexAnswer.classList.add("hidden");
+  els.askCodexAnswer.replaceChildren();
 }
 
 function nextFrame() {
@@ -836,6 +864,7 @@ async function selectThread(threadId, options = {}) {
   els.exportButton.disabled = true;
   els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
+  resetAskCodex();
   try {
     const detail = await fetchJson(modeConfig().detailUrl(threadId), { signal: controller.signal });
     if (requestId !== state.detailRequestId) {
@@ -863,6 +892,7 @@ function clearConversation() {
   state.expandedToolRuns = new Set();
   state.toolRunByMessageIndex = new Map();
   resetConversationSearch();
+  resetAskCodex();
   els.emptyState.classList.remove("hidden");
   els.conversationView.classList.add("hidden");
   els.relatedPanel.classList.add("hidden");
@@ -889,6 +919,8 @@ async function renderConversation(detail) {
   els.copyIdButton.disabled = false;
   els.conversationSearchInput.disabled = false;
   els.conversationSearchClear.disabled = els.conversationSearchInput.value.trim() === "";
+  resetAskCodex();
+  els.askCodexButton.disabled = els.askCodexQuestion.value.trim() === "";
 
   els.conversationTitle.textContent = summary.preview || "Conversation";
   els.conversationMeta.textContent = `${text(summary.started)} to ${text(summary.ended || summary.updated)}`;
@@ -3714,6 +3746,94 @@ function renderSafeLink(label, href) {
   return span;
 }
 
+async function askCodexAboutCurrentThread() {
+  const question = els.askCodexQuestion.value.trim();
+  if (!state.currentThread || !question) {
+    return;
+  }
+  cancelAskCodexRequest();
+  const requestId = state.askCodex.requestId + 1;
+  const controller = new AbortController();
+  state.askCodex.requestId = requestId;
+  state.askCodex.abortController = controller;
+
+  const askContext = currentAskCodexContext();
+  els.askCodexButton.disabled = true;
+  els.askCodexButton.textContent = "Asking...";
+  els.askCodexStatus.textContent = `Sending ${askContext.messageCount} filtered messages (${formatCount(askContext.context.length)} chars) to Codex...`;
+  els.askCodexAnswer.classList.add("hidden");
+  els.askCodexAnswer.replaceChildren();
+  try {
+    const result = await fetchJson("/api/ask-codex", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question,
+        context: askContext.context,
+        context_truncated: askContext.truncated,
+        kind: state.mode,
+        thread_id: state.currentThread.summary?.id || "",
+        title: state.currentThread.summary?.preview || ""
+      }),
+      signal: controller.signal
+    });
+    if (requestId !== state.askCodex.requestId) {
+      return;
+    }
+    const answer = result.answer || "";
+    els.askCodexAnswer.textContent = answer;
+    els.askCodexAnswer.classList.toggle("hidden", answer === "");
+    els.askCodexStatus.textContent = [
+      "Answer from Codex.",
+      result.context_truncated ? "Context was truncated." : "",
+      result.question_truncated ? "Question was truncated." : ""
+    ].filter(Boolean).join(" ");
+  } catch (error) {
+    if (requestId === state.askCodex.requestId && !isAbortError(error)) {
+      els.askCodexAnswer.textContent = error.message || String(error);
+      els.askCodexAnswer.classList.remove("hidden");
+      els.askCodexStatus.textContent = "Ask Codex failed.";
+    }
+  } finally {
+    if (state.askCodex.abortController === controller) {
+      state.askCodex.abortController = null;
+    }
+    if (requestId === state.askCodex.requestId) {
+      els.askCodexButton.textContent = "Ask";
+      els.askCodexButton.disabled = els.askCodexQuestion.value.trim() === "";
+    }
+    syncConversationChromeResize();
+  }
+}
+
+function currentAskCodexContext() {
+  const exportThread = currentFilteredExportThread();
+  const original = conversationAsPlainText(exportThread);
+  const [context, truncated] = trimMiddle(original, ASK_CODEX_CONTEXT_CHAR_LIMIT);
+  return {
+    context,
+    truncated,
+    messageCount: exportThread.messages.length
+  };
+}
+
+function trimMiddle(value, maxChars) {
+  if (value.length <= maxChars) {
+    return [value, false];
+  }
+  const headChars = Math.floor(maxChars / 2);
+  const tailChars = maxChars - headChars;
+  const omitted = value.length - maxChars;
+  return [
+    `${value.slice(0, headChars).trimEnd()}\n\n[... ${omitted} characters omitted from the middle before sending to Codex ...]\n\n${value.slice(-tailChars).trimStart()}`,
+    true
+  ];
+}
+
+function formatCount(value) {
+  return new Intl.NumberFormat().format(value);
+}
+
 function exportCurrentThread() {
   if (!state.currentThread) return;
   const exportThread = currentFilteredExportThread();
@@ -3861,6 +3981,7 @@ function showConversationError(error) {
   cancelMessageRender();
   state.currentThread = null;
   resetConversationSearch();
+  resetAskCodex();
   els.emptyStateMessage.textContent = error.message || String(error);
   els.emptyState.classList.remove("hidden");
   els.conversationView.classList.add("hidden");
@@ -3938,6 +4059,21 @@ async function init() {
   });
   els.messageFilters.addEventListener("toggle", () => {
     syncConversationChromeResize();
+  });
+  els.askCodexPanel.addEventListener("toggle", () => {
+    syncConversationChromeResize();
+  });
+  els.askCodexQuestion.addEventListener("input", () => {
+    els.askCodexButton.disabled = els.askCodexQuestion.value.trim() === "" || !state.currentThread;
+  });
+  els.askCodexQuestion.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      void askCodexAboutCurrentThread();
+    }
+  });
+  els.askCodexButton.addEventListener("click", () => {
+    void askCodexAboutCurrentThread();
   });
   els.messageFilterDefaults.addEventListener("click", () => {
     setMessageFilters(defaultMessageFilters());

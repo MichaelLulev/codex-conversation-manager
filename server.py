@@ -11,7 +11,9 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import asdict
@@ -39,6 +41,10 @@ SQLITE_OPEN_ATTEMPTS = 5
 SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
 DUPLICATE_MESSAGE_WINDOW_SECONDS = 0.05
+ASK_CODEX_MAX_QUESTION_CHARS = 8000
+ASK_CODEX_MAX_CONTEXT_CHARS = 220000
+ASK_CODEX_TIMEOUT_SECONDS = 300
+ASK_CODEX_OUTPUT_TAIL_CHARS = 12000
 OMITTED_IMAGE_RESULT_LABEL = "(base64 image result omitted; saved path/status is shown when available)"
 MAIN_THREAD_SELECT_COLUMNS = """
     id, rollout_path, created_at, updated_at, title, first_user_message,
@@ -164,6 +170,150 @@ def utc_timestamp_ms(value: datetime | None = None) -> str:
 def new_thread_id() -> str:
     uuid7 = getattr(uuid, "uuid7", None)
     return str(uuid7() if uuid7 else uuid.uuid4())
+
+
+def codex_exec_binary() -> str:
+    configured = os.environ.get("CODEX_READER_CODEX_BIN") or os.environ.get("CODEX_REAL_COMMAND")
+    if configured:
+        path = Path(configured).expanduser()
+        if path.exists():
+            return str(path)
+        found = shutil.which(configured)
+        if found:
+            return found
+    local_real = Path.home() / ".npm-global" / "bin" / "codex"
+    if local_real.exists():
+        return str(local_real)
+    found = shutil.which("codex")
+    if not found:
+        raise FileNotFoundError("codex")
+    return found
+
+
+def trim_text(value: str, max_chars: int) -> tuple[str, bool]:
+    if len(value) <= max_chars:
+        return value, False
+    head_chars = max_chars // 2
+    tail_chars = max_chars - head_chars
+    omitted = len(value) - max_chars
+    trimmed = (
+        value[:head_chars].rstrip()
+        + f"\n\n[... {omitted} characters omitted from the middle ...]\n\n"
+        + value[-tail_chars:].lstrip()
+    )
+    return trimmed, True
+
+
+def ask_codex_about_conversation(payload: dict[str, Any], codex_home: Path) -> dict[str, Any]:
+    question_value = payload.get("question")
+    context_value = payload.get("context")
+    if not isinstance(question_value, str) or not question_value.strip():
+        raise ValueError("Missing question")
+    if not isinstance(context_value, str) or not context_value.strip():
+        raise ValueError("Missing conversation context")
+
+    question, question_truncated = trim_text(question_value.strip(), ASK_CODEX_MAX_QUESTION_CHARS)
+    context, context_truncated_server = trim_text(context_value, ASK_CODEX_MAX_CONTEXT_CHARS)
+    client_truncated = bool(payload.get("context_truncated"))
+    prompt = build_ask_codex_prompt(
+        question=question,
+        context=context,
+        kind=payload.get("kind"),
+        thread_id=payload.get("thread_id"),
+        title=payload.get("title"),
+        context_truncated=client_truncated or context_truncated_server,
+    )
+
+    codex_bin = codex_exec_binary()
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    env["NO_COLOR"] = "1"
+
+    with tempfile.TemporaryDirectory(prefix="codex-reader-ask-") as tmp_dir:
+        output_path = Path(tmp_dir) / "answer.txt"
+        command = [
+            codex_bin,
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--ephemeral",
+            "--color",
+            "never",
+            "--cd",
+            str(PROJECT_ROOT),
+            "--output-last-message",
+            str(output_path),
+            "-",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                input=prompt,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=PROJECT_ROOT,
+                env=env,
+                timeout=ASK_CODEX_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("Codex did not finish before the 5 minute timeout") from exc
+
+        answer = ""
+        if output_path.exists():
+            answer = output_path.read_text(encoding="utf-8", errors="replace").strip()
+        if not answer:
+            answer = (result.stdout or "").strip()
+        if result.returncode != 0:
+            details = "\n".join(
+                item.strip()
+                for item in [result.stderr, result.stdout]
+                if item and item.strip()
+            )
+            details = details[-ASK_CODEX_OUTPUT_TAIL_CHARS:] if details else "No output"
+            raise RuntimeError(f"Codex failed with exit code {result.returncode}: {details}")
+        if not answer:
+            raise RuntimeError("Codex finished without an answer")
+
+    return {
+        "answer": answer,
+        "context_chars": len(context),
+        "context_truncated": client_truncated or context_truncated_server,
+        "question_truncated": question_truncated,
+    }
+
+
+def build_ask_codex_prompt(
+    *,
+    question: str,
+    context: str,
+    kind: Any,
+    thread_id: Any,
+    title: Any,
+    context_truncated: bool,
+) -> str:
+    metadata = [
+        f"Conversation type: {kind if isinstance(kind, str) else 'unknown'}",
+        f"Thread ID: {thread_id if isinstance(thread_id, str) else 'unknown'}",
+        f"Title: {title if isinstance(title, str) and title else 'unknown'}",
+        f"Context truncated: {'yes' if context_truncated else 'no'}",
+    ]
+    return (
+        "You are answering a question about a saved Codex conversation transcript.\n"
+        "Use only the provided transcript and metadata. Do not inspect files, run commands, "
+        "modify files, browse the web, or infer facts that are not supported by the transcript.\n"
+        "If the transcript is insufficient, say what is missing. When useful, refer to message "
+        "numbers or role headings from the transcript.\n\n"
+        "Question:\n"
+        f"{question}\n\n"
+        "Conversation metadata:\n"
+        + "\n".join(f"- {item}" for item in metadata)
+        + "\n\nTranscript:\n"
+        f"{context}\n"
+    )
 
 
 def parent_thread_id_from_source(source: str | None) -> str | None:
@@ -3220,6 +3370,12 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/ask-codex":
+                self.send_json(
+                    ask_codex_about_conversation(self.read_json_body(), self.reader.codex_home),
+                    status=200,
+                )
+                return
             create_rollback_suffix = "/rollback-to-message"
             fork_message_suffix = "/fork-from-message"
             rollback_suffix = "/fork-before-rollback"
@@ -3301,6 +3457,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error_json(409, f"Generated rollout already exists: {exc}")
         except FileNotFoundError as exc:
             self.send_error_json(500, f"Missing Codex file: {exc}")
+        except TimeoutError as exc:
+            self.send_error_json(504, str(exc))
+        except RuntimeError as exc:
+            self.send_error_json(500, str(exc))
         except sqlite3.Error as exc:
             self.send_error_json(500, f"SQLite error: {exc}")
         except OSError as exc:
