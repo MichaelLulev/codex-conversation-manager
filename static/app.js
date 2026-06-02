@@ -1548,27 +1548,14 @@ function syncConversationChromeResize() {
 }
 
 function syncAskCodexLayout() {
-  const panel = els.askCodexPanel;
-  const content = panel?.querySelector(".ask-codex-content");
-  if (!panel || !content) {
+  const content = els.askCodexPanel?.querySelector(".ask-codex-content");
+  if (!content) {
     return false;
   }
-  if (!panel.open || !panel.classList.contains("has-answer")) {
-    content.style.height = "";
-    content.style.maxHeight = "";
-    content.style.minHeight = "";
-    return false;
-  }
-  const summary = panel.querySelector(".ask-codex-summary");
-  const summaryHeight = Math.ceil(summary?.getBoundingClientRect().height || 0);
-  const availableHeight = Math.max(96, Math.floor(panel.clientHeight - summaryHeight));
-  const heightPx = `${availableHeight}px`;
-  if (content.style.height !== heightPx) {
-    content.style.height = heightPx;
-    content.style.maxHeight = heightPx;
-    content.style.minHeight = "0";
-  }
-  return true;
+  content.style.height = "";
+  content.style.maxHeight = "";
+  content.style.minHeight = "";
+  return false;
 }
 
 function renderCompactionItem(checkpoint, summary) {

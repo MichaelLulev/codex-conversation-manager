@@ -573,14 +573,11 @@ button:disabled {
 }
 
 .ask-codex-panel[open].has-answer {
-  height: min(58vh, 560px);
-  max-height: min(58vh, 560px);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .ask-codex-panel[open].has-answer .ask-codex-content {
-  grid-template-rows: minmax(72px, auto) auto minmax(96px, 1fr);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .ask-codex-content textarea {
@@ -621,7 +618,7 @@ button:disabled {
 }
 
 .ask-codex-answer {
-  max-height: min(32vh, 320px);
+  max-height: clamp(96px, 26vh, 280px);
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
@@ -632,10 +629,6 @@ button:disabled {
   white-space: normal;
   overflow-wrap: anywhere;
   scrollbar-gutter: stable;
-}
-
-.ask-codex-panel.has-answer .ask-codex-answer {
-  max-height: none;
 }
 
 .ask-codex-answer a,
