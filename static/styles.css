@@ -605,6 +605,30 @@ button:disabled {
   scrollbar-gutter: stable;
 }
 
+.ask-codex-answer a,
+.conversation-nav-link {
+  color: var(--accent);
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.conversation-nav-link {
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  padding: 0 1px;
+  background: transparent;
+  cursor: pointer;
+  vertical-align: baseline;
+}
+
+.conversation-nav-link:hover:not(:disabled) {
+  color: #006f67;
+  background: transparent;
+}
+
 .message-filter-options {
   min-width: 0;
   display: flex;

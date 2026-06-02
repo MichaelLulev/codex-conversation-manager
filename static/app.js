@@ -107,7 +107,9 @@ const state = {
   askCodex: {
     requestId: 0,
     abortController: null,
-    selectedText: ""
+    selectedText: "",
+    selectedMessageIndex: null,
+    activeMarks: []
   },
   conversationSearch: {
     matchGroups: [],
@@ -578,7 +580,9 @@ function cancelAskCodexRequest() {
 
 function resetAskCodex() {
   cancelAskCodexRequest();
+  clearAskCodexNavigationHighlights();
   state.askCodex.selectedText = "";
+  state.askCodex.selectedMessageIndex = null;
   els.askCodexQuestion.value = "";
   els.askCodexButton.disabled = true;
   els.askSelectedButton.disabled = true;
@@ -591,12 +595,38 @@ function updateSelectedTranscriptText() {
   const selection = els.messagesDocument?.getSelection?.();
   const textValue = collapseWhitespace(selection ? selection.toString() : "");
   state.askCodex.selectedText = textValue;
+  state.askCodex.selectedMessageIndex = selectedMessageIndex(selection);
   els.askSelectedButton.disabled = !textValue || !state.currentThread;
   if (textValue) {
-    els.askSelectedButton.title = `Ask about selected text: ${trimForPrompt(textValue, 120)}`;
+    const source = Number.isInteger(state.askCodex.selectedMessageIndex)
+      ? ` in message ${state.askCodex.selectedMessageIndex + 1}`
+      : "";
+    els.askSelectedButton.title = `Ask about selected text${source}: ${trimForPrompt(textValue, 120)}`;
   } else {
     els.askSelectedButton.title = "Select text in the conversation transcript first.";
   }
+}
+
+function selectedMessageIndex(selection) {
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return null;
+  }
+  const range = selection.getRangeAt(0);
+  const startMessage = closestMessageElement(range.startContainer);
+  const endMessage = closestMessageElement(range.endContainer);
+  if (!startMessage || startMessage !== endMessage) {
+    return null;
+  }
+  const index = Number(startMessage.dataset.messageIndex);
+  return Number.isInteger(index) ? index : null;
+}
+
+function closestMessageElement(node) {
+  let element = node && node.nodeType === 1 ? node : node?.parentElement;
+  while (element && !element.classList?.contains("message")) {
+    element = element.parentElement;
+  }
+  return element && element.classList?.contains("message") ? element : null;
 }
 
 function collapseWhitespace(value) {
@@ -1346,6 +1376,7 @@ function rerenderMessagesForCurrentFilters() {
   cancelScrollAnimation();
   cancelConversationSearchWork();
   clearConversationHighlights();
+  clearAskCodexNavigationHighlights();
   const renderRequestId = state.renderRequestId + 1;
   state.renderRequestId = renderRequestId;
   state.toolRunByMessageIndex = new Map();
@@ -2152,6 +2183,7 @@ function resetConversationSearch() {
   cancelScheduledConversationSearch();
   cancelConversationSearchWork();
   clearConversationHighlights();
+  clearAskCodexNavigationHighlights();
   state.conversationSearch.matchGroups = [];
   state.conversationSearch.totalMatches = 0;
   state.conversationSearch.activeIndex = -1;
@@ -2195,6 +2227,7 @@ function scheduleConversationSearchAfterPaint() {
 async function applyConversationSearch() {
   cancelScheduledConversationSearch();
   clearConversationHighlights();
+  clearAskCodexNavigationHighlights();
   if (state.conversationSearch.abortController) {
     state.conversationSearch.abortController.abort();
     state.conversationSearch.abortController = null;
@@ -2525,6 +2558,19 @@ function highlightNthSearchInElement(element, lowerQuery, queryLength, targetOcc
 function clearConversationHighlights() {
   const marks = state.conversationSearch.activeMarks;
   state.conversationSearch.activeMarks = [];
+  for (const mark of marks) {
+    if (!mark.isConnected) {
+      continue;
+    }
+    const parent = mark.parentNode;
+    mark.replaceWith(mark.ownerDocument.createTextNode(mark.textContent));
+    parent?.normalize();
+  }
+}
+
+function clearAskCodexNavigationHighlights() {
+  const marks = state.askCodex.activeMarks;
+  state.askCodex.activeMarks = [];
   for (const mark of marks) {
     if (!mark.isConnected) {
       continue;
@@ -3827,7 +3873,7 @@ function hasRtlText(value) {
 
 function renderInline(value) {
   const fragment = document.createDocumentFragment();
-  const pattern = /(`([^`]+)`)|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(\[([^\]]+)\]\(([^)\s]+)\))/g;
+  const pattern = /(`([^`]+)`)|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(\[([^\]]+)\]\(([^)]+)\))/g;
   let cursor = 0;
   let match;
 
@@ -3861,6 +3907,10 @@ function renderInline(value) {
 }
 
 function renderSafeLink(label, href) {
+  const conversationTarget = parseConversationNavigationHref(href);
+  if (conversationTarget) {
+    return createConversationNavigationLink(label, conversationTarget);
+  }
   if (/^(https?:\/\/|mailto:|#)/i.test(href)) {
     const link = document.createElement("a");
     link.href = href;
@@ -3872,6 +3922,134 @@ function renderSafeLink(label, href) {
   const span = document.createElement("span");
   span.textContent = `${label} (${href})`;
   return span;
+}
+
+function parseConversationNavigationHref(href) {
+  const value = String(href || "").trim();
+  const match = value.match(/^codex-message:(\d+)(?:\?(.*))?$/i);
+  if (!match) {
+    return null;
+  }
+  const messageNumber = Number(match[1]);
+  if (!Number.isInteger(messageNumber) || messageNumber < 1) {
+    return null;
+  }
+  const target = {
+    messageIndex: messageNumber - 1,
+    quote: ""
+  };
+  if (match[2]) {
+    const params = new URLSearchParams(match[2]);
+    target.quote = params.get("text") || params.get("quote") || params.get("q") || "";
+  }
+  return target;
+}
+
+function createConversationNavigationLink(label, target) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "conversation-nav-link";
+  button.textContent = label;
+  button.title = target.quote
+    ? `Scroll to this text in message ${target.messageIndex + 1}`
+    : `Scroll to message ${target.messageIndex + 1}`;
+  button.addEventListener("click", () => scrollToConversationNavigationTarget(target));
+  return button;
+}
+
+function scrollToConversationNavigationTarget(target) {
+  if (!target || !Number.isInteger(target.messageIndex)) {
+    return false;
+  }
+  const message = state.currentThread?.messages?.[target.messageIndex];
+  if (!message) {
+    els.askCodexStatus.textContent = `Message ${target.messageIndex + 1} is not in this conversation.`;
+    return false;
+  }
+
+  clearConversationHighlights();
+  clearAskCodexNavigationHighlights();
+
+  let wrapper = els.messages?.querySelector(`.message[data-message-index="${target.messageIndex}"]`);
+  if (!wrapper) {
+    wrapper = expandToolRunForMessage(target.messageIndex);
+  }
+  if (!wrapper) {
+    const deferred = scrollToMessageIndex(target.messageIndex, { defer: true });
+    els.askCodexStatus.textContent = deferred
+      ? `Scrolled to message ${target.messageIndex + 1}.`
+      : `Message ${target.messageIndex + 1} is hidden by the current filters.`;
+    return deferred;
+  }
+  if (wrapper.classList.contains("collapsed")) {
+    expandCollapsedMessage(wrapper);
+  }
+
+  if (target.quote) {
+    const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
+    ensureMessageBodyRendered(body);
+    body.hidden = false;
+    const mark = highlightAskCodexTargetInElement(body, target.quote);
+    if (mark) {
+      state.askCodex.activeMarks = [mark];
+      scrollElementIntoMessages(mark);
+      wrapper.classList.add("branch-link-focus");
+      window.setTimeout(() => wrapper.classList.remove("branch-link-focus"), 1600);
+      els.askCodexStatus.textContent = `Scrolled to text in message ${target.messageIndex + 1}.`;
+      return true;
+    }
+    els.askCodexStatus.textContent = `Text not found in message ${target.messageIndex + 1}; scrolled to the message.`;
+  } else {
+    els.askCodexStatus.textContent = `Scrolled to message ${target.messageIndex + 1}.`;
+  }
+  return scrollToMessageIndex(target.messageIndex, { defer: true });
+}
+
+function highlightAskCodexTargetInElement(element, quote) {
+  const candidates = askCodexTargetCandidates(quote);
+  for (const candidate of candidates) {
+    const mark = highlightNthSearchInElement(
+      element,
+      candidate.toLocaleLowerCase(),
+      candidate.length,
+      0
+    );
+    if (mark) {
+      mark.classList.add("ask-target-match");
+      return mark;
+    }
+  }
+  return null;
+}
+
+function askCodexTargetCandidates(quote) {
+  const raw = String(quote || "").trim();
+  const collapsed = collapseWhitespace(raw);
+  const base = [
+    raw,
+    collapsed,
+    stripInlineMarkup(raw),
+    stripInlineMarkup(collapsed)
+  ].filter(Boolean);
+  return [...new Set([
+    ...base,
+    ...base.flatMap(askCodexQuoteSegments)
+  ].filter(Boolean))];
+}
+
+function askCodexQuoteSegments(value) {
+  const words = collapseWhitespace(value).split(/\s+/).filter((word) => word.length > 0);
+  const segments = [];
+  const maxWords = Math.min(8, words.length);
+  for (let size = maxWords; size >= 3; size -= 1) {
+    for (let start = 0; start + size <= words.length; start += 1) {
+      const segment = words.slice(start, start + size).join(" ");
+      if (segment.length >= 12) {
+        segments.push(segment);
+      }
+    }
+  }
+  return segments;
 }
 
 function askCodexAboutMessage(message, index) {
@@ -3900,11 +4078,18 @@ function askCodexAboutSelectedText() {
     return;
   }
   state.askCodex.selectedText = selectedText;
+  const selectedMessageIndex = state.askCodex.selectedMessageIndex;
+  const selectedMessageNumber = Number.isInteger(selectedMessageIndex) ? selectedMessageIndex + 1 : null;
+  const selectedLink = selectedMessageNumber
+    ? `codex-message:${selectedMessageNumber}?text=${encodeURIComponent(trimForPrompt(selectedText, 240))}`
+    : "";
   const question = [
     "Explain this selected text from the conversation:",
     `"${trimForPrompt(selectedText, 1200)}"`,
+    selectedMessageNumber ? `It comes from message ${selectedMessageNumber}.` : "",
+    selectedLink ? `If you refer to the selected text, link to it as [selected text](${selectedLink}).` : "",
     "Use the surrounding conversation context where helpful."
-  ].join("\n");
+  ].filter(Boolean).join("\n");
   prepareAskCodexQuestion(question, "Prepared question for selected text.");
 }
 
@@ -3941,6 +4126,7 @@ async function askCodexAboutCurrentThread() {
   els.askCodexStatus.textContent = `Sending ${askContext.messageCount} filtered messages (${formatCount(askContext.context.length)} chars) to Codex...`;
   els.askCodexAnswer.classList.add("hidden");
   els.askCodexAnswer.replaceChildren();
+  clearAskCodexNavigationHighlights();
   try {
     const result = await fetchJson("/api/ask-codex", {
       method: "POST",
@@ -3959,8 +4145,7 @@ async function askCodexAboutCurrentThread() {
       return;
     }
     const answer = result.answer || "";
-    els.askCodexAnswer.textContent = answer;
-    els.askCodexAnswer.classList.toggle("hidden", answer === "");
+    renderAskCodexAnswer(answer);
     els.askCodexStatus.textContent = [
       "Answer from Codex.",
       result.context_truncated ? "Context was truncated." : "",
@@ -3984,9 +4169,57 @@ async function askCodexAboutCurrentThread() {
   }
 }
 
+function renderAskCodexAnswer(answer) {
+  const textValue = String(answer || "");
+  els.askCodexAnswer.replaceChildren(renderAskCodexAnswerText(textValue));
+  els.askCodexAnswer.classList.toggle("hidden", textValue === "");
+}
+
+function renderAskCodexAnswerText(value) {
+  const fragment = document.createDocumentFragment();
+  const textValue = String(value || "");
+  const pattern = /\[([^\]]+)\]\(([^)]+)\)|\b[Mm]essages?\s+(\d+)\b/g;
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(textValue)) !== null) {
+    if (match.index > cursor) {
+      fragment.appendChild(document.createTextNode(textValue.slice(cursor, match.index)));
+    }
+    if (match[1] !== undefined && match[2] !== undefined) {
+      fragment.appendChild(renderSafeLink(match[1], match[2]));
+    } else {
+      const messageNumber = Number(match[3]);
+      if (isValidConversationMessageNumber(messageNumber)) {
+        fragment.appendChild(createConversationNavigationLink(match[0], {
+          messageIndex: messageNumber - 1,
+          quote: ""
+        }));
+      } else {
+        fragment.appendChild(document.createTextNode(match[0]));
+      }
+    }
+    cursor = pattern.lastIndex;
+  }
+  if (cursor < textValue.length) {
+    fragment.appendChild(document.createTextNode(textValue.slice(cursor)));
+  }
+  if (!fragment.childNodes.length) {
+    fragment.appendChild(document.createTextNode(""));
+  }
+  return fragment;
+}
+
+function isValidConversationMessageNumber(messageNumber) {
+  return (
+    Number.isInteger(messageNumber)
+    && messageNumber >= 1
+    && messageNumber <= (state.currentThread?.messages || []).length
+  );
+}
+
 function currentAskCodexContext() {
-  const exportThread = currentFilteredExportThread();
-  const original = conversationAsPlainText(exportThread);
+  const exportThread = currentFilteredExportThread({ includeNavigationRefs: true });
+  const original = conversationAsPlainText(exportThread, { includeNavigationRefs: true });
   const [context, truncated] = trimMiddle(original, ASK_CODEX_CONTEXT_CHAR_LIMIT);
   return {
     context,
@@ -4043,12 +4276,16 @@ function exportCurrentThread() {
   URL.revokeObjectURL(url);
 }
 
-function currentFilteredExportThread() {
+function currentFilteredExportThread(options = {}) {
   const detail = state.currentThread || {};
   const summary = detail.summary || {};
-  const messages = (detail.messages || [])
-    .filter(isMessageVisibleByFilter)
-    .map(exportMessageObject);
+  const messages = [];
+  for (const [index, message] of (detail.messages || []).entries()) {
+    if (!isMessageVisibleByFilter(message)) {
+      continue;
+    }
+    messages.push(exportMessageObject(message, { ...options, messageIndex: index }));
+  }
   return {
     ...detail,
     summary: {
@@ -4059,11 +4296,15 @@ function currentFilteredExportThread() {
   };
 }
 
-function exportMessageObject(message) {
+function exportMessageObject(message, options = {}) {
   const exported = { ...message };
   delete exported.__finalAssistantReply;
   if (message?.role === "assistant") {
     exported.assistant_stage = assistantStage(message);
+  }
+  if (options.includeNavigationRefs && Number.isInteger(options.messageIndex)) {
+    exported.message_number = options.messageIndex + 1;
+    exported.navigation_href = `codex-message:${options.messageIndex + 1}`;
   }
   return exported;
 }
@@ -4099,7 +4340,7 @@ function conversationAsMarkdown(detail) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-function conversationAsPlainText(detail) {
+function conversationAsPlainText(detail, options = {}) {
   const summary = detail.summary || {};
   const messages = detail.messages || [];
   const divider = "=".repeat(72);
@@ -4118,7 +4359,13 @@ function conversationAsPlainText(detail) {
   ];
 
   for (const [index, message] of messages.entries()) {
-    lines.push(section, `${index + 1}. ${exportRoleLabel(message)}`);
+    const messageNumber = options.includeNavigationRefs && Number.isInteger(message.message_number)
+      ? message.message_number
+      : index + 1;
+    const navigation = options.includeNavigationRefs && message.navigation_href
+      ? ` [link: ${message.navigation_href}]`
+      : "";
+    lines.push(section, `${messageNumber}. ${exportRoleLabel(message)}${navigation}`);
     for (const item of exportMessageMetadata(message)) {
       lines.push(item);
     }
