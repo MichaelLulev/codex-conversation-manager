@@ -3577,7 +3577,7 @@ function renderRoleLabel(message) {
   return wrapper;
 }
 
-function renderFormattedText(value) {
+function renderFormattedText(value, options = {}) {
   if (String(value).length > MAX_FORMATTED_TEXT_LENGTH) {
     return renderLongPlainText(value);
   }
@@ -3610,7 +3610,7 @@ function renderFormattedText(value) {
       const element = document.createElement("h4");
       element.className = `md-heading level-${heading[1].length}`;
       setAutoDirection(element, heading[2]);
-      element.appendChild(renderInline(heading[2]));
+      element.appendChild(renderInline(heading[2], options));
       fragment.appendChild(element);
       index += 1;
       continue;
@@ -3624,7 +3624,7 @@ function renderFormattedText(value) {
         if (!item) break;
         const li = document.createElement("li");
         setAutoDirection(li, item[1]);
-        li.appendChild(renderInline(item[1]));
+        li.appendChild(renderInline(item[1], options));
         list.appendChild(li);
         index += 1;
       }
@@ -3640,7 +3640,7 @@ function renderFormattedText(value) {
         if (!item) break;
         const li = document.createElement("li");
         setAutoDirection(li, item[1]);
-        li.appendChild(renderInline(item[1]));
+        li.appendChild(renderInline(item[1], options));
         list.appendChild(li);
         index += 1;
       }
@@ -3658,7 +3658,7 @@ function renderFormattedText(value) {
         index += 1;
       }
       setAutoDirection(quote, quoteLines.join(" "));
-      quote.appendChild(renderInline(quoteLines.join(" ")));
+      quote.appendChild(renderInline(quoteLines.join(" "), options));
       fragment.appendChild(quote);
       continue;
     }
@@ -3673,7 +3673,7 @@ function renderFormattedText(value) {
 
     const table = parseMarkdownTable(lines, index);
     if (table) {
-      fragment.appendChild(renderMarkdownTable(table));
+      fragment.appendChild(renderMarkdownTable(table, options));
       index = table.nextIndex;
       continue;
     }
@@ -3685,7 +3685,7 @@ function renderFormattedText(value) {
     }
     const paragraph = document.createElement("p");
     setAutoDirection(paragraph, paragraphLines.join("\n"));
-    appendFormattedLines(paragraph, paragraphLines);
+    appendFormattedLines(paragraph, paragraphLines, options);
     fragment.appendChild(paragraph);
   }
 
@@ -3702,12 +3702,12 @@ function renderLongPlainText(value) {
   return wrapper;
 }
 
-function appendFormattedLines(parent, lines) {
+function appendFormattedLines(parent, lines, options = {}) {
   for (const line of lines) {
     const span = document.createElement("span");
     span.className = "bidi-line";
     setAutoDirection(span, line);
-    span.appendChild(renderInline(line));
+    span.appendChild(renderInline(line, options));
     parent.appendChild(span);
   }
 }
@@ -3833,7 +3833,7 @@ function normalizeTableRow(row, columnCount) {
   return normalized;
 }
 
-function renderMarkdownTable(table) {
+function renderMarkdownTable(table, options = {}) {
   const wrapper = document.createElement("div");
   wrapper.className = "md-table-wrap";
   const element = document.createElement("table");
@@ -3846,7 +3846,7 @@ function renderMarkdownTable(table) {
     const th = document.createElement("th");
     setAutoDirection(th, cellText);
     applyTableAlignment(th, table.alignments[cellIndex]);
-    th.appendChild(renderInline(cellText));
+    th.appendChild(renderInline(cellText, options));
     headerRow.appendChild(th);
   }
   thead.appendChild(headerRow);
@@ -3859,7 +3859,7 @@ function renderMarkdownTable(table) {
       const td = document.createElement("td");
       setAutoDirection(td, cellText);
       applyTableAlignment(td, table.alignments[cellIndex]);
-      td.appendChild(renderInline(cellText));
+      td.appendChild(renderInline(cellText, options));
       tr.appendChild(td);
     }
     tbody.appendChild(tr);
@@ -3899,7 +3899,7 @@ function hasRtlText(value) {
   return /[\u0590-\u08FF\uFB1D-\uFDFD\uFE70-\uFEFC]/.test(String(value));
 }
 
-function renderInline(value) {
+function renderInline(value, options = {}) {
   const fragment = document.createDocumentFragment();
   const pattern = /(`([^`]+)`)|(\*\*([^*]+)\*\*)|(\*([^*]+)\*)|(\[([^\]]+)\]\(([^)]+)\))/g;
   let cursor = 0;
@@ -3907,7 +3907,7 @@ function renderInline(value) {
 
   while ((match = pattern.exec(value)) !== null) {
     if (match.index > cursor) {
-      fragment.appendChild(document.createTextNode(value.slice(cursor, match.index)));
+      appendInlineText(fragment, value.slice(cursor, match.index), options);
     }
 
     if (match[2] !== undefined) {
@@ -3929,9 +3929,37 @@ function renderInline(value) {
   }
 
   if (cursor < value.length) {
-    fragment.appendChild(document.createTextNode(value.slice(cursor)));
+    appendInlineText(fragment, value.slice(cursor), options);
   }
   return fragment;
+}
+
+function appendInlineText(fragment, value, options = {}) {
+  if (!options.autoLinkMessageRefs) {
+    fragment.appendChild(document.createTextNode(value));
+    return;
+  }
+  const pattern = /\b[Mm]essages?\s+(\d+)\b/g;
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(value)) !== null) {
+    if (match.index > cursor) {
+      fragment.appendChild(document.createTextNode(value.slice(cursor, match.index)));
+    }
+    const messageNumber = Number(match[1]);
+    if (isValidConversationMessageNumber(messageNumber)) {
+      fragment.appendChild(createConversationNavigationLink(match[0], {
+        messageIndex: messageNumber - 1,
+        quote: ""
+      }));
+    } else {
+      fragment.appendChild(document.createTextNode(match[0]));
+    }
+    cursor = pattern.lastIndex;
+  }
+  if (cursor < value.length) {
+    fragment.appendChild(document.createTextNode(value.slice(cursor)));
+  }
 }
 
 function renderSafeLink(label, href) {
@@ -4183,10 +4211,7 @@ async function askCodexAboutCurrentThread() {
     ].filter(Boolean).join(" ");
   } catch (error) {
     if (requestId === state.askCodex.requestId && !isAbortError(error)) {
-      els.askCodexAnswer.textContent = error.message || String(error);
-      els.askCodexAnswer.classList.remove("hidden");
-      els.askCodexPanel.classList.add("has-answer");
-      syncAskCodexLayout();
+      renderAskCodexAnswer(error.message || String(error));
       els.askCodexStatus.textContent = "Ask Codex failed.";
     }
   } finally {
@@ -4203,44 +4228,10 @@ async function askCodexAboutCurrentThread() {
 
 function renderAskCodexAnswer(answer) {
   const textValue = String(answer || "");
-  els.askCodexAnswer.replaceChildren(renderAskCodexAnswerText(textValue));
+  els.askCodexAnswer.replaceChildren(renderFormattedText(textValue, { autoLinkMessageRefs: true }));
   els.askCodexAnswer.classList.toggle("hidden", textValue === "");
   els.askCodexPanel.classList.toggle("has-answer", textValue !== "");
   syncAskCodexLayout();
-}
-
-function renderAskCodexAnswerText(value) {
-  const fragment = document.createDocumentFragment();
-  const textValue = String(value || "");
-  const pattern = /\[([^\]]+)\]\(([^)]+)\)|\b[Mm]essages?\s+(\d+)\b/g;
-  let cursor = 0;
-  let match;
-  while ((match = pattern.exec(textValue)) !== null) {
-    if (match.index > cursor) {
-      fragment.appendChild(document.createTextNode(textValue.slice(cursor, match.index)));
-    }
-    if (match[1] !== undefined && match[2] !== undefined) {
-      fragment.appendChild(renderSafeLink(match[1], match[2]));
-    } else {
-      const messageNumber = Number(match[3]);
-      if (isValidConversationMessageNumber(messageNumber)) {
-        fragment.appendChild(createConversationNavigationLink(match[0], {
-          messageIndex: messageNumber - 1,
-          quote: ""
-        }));
-      } else {
-        fragment.appendChild(document.createTextNode(match[0]));
-      }
-    }
-    cursor = pattern.lastIndex;
-  }
-  if (cursor < textValue.length) {
-    fragment.appendChild(document.createTextNode(textValue.slice(cursor)));
-  }
-  if (!fragment.childNodes.length) {
-    fragment.appendChild(document.createTextNode(""));
-  }
-  return fragment;
 }
 
 function isValidConversationMessageNumber(messageNumber) {

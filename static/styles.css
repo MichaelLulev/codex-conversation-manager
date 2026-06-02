@@ -618,7 +618,7 @@ button:disabled {
   border-radius: 6px;
   padding: var(--space-sm);
   background: var(--panel);
-  white-space: pre-wrap;
+  white-space: normal;
   overflow-wrap: anywhere;
   scrollbar-gutter: stable;
 }
