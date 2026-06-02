@@ -1911,10 +1911,6 @@ def response_item_is_real_user_message(payload: dict[str, Any]) -> bool:
     return bool(text.strip()) and not is_context_input_text(text)
 
 
-def response_item_is_assistant_message(payload: dict[str, Any]) -> bool:
-    return payload.get("type") == "message" and payload.get("role") == "assistant"
-
-
 def event_item_is_real_user_message(payload: dict[str, Any]) -> bool:
     if payload.get("type") != "user_message":
         return False
@@ -1922,12 +1918,9 @@ def event_item_is_real_user_message(payload: dict[str, Any]) -> bool:
     return isinstance(text, str) and bool(text.strip()) and not is_context_input_text(text)
 
 
-def event_item_is_assistant_message(payload: dict[str, Any]) -> bool:
-    return payload.get("type") == "agent_message" and isinstance(payload.get("message"), str)
-
-
 def fork_interrupt_state(lines: list[str]) -> tuple[bool, str | None]:
-    last_conversation_item: str | None = None
+    saw_user_message = False
+    has_turn_boundary_after_last_user = False
     active_turn_id: str | None = None
     explicit_turn_open = False
 
@@ -1942,9 +1935,8 @@ def fork_interrupt_state(lines: list[str]) -> tuple[bool, str | None]:
         item_type = item.get("type")
         if item_type == "response_item":
             if response_item_is_real_user_message(payload):
-                last_conversation_item = "user"
-            elif response_item_is_assistant_message(payload):
-                last_conversation_item = "assistant"
+                saw_user_message = True
+                has_turn_boundary_after_last_user = False
             continue
 
         if item_type != "event_msg":
@@ -1952,26 +1944,21 @@ def fork_interrupt_state(lines: list[str]) -> tuple[bool, str | None]:
 
         payload_type = payload.get("type")
         if payload_type == "user_message" and event_item_is_real_user_message(payload):
-            last_conversation_item = "user"
-        elif event_item_is_assistant_message(payload):
-            last_conversation_item = "assistant"
+            saw_user_message = True
+            has_turn_boundary_after_last_user = False
         elif payload_type in {"turn_started", "task_started"}:
             value = payload.get("turn_id")
             active_turn_id = value if isinstance(value, str) and value else None
-            explicit_turn_open = True
+            explicit_turn_open = active_turn_id is not None
         elif payload_type in {"turn_complete", "task_complete", "turn_aborted", "task_aborted"}:
             explicit_turn_open = False
             active_turn_id = None
-            if last_conversation_item in {"user", "assistant"}:
-                last_conversation_item = "boundary"
-        elif payload_type == "thread_rolled_back":
-            explicit_turn_open = False
-            active_turn_id = None
-            last_conversation_item = "boundary"
+            if saw_user_message:
+                has_turn_boundary_after_last_user = True
 
     if explicit_turn_open:
         return True, active_turn_id
-    return last_conversation_item == "user", None
+    return saw_user_message and not has_turn_boundary_after_last_user, None
 
 
 def interrupted_marker_line(timestamp: str) -> str:

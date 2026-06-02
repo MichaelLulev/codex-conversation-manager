@@ -82,7 +82,7 @@ class SyntheticForkTests(unittest.TestCase):
         self.assertFalse(added)
         self.assertEqual(len(lines), 3)
 
-    def test_no_interruption_for_legacy_prefix_with_assistant_answer(self):
+    def test_legacy_prefix_with_assistant_answer_still_counts_as_mid_turn(self):
         lines, added = server.append_interrupted_boundary_if_needed(
             [
                 response_message_line("user", "hello"),
@@ -91,8 +91,23 @@ class SyntheticForkTests(unittest.TestCase):
             "2026-06-02T12:01:00.000Z",
         )
 
+        self.assertTrue(added)
+        self.assertEqual(len(lines), 4)
+        event = json.loads(lines[-1])
+        self.assertEqual(event["payload"]["type"], "turn_aborted")
+
+    def test_no_interruption_when_turn_aborted_after_user(self):
+        lines, added = server.append_interrupted_boundary_if_needed(
+            [
+                response_message_line("user", "hello"),
+                response_message_line("assistant", "partial"),
+                event_line({"type": "turn_aborted", "reason": "interrupted"}),
+            ],
+            "2026-06-02T12:01:00.000Z",
+        )
+
         self.assertFalse(added)
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
 
     def test_open_explicit_turn_preserves_turn_id(self):
         lines, added = server.append_interrupted_boundary_if_needed(
