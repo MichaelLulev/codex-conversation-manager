@@ -1257,9 +1257,9 @@ button:disabled {
 }
 
 .role-stage.final {
-  border-color: rgba(0, 143, 131, 0.26);
-  color: var(--accent);
-  background: var(--accent-soft);
+  border-color: rgba(154, 101, 10, 0.3);
+  color: var(--accent-2);
+  background: #fff4df;
 }
 
 .message-toggle {
