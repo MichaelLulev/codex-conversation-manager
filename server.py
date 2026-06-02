@@ -36,7 +36,7 @@ ASSET_ROOT = PROJECT_ROOT / "assets"
 DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 SIDE_BOUNDARY_MARKER = "Side conversation boundary."
 WEBSOCKET_MARKER = "websocket event:"
-MAIN_THREAD_FILTERS = {"all", "with_side", "with_forks", "forked", "with_rollback"}
+MAIN_THREAD_FILTERS = {"all", "with_side", "with_forks", "forked", "with_rollback", "archived"}
 SQLITE_OPEN_ATTEMPTS = 5
 SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
@@ -44,6 +44,8 @@ DUPLICATE_MESSAGE_WINDOW_SECONDS = 0.05
 ASK_CODEX_MAX_QUESTION_CHARS = 8000
 ASK_CODEX_TIMEOUT_SECONDS = 300
 ASK_CODEX_OUTPUT_TAIL_CHARS = 12000
+SESSIONS_SUBDIR = "sessions"
+ARCHIVED_SESSIONS_SUBDIR = "archived_sessions"
 OMITTED_IMAGE_RESULT_LABEL = "(base64 image result omitted; saved path/status is shown when available)"
 TURN_ABORTED_GUIDANCE = (
     "The user interrupted the previous turn on purpose. Any running unified exec "
@@ -150,6 +152,14 @@ class MainThreadSummary:
     kind: str = "main"
     meta_label: str = ""
     search_match: str | None = None
+
+
+@dataclass
+class ArchiveCandidate:
+    thread_id: str
+    source_path: Path
+    archived_path: Path
+    before_stat: os.stat_result
 
 
 def local_time(ts: int | float | None) -> str | None:
@@ -596,7 +606,8 @@ class SideConversationReader:
     ) -> list[MainThreadSummary]:
         normalized_query = normalize_search_query(query)
         normalized_filter = list_filter if list_filter in MAIN_THREAD_FILTERS else "all"
-        rows = self.main_thread_rows()
+        archived_filter = normalized_filter == "archived"
+        rows = self.main_thread_rows(archived=archived_filter)
         if normalized_filter == "with_side":
             parent_ids = {
                 item.parent_thread_id
@@ -851,14 +862,16 @@ class SideConversationReader:
     def main_parent_thread_id(self, row: sqlite3.Row) -> str | None:
         return parent_thread_id_from_source(row["source"]) or self.rollout_forked_from_id(row["rollout_path"])
 
-    def main_thread_rows(self) -> list[sqlite3.Row]:
+    def main_thread_rows(self, archived: bool = False) -> list[sqlite3.Row]:
         with connect_readonly(self.state_db) as conn:
             return conn.execute(
                 f"""
                 select {MAIN_THREAD_SELECT_COLUMNS}
                 from threads
+                where archived = ?
                 order by coalesce(updated_at_ms, updated_at * 1000) desc, id desc
-                """
+                """,
+                (1 if archived else 0,),
             ).fetchall()
 
     def get_main_thread(self, thread_id: str) -> dict[str, Any]:
@@ -1194,11 +1207,224 @@ class SideConversationReader:
             "state_update_error": state_update_error,
         }
 
+    def archive_main_thread(
+        self,
+        thread_id: str,
+        expected_rollout_path: str | None = None,
+    ) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        if bool(row["archived"]):
+            raise ValueError("Conversation is already archived")
+        root_candidate = self.archive_candidate_from_row(row, expected_rollout_path)
+
+        descendant_errors: list[dict[str, str]] = []
+        descendant_candidates: list[ArchiveCandidate] = []
+        seen_thread_ids = {thread_id}
+        for descendant_id in self.thread_spawn_descendant_ids(thread_id):
+            if descendant_id in seen_thread_ids:
+                continue
+            seen_thread_ids.add(descendant_id)
+            try:
+                descendant_row = self.main_thread_row(descendant_id)
+            except (KeyError, sqlite3.Error) as exc:
+                descendant_errors.append(self.archive_descendant_error(descendant_id, exc))
+                continue
+            if bool(descendant_row["archived"]):
+                continue
+            try:
+                descendant_candidates.append(self.archive_candidate_from_row(descendant_row))
+            except (OSError, ValueError) as exc:
+                descendant_errors.append(self.archive_descendant_error(descendant_id, exc))
+
+        candidates = [root_candidate]
+        for candidate in descendant_candidates:
+            try:
+                if source_stat_changed(candidate.before_stat, candidate.source_path.stat()):
+                    raise ValueError("Conversation changed while preparing archive")
+                candidates.append(candidate)
+            except (OSError, ValueError) as exc:
+                descendant_errors.append(self.archive_descendant_error(candidate.thread_id, exc))
+
+        if source_stat_changed(root_candidate.before_stat, root_candidate.source_path.stat()):
+            raise ValueError("Conversation changed while preparing archive; refresh and try again")
+        backup_path = str(self.backup_state_db())
+
+        archived_at = datetime.now(timezone.utc)
+        archived_threads: list[dict[str, str | bool | int | None]] = []
+        archive_order = [root_candidate, *reversed(candidates[1:])]
+        for candidate in archive_order:
+            try:
+                archived_threads.append(self.archive_candidate(candidate, archived_at))
+            except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+                if candidate.thread_id == thread_id:
+                    raise
+                descendant_errors.append(self.archive_descendant_error(candidate.thread_id, exc))
+
+        return {
+            "id": thread_id,
+            "archived": True,
+            "rollout_path": str(root_candidate.archived_path),
+            "previous_rollout_path": str(root_candidate.source_path),
+            "archived_at": int(archived_at.timestamp()),
+            "archived_time": local_time(archived_at.timestamp()),
+            "archived_threads": archived_threads,
+            "archived_count": len(archived_threads),
+            "descendant_errors": descendant_errors,
+            "state_db_backup": backup_path,
+        }
+
+    def archive_candidate_from_row(
+        self,
+        row: sqlite3.Row,
+        expected_rollout_path: str | None = None,
+    ) -> ArchiveCandidate:
+        thread_id = row["id"]
+        rollout_path = row["rollout_path"]
+        if not rollout_path:
+            raise ValueError("Conversation does not have a rollout path")
+
+        source_path = Path(rollout_path).expanduser()
+        if expected_rollout_path:
+            expected_path = Path(expected_rollout_path).expanduser()
+            if expected_path.resolve() != source_path.resolve():
+                raise ValueError("Conversation rollout path changed; refresh and try again")
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+
+        before_stat = source_path.stat()
+        archived_path = self.archive_rollout_path(thread_id, source_path)
+        if archived_path.exists():
+            raise FileExistsError(archived_path)
+        return ArchiveCandidate(
+            thread_id=thread_id,
+            source_path=source_path,
+            archived_path=archived_path,
+            before_stat=before_stat,
+        )
+
+    def archive_candidate(
+        self,
+        candidate: ArchiveCandidate,
+        archived_at: datetime,
+    ) -> dict[str, str | bool | int | None]:
+        if source_stat_changed(candidate.before_stat, candidate.source_path.stat()):
+            raise ValueError("Conversation changed while preparing archive")
+        candidate.archived_path.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(candidate.source_path, candidate.archived_path)
+        try:
+            archived_stat = candidate.archived_path.stat()
+            self.mark_thread_archived(
+                candidate.thread_id,
+                candidate.archived_path,
+                archived_at,
+                archived_stat,
+            )
+        except Exception:
+            try:
+                os.rename(candidate.archived_path, candidate.source_path)
+            except OSError:
+                pass
+            raise
+
+        self.clear_rollout_caches(candidate.source_path)
+        self.clear_rollout_caches(candidate.archived_path)
+        return {
+            "id": candidate.thread_id,
+            "archived": True,
+            "rollout_path": str(candidate.archived_path),
+            "previous_rollout_path": str(candidate.source_path),
+            "archived_at": int(archived_at.timestamp()),
+            "archived_time": local_time(archived_at.timestamp()),
+        }
+
+    def archive_descendant_error(self, thread_id: str, exc: BaseException) -> dict[str, str]:
+        return {"id": thread_id, "error": str(exc) or exc.__class__.__name__}
+
+    def thread_spawn_descendant_ids(self, thread_id: str) -> list[str]:
+        try:
+            with connect_readonly(self.state_db) as conn:
+                return [
+                    row["child_thread_id"]
+                    for row in conn.execute(
+                        """
+                        with recursive subtree(child_thread_id, depth) as (
+                            select child_thread_id, 1
+                            from thread_spawn_edges
+                            where parent_thread_id = ?
+                            union all
+                            select edge.child_thread_id, subtree.depth + 1
+                            from thread_spawn_edges as edge
+                            join subtree on edge.parent_thread_id = subtree.child_thread_id
+                        )
+                        select child_thread_id
+                        from subtree
+                        order by depth asc, child_thread_id asc
+                        """,
+                        (thread_id,),
+                    )
+                ]
+        except sqlite3.Error:
+            return []
+
+    def archive_rollout_path(self, thread_id: str, rollout_path: Path) -> Path:
+        sessions_root = (self.codex_home / SESSIONS_SUBDIR).resolve()
+        canonical_source = rollout_path.resolve()
+        try:
+            canonical_source.relative_to(sessions_root)
+        except ValueError as exc:
+            raise ValueError("Only active Codex session rollout files can be archived") from exc
+
+        file_name = rollout_path.name
+        if not (
+            file_name.startswith("rollout-")
+            and file_name.endswith(f"-{thread_id}.jsonl")
+        ):
+            raise ValueError("Rollout filename does not match the conversation id")
+        return self.codex_home / ARCHIVED_SESSIONS_SUBDIR / file_name
+
+    def mark_thread_archived(
+        self,
+        thread_id: str,
+        archived_path: Path,
+        archived_at: datetime,
+        archived_stat: os.stat_result,
+    ) -> None:
+        archived_epoch = int(archived_at.timestamp())
+        updated_epoch = int(archived_stat.st_mtime)
+        updated_millis = archived_stat.st_mtime_ns // 1_000_000
+        with connect_writable(self.state_db) as conn:
+            result = conn.execute(
+                """
+                update threads
+                set rollout_path = ?,
+                    archived = 1,
+                    archived_at = ?,
+                    updated_at = ?,
+                    updated_at_ms = ?
+                where id = ?
+                """,
+                (
+                    str(archived_path),
+                    archived_epoch,
+                    updated_epoch,
+                    updated_millis,
+                    thread_id,
+                ),
+            )
+            if result.rowcount == 0:
+                raise KeyError(thread_id)
+
+    def clear_rollout_caches(self, rollout_path: Path) -> None:
+        cache_key = str(rollout_path)
+        self.rollout_parent_cache.pop(cache_key, None)
+        self.rollout_rollback_cache.pop(cache_key, None)
+        self.rollout_search_text_cache.pop(cache_key, None)
+
     def new_rollout_path(self, thread_id: str, created_at: datetime) -> Path:
         local_created_at = created_at.astimezone()
         directory = (
             self.codex_home
-            / "sessions"
+            / SESSIONS_SUBDIR
             / local_created_at.strftime("%Y")
             / local_created_at.strftime("%m")
             / local_created_at.strftime("%d")
@@ -3478,6 +3704,24 @@ class AppHandler(BaseHTTPRequestHandler):
             fork_message_suffix = "/fork-from-message"
             rollback_suffix = "/fork-before-rollback"
             compaction_suffix = "/fork-before-compaction"
+            archive_suffix = "/archive"
+            if path.startswith("/api/main-threads/") and path.endswith(archive_suffix):
+                thread_id = unquote(
+                    path.removeprefix("/api/main-threads/")[: -len(archive_suffix)]
+                ).strip("/")
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread id")
+                    return
+                payload = self.read_json_body()
+                expected_rollout_path = payload.get("rollout_path")
+                if expected_rollout_path is not None and not isinstance(expected_rollout_path, str):
+                    self.send_error_json(400, "Invalid rollout_path")
+                    return
+                self.send_json(
+                    self.reader.archive_main_thread(thread_id, expected_rollout_path),
+                    status=200,
+                )
+                return
             if path.startswith("/api/main-threads/") and path.endswith(create_rollback_suffix):
                 thread_id = unquote(
                     path.removeprefix("/api/main-threads/")[: -len(create_rollback_suffix)]

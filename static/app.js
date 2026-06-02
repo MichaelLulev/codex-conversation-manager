@@ -22,7 +22,8 @@ const MAIN_FILTER_LABELS = {
   with_side: "with side conversations",
   with_forks: "with forks",
   forked: "forked conversations",
-  with_rollback: "with rollbacks"
+  with_rollback: "with rollbacks",
+  archived: "archived conversations"
 };
 
 const MESSAGE_RENDER_BATCH_SIZE = 100;
@@ -138,6 +139,7 @@ const els = {
   exportButton: document.getElementById("export-button"),
   exportFormatSelect: document.getElementById("export-format-select"),
   copyIdButton: document.getElementById("copy-id-button"),
+  archiveButton: document.getElementById("archive-button"),
   mainModeButton: document.getElementById("main-mode-button"),
   sideModeButton: document.getElementById("side-mode-button"),
   searchInput: document.getElementById("search-input"),
@@ -744,6 +746,14 @@ function renderMode() {
   els.mainFilterSelect.value = state.mainFilter;
   els.searchInput.placeholder = config.searchPlaceholder;
   els.emptyStateMessage.textContent = config.empty;
+  updateArchiveButton();
+}
+
+function updateArchiveButton() {
+  const summary = state.currentThread?.summary;
+  const canArchive = state.mode === "main" && summary && !summary.archived;
+  els.archiveButton.disabled = !canArchive;
+  els.archiveButton.textContent = summary?.archived ? "Archived" : "Archive";
 }
 
 function renderMessageFilterControls() {
@@ -939,6 +949,7 @@ async function selectThread(threadId, options = {}) {
   els.exportButton.disabled = true;
   els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
+  updateArchiveButton();
   resetAskCodex();
   try {
     const detail = await fetchJson(modeConfig().detailUrl(threadId), { signal: controller.signal });
@@ -975,6 +986,7 @@ function clearConversation() {
   els.exportButton.disabled = true;
   els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
+  updateArchiveButton();
 }
 
 async function renderConversation(detail) {
@@ -993,6 +1005,7 @@ async function renderConversation(detail) {
   els.exportButton.disabled = false;
   els.exportFormatSelect.disabled = false;
   els.copyIdButton.disabled = false;
+  updateArchiveButton();
   els.conversationSearchInput.disabled = false;
   els.conversationSearchClear.disabled = els.conversationSearchInput.value.trim() === "";
   resetAskCodex();
@@ -4577,6 +4590,55 @@ async function copyCurrentId() {
   }, 1200);
 }
 
+async function archiveCurrentThread() {
+  const detail = state.currentThread;
+  const summary = detail?.summary;
+  if (state.mode !== "main" || !summary?.id || summary.archived) {
+    return;
+  }
+
+  const confirmed = await confirmWriteAction({
+    title: "Archive this conversation?",
+    body: "This uses Codex-compatible archive behavior: the rollout file moves to archived_sessions and the conversation is removed from the normal active list. The transcript is not permanently deleted.",
+    details: [
+      { label: "Conversation", value: summary.preview || summary.id },
+      { label: "Thread ID", value: summary.id },
+      { label: "Rollout path", value: summary.rollout_path },
+      { label: "Descendants", value: "Spawned descendant conversations are archived too when Codex can read them" }
+    ],
+    confirmLabel: "Archive",
+    opener: els.archiveButton
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  els.archiveButton.disabled = true;
+  const originalText = els.archiveButton.textContent;
+  els.archiveButton.textContent = "Archiving...";
+  try {
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(summary.id)}/archive`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rollout_path: summary.rollout_path || "" })
+      }
+    );
+    const archivedCount = result.archived_count || 1;
+    const skippedCount = (result.descendant_errors || []).length;
+    els.sourceLine.textContent = skippedCount > 0
+      ? `Archived ${archivedCount} conversation${archivedCount === 1 ? "" : "s"}; ${skippedCount} spawned descendant${skippedCount === 1 ? "" : "s"} could not be archived`
+      : `Archived ${archivedCount} conversation${archivedCount === 1 ? "" : "s"}`;
+    clearConversation();
+    await loadThreads({ preserveSelection: false });
+  } catch (error) {
+    els.archiveButton.disabled = false;
+    els.archiveButton.textContent = originalText;
+    els.sourceLine.textContent = error.message || String(error);
+  }
+}
+
 function showError(error) {
   cancelDetailRequest();
   cancelMessageRender();
@@ -4601,6 +4663,7 @@ function showConversationError(error) {
   els.exportButton.disabled = true;
   els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
+  updateArchiveButton();
 }
 
 async function init() {
@@ -4637,6 +4700,9 @@ async function init() {
   });
   els.exportButton.addEventListener("click", exportCurrentThread);
   els.copyIdButton.addEventListener("click", copyCurrentId);
+  els.archiveButton.addEventListener("click", () => {
+    void archiveCurrentThread();
+  });
   els.searchInput.addEventListener("input", () => {
     state.filter = els.searchInput.value;
     scheduleThreadSearch();

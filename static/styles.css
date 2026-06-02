@@ -164,6 +164,17 @@ button:disabled {
   color: var(--brand-ink);
 }
 
+.topbar-actions #archive-button {
+  border-color: rgba(255, 245, 223, 0.32);
+  color: #ffe8b8;
+}
+
+.topbar-actions #archive-button:hover:not(:disabled) {
+  border-color: #f0b84f;
+  background: rgba(240, 184, 79, 0.16);
+  color: #fff4d7;
+}
+
 .topbar-actions select:disabled {
   opacity: 0.5;
   cursor: not-allowed;
