@@ -9,12 +9,15 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
+import uuid
 from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
@@ -31,10 +34,11 @@ ASSET_ROOT = PROJECT_ROOT / "assets"
 DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 SIDE_BOUNDARY_MARKER = "Side conversation boundary."
 WEBSOCKET_MARKER = "websocket event:"
-MAIN_THREAD_FILTERS = {"all", "with_side", "with_forks", "forked"}
+MAIN_THREAD_FILTERS = {"all", "with_side", "with_forks", "forked", "with_rollback"}
 SQLITE_OPEN_ATTEMPTS = 5
 SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
+DUPLICATE_MESSAGE_WINDOW_SECONDS = 0.05
 OMITTED_IMAGE_RESULT_LABEL = "(base64 image result omitted; saved path/status is shown when available)"
 MAIN_THREAD_SELECT_COLUMNS = """
     id, rollout_path, created_at, updated_at, title, first_user_message,
@@ -49,11 +53,17 @@ MAIN_THREAD_SELECT_COLUMNS = """
 class Message:
     role: str
     text: str
-    timestamp: int | None
+    timestamp: int | float | None
     time: str | None
     source: str
     phase: str | None = None
     item_id: str | None = None
+    line_number: int | None = None
+    rolled_back: bool = False
+    rolled_back_at: str | None = None
+    rolled_back_by_timestamp: int | float | None = None
+    rollback_group: str | None = None
+    rollback_turns: int | None = None
 
 
 @dataclass
@@ -75,6 +85,32 @@ class SideThreadSummary:
     parent_thread_id: str | None = None
     kind: str = "side"
     meta_label: str = ""
+    search_match: str | None = None
+
+
+@dataclass
+class CompactionCheckpoint:
+    ordinal: int
+    line_number: int
+    copy_line_count: int
+    timestamp: int | float | None
+    time: str | None
+    kind: str
+    label: str
+    summary: str
+    message_index: int | None = None
+
+
+@dataclass
+class RollbackCheckpoint:
+    ordinal: int
+    line_number: int
+    copy_line_count: int
+    timestamp: int | float | None
+    time: str | None
+    rollback_turns: int | None
+    summary: str
+    message_index: int | None = None
 
 
 @dataclass
@@ -102,21 +138,32 @@ class MainThreadSummary:
     has_persisted_thread: bool = True
     kind: str = "main"
     meta_label: str = ""
+    search_match: str | None = None
 
 
-def local_time(ts: int | None) -> str | None:
+def local_time(ts: int | float | None) -> str | None:
     if ts is None:
         return None
     return datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def timestamp_from_iso(value: Any) -> int | None:
+def timestamp_from_iso(value: Any) -> float | None:
     if not isinstance(value, str):
         return None
     try:
-        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def utc_timestamp_ms(value: datetime | None = None) -> str:
+    dt = value or datetime.now(timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def new_thread_id() -> str:
+    uuid7 = getattr(uuid, "uuid7", None)
+    return str(uuid7() if uuid7 else uuid.uuid4())
 
 
 def parent_thread_id_from_source(source: str | None) -> str | None:
@@ -178,12 +225,25 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
     raise sqlite3.OperationalError(f"unable to open database file: {path}")
 
 
+def connect_writable(path: Path) -> sqlite3.Connection:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    conn = sqlite3.connect(path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("pragma busy_timeout = 5000")
+    conn.execute("pragma foreign_keys = on")
+    return conn
+
+
 class SideConversationReader:
     def __init__(self, codex_home: Path = DEFAULT_CODEX_HOME) -> None:
         self.codex_home = codex_home
         self.logs_db = codex_home / "logs_2.sqlite"
         self.state_db = codex_home / "state_5.sqlite"
         self.history_path = codex_home / "history.jsonl"
+        self.rollout_rollback_cache: dict[str, tuple[int, int, bool]] = {}
+        self.rollout_parent_cache: dict[str, tuple[int, int, str | None]] = {}
+        self.rollout_search_text_cache: dict[str, tuple[int, int, str, list[tuple[str, str]]]] = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -273,7 +333,8 @@ class SideConversationReader:
                 )
         return entries
 
-    def list_threads(self) -> list[SideThreadSummary]:
+    def list_threads(self, query: str = "", full_text: bool = False) -> list[SideThreadSummary]:
+        normalized_query = normalize_search_query(query)
         candidates = self.side_candidates()
         ids = {candidate["id"] for candidate in candidates}
         history = self.history_entries(ids)
@@ -292,26 +353,35 @@ class SideConversationReader:
                 metadata.get("cwd"),
                 candidate.get("process_uuid"),
             )
-            summaries.append(
-                SideThreadSummary(
-                    id=thread_id,
-                    started_at=candidate["started_at"],
-                    ended_at=candidate["ended_at"],
-                    started=local_time(candidate["started_at"]),
-                    ended=local_time(candidate["ended_at"]),
-                    log_rows=candidate["log_rows"],
-                    user_count=user_count,
-                    assistant_count=assistant_count,
-                    message_count=len(messages),
-                    preview=preview,
-                    cwd=metadata.get("cwd"),
-                    model=metadata.get("model"),
-                    app_version=metadata.get("app_version"),
-                    has_persisted_thread=candidate["has_persisted_thread"],
-                    parent_thread_id=parent_thread_id,
-                    meta_label=f"{user_count} user, {assistant_count} assistant",
-                )
+            summary = SideThreadSummary(
+                id=thread_id,
+                started_at=candidate["started_at"],
+                ended_at=candidate["ended_at"],
+                started=local_time(candidate["started_at"]),
+                ended=local_time(candidate["ended_at"]),
+                log_rows=candidate["log_rows"],
+                user_count=user_count,
+                assistant_count=assistant_count,
+                message_count=len(messages),
+                preview=preview,
+                cwd=metadata.get("cwd"),
+                model=metadata.get("model"),
+                app_version=metadata.get("app_version"),
+                has_persisted_thread=candidate["has_persisted_thread"],
+                parent_thread_id=parent_thread_id,
+                meta_label=f"{user_count} user, {assistant_count} assistant",
             )
+            if normalized_query:
+                summary_match = summary_matches_search(summary, normalized_query)
+                text_match = (
+                    conversation_match_snippet(messages, normalized_query)
+                    if full_text and not summary_match
+                    else None
+                )
+                if not summary_match and not text_match:
+                    continue
+                summary.search_match = text_match
+            summaries.append(summary)
         return summaries
 
     def get_thread(self, thread_id: str) -> dict[str, Any]:
@@ -360,7 +430,10 @@ class SideConversationReader:
             ),
         }
 
-    def list_main_threads(self, list_filter: str = "all") -> list[MainThreadSummary]:
+    def list_main_threads(
+        self, list_filter: str = "all", query: str = "", full_text: bool = False
+    ) -> list[MainThreadSummary]:
+        normalized_query = normalize_search_query(query)
         normalized_filter = list_filter if list_filter in MAIN_THREAD_FILTERS else "all"
         rows = self.main_thread_rows()
         if normalized_filter == "with_side":
@@ -374,16 +447,248 @@ class SideConversationReader:
             parent_ids = {
                 parent
                 for row in rows
-                if (parent := parent_thread_id_from_source(row["source"]))
+                if (parent := self.main_parent_thread_id(row))
             }
             rows = [row for row in rows if row["id"] in parent_ids]
         elif normalized_filter == "forked":
             rows = [
                 row
                 for row in rows
-                if parent_thread_id_from_source(row["source"]) is not None
+                if self.main_parent_thread_id(row) is not None
             ]
-        return [self.main_summary_from_row(row) for row in rows]
+        elif normalized_filter == "with_rollback":
+            rows = [row for row in rows if self.rollout_has_rollback(row["rollout_path"])]
+        summaries: list[MainThreadSummary] = []
+        for row in rows:
+            summary = self.main_summary_from_row(row)
+            if normalized_query:
+                summary_match = summary_matches_search(summary, normalized_query)
+                text_match = (
+                    self.main_thread_match_snippet(row, normalized_query)
+                    if full_text and not summary_match
+                    else None
+                )
+                if not summary_match and not text_match:
+                    continue
+                summary.search_match = text_match
+            summaries.append(summary)
+        return summaries
+
+    def main_thread_match_snippet(self, row: sqlite3.Row, normalized_query: str) -> str | None:
+        lower_text, entries = self.rollout_search_index(row["rollout_path"])
+        if normalized_query not in lower_text:
+            return None
+        return search_indexed_text_match_snippet(entries, normalized_query)
+
+    def rollout_has_rollback(self, rollout_path: str | None) -> bool:
+        if not rollout_path:
+            return False
+        path = Path(rollout_path).expanduser()
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+
+        cache_key = str(path)
+        cached = self.rollout_rollback_cache.get(cache_key)
+        if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
+
+        has_rollback = False
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if "thread_rolled_back" in line:
+                        has_rollback = True
+                        break
+        except OSError:
+            has_rollback = False
+        self.rollout_rollback_cache[cache_key] = (stat.st_mtime_ns, stat.st_size, has_rollback)
+        return has_rollback
+
+    def rollout_forked_from_id(self, rollout_path: str | None) -> str | None:
+        if not rollout_path:
+            return None
+        path = Path(rollout_path).expanduser()
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+
+        cache_key = str(path)
+        cached = self.rollout_parent_cache.get(cache_key)
+        if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
+
+        parent_thread_id: str | None = None
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if '"session_meta"' not in line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if item.get("type") != "session_meta":
+                        continue
+                    payload = item.get("payload")
+                    if not isinstance(payload, dict):
+                        break
+                    forked_from_id = payload.get("forked_from_id")
+                    if isinstance(forked_from_id, str) and forked_from_id:
+                        parent_thread_id = forked_from_id
+                    break
+        except OSError:
+            parent_thread_id = None
+        self.rollout_parent_cache[cache_key] = (stat.st_mtime_ns, stat.st_size, parent_thread_id)
+        return parent_thread_id
+
+    def rollout_compaction_checkpoints(
+        self, rollout_path: str | None
+    ) -> list[CompactionCheckpoint]:
+        if not rollout_path:
+            return []
+        path = Path(rollout_path).expanduser()
+        if not path.exists():
+            return []
+
+        checkpoints: list[CompactionCheckpoint] = []
+        last_compacted_line: int | None = None
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    stripped = line.strip()
+                    if not stripped or "compacted" not in stripped:
+                        continue
+                    try:
+                        item = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = item.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    item_type = item.get("type")
+                    kind: str | None = None
+                    if item_type == "compacted":
+                        kind = "compacted"
+                        last_compacted_line = line_number
+                    elif (
+                        item_type == "event_msg"
+                        and payload.get("type") == "context_compacted"
+                    ):
+                        if (
+                            last_compacted_line is not None
+                            and line_number - last_compacted_line <= 8
+                        ):
+                            continue
+                        kind = "context_compacted"
+                    if kind is None:
+                        continue
+                    timestamp = timestamp_from_iso(item.get("timestamp"))
+                    checkpoints.append(
+                        CompactionCheckpoint(
+                            ordinal=len(checkpoints) + 1,
+                            line_number=line_number,
+                            copy_line_count=line_number - 1,
+                            timestamp=timestamp,
+                            time=local_time(timestamp),
+                            kind=kind,
+                            label=(
+                                "Compacted summary"
+                                if kind == "compacted"
+                                else "Compaction event"
+                            ),
+                            summary=compaction_checkpoint_summary(payload, kind),
+                        )
+                    )
+        except OSError:
+            return []
+        return checkpoints
+
+    def rollout_rollback_checkpoints(
+        self, rollout_path: str | None
+    ) -> list[RollbackCheckpoint]:
+        if not rollout_path:
+            return []
+        path = Path(rollout_path).expanduser()
+        if not path.exists():
+            return []
+
+        checkpoints: list[RollbackCheckpoint] = []
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    stripped = line.strip()
+                    if not stripped or "thread_rolled_back" not in stripped:
+                        continue
+                    try:
+                        item = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = item.get("payload")
+                    if (
+                        item.get("type") != "event_msg"
+                        or not isinstance(payload, dict)
+                        or payload.get("type") != "thread_rolled_back"
+                    ):
+                        continue
+                    rollback_turns_value = payload.get("num_turns")
+                    rollback_turns = (
+                        int(rollback_turns_value)
+                        if isinstance(rollback_turns_value, int | float)
+                        else None
+                    )
+                    timestamp = timestamp_from_iso(item.get("timestamp"))
+                    count = rollback_turns if rollback_turns is not None else "unknown"
+                    turn_label = "turn" if rollback_turns == 1 else "turns"
+                    checkpoints.append(
+                        RollbackCheckpoint(
+                            ordinal=len(checkpoints) + 1,
+                            line_number=line_number,
+                            copy_line_count=line_number - 1,
+                            timestamp=timestamp,
+                            time=local_time(timestamp),
+                            rollback_turns=rollback_turns,
+                            summary=f"Rolled back {count} {turn_label}",
+                        )
+                    )
+        except OSError:
+            return []
+        return checkpoints
+
+    def attach_compaction_message_indexes(
+        self, checkpoints: list[CompactionCheckpoint], messages: list[Message]
+    ) -> None:
+        used: set[int] = set()
+        for checkpoint in checkpoints:
+            for index, message in enumerate(messages):
+                if index in used or message.role != "event" or message.phase != "compaction":
+                    continue
+                if checkpoint.timestamp is not None and message.timestamp is not None:
+                    if abs(float(message.timestamp) - float(checkpoint.timestamp)) > 0.001:
+                        continue
+                checkpoint.message_index = index
+                used.add(index)
+                break
+
+    def attach_rollback_message_indexes(
+        self, checkpoints: list[RollbackCheckpoint], messages: list[Message]
+    ) -> None:
+        used: set[int] = set()
+        for checkpoint in checkpoints:
+            for index, message in enumerate(messages):
+                if index in used or message.role != "event" or message.phase != "rollback":
+                    continue
+                if checkpoint.timestamp is not None and message.timestamp is not None:
+                    if abs(float(message.timestamp) - float(checkpoint.timestamp)) > 0.001:
+                        continue
+                checkpoint.message_index = index
+                used.add(index)
+                break
+
+    def main_parent_thread_id(self, row: sqlite3.Row) -> str | None:
+        return parent_thread_id_from_source(row["source"]) or self.rollout_forked_from_id(row["rollout_path"])
 
     def main_thread_rows(self) -> list[sqlite3.Row]:
         with connect_readonly(self.state_db) as conn:
@@ -398,9 +703,13 @@ class SideConversationReader:
     def get_main_thread(self, thread_id: str) -> dict[str, Any]:
         row = self.main_thread_row(thread_id)
         messages = self.rollout_messages(row["rollout_path"])
+        compactions = self.rollout_compaction_checkpoints(row["rollout_path"])
+        rollbacks = self.rollout_rollback_checkpoints(row["rollout_path"])
         messages.append(thread_metadata_message(row))
         messages.extend(self.response_metadata_messages(thread_id))
         messages = finalize_messages(messages)
+        self.attach_compaction_message_indexes(compactions, messages)
+        self.attach_rollback_message_indexes(rollbacks, messages)
         summary = self.main_summary_from_row(row, messages)
         return {
             "summary": asdict(summary),
@@ -420,9 +729,47 @@ class SideConversationReader:
                 "git_origin_url": row["git_origin_url"],
             },
             "messages": [asdict(message) for message in messages],
+            "compactions": [asdict(checkpoint) for checkpoint in compactions],
+            "rollbacks": [asdict(checkpoint) for checkpoint in rollbacks],
             "related": self.related_for_main_thread(thread_id),
             "recovery_note": "Read from Codex's saved rollout transcript for this persisted session.",
         }
+
+    def search_thread(
+        self,
+        kind: str,
+        thread_id: str,
+        query: str,
+        filters: set[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_query = query.strip()
+        if not normalized_query:
+            return {"matchGroups": [], "totalMatches": 0}
+
+        if kind == "main":
+            row = self.main_thread_row(thread_id)
+            messages = self.rollout_messages(row["rollout_path"])
+            messages.append(thread_metadata_message(row))
+            messages.extend(self.response_metadata_messages(thread_id))
+            messages = finalize_messages(messages)
+        else:
+            candidates = {item["id"]: item for item in self.side_candidates()}
+            if thread_id not in candidates:
+                raise KeyError(thread_id)
+            history = self.history_entries({thread_id}).get(thread_id, [])
+            messages = self.conversation(thread_id, history, self.assistant_messages(thread_id))
+
+        lower_query = normalized_query.lower()
+        match_groups: list[dict[str, int]] = []
+        total_matches = 0
+        for index, message in enumerate(messages):
+            if filters is not None and message_filter_key(message) not in filters:
+                continue
+            count = count_occurrences(message.text.lower(), lower_query)
+            if count > 0:
+                match_groups.append({"messageIndex": index, "count": count})
+                total_matches += count
+        return {"matchGroups": match_groups, "totalMatches": total_matches}
 
     def main_thread_row(self, thread_id: str) -> sqlite3.Row:
         with connect_readonly(self.state_db) as conn:
@@ -438,6 +785,427 @@ class SideConversationReader:
             raise KeyError(thread_id)
         return row
 
+    def create_fork_before_compaction(
+        self, thread_id: str, line_number: int
+    ) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        rollout_path = row["rollout_path"]
+        if not rollout_path:
+            raise ValueError("Conversation does not have a rollout path")
+        source_path = Path(rollout_path).expanduser()
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+
+        checkpoints = self.rollout_compaction_checkpoints(rollout_path)
+        checkpoint = next(
+            (item for item in checkpoints if item.line_number == line_number),
+            None,
+        )
+        if checkpoint is None:
+            raise ValueError("Compaction checkpoint was not found in this conversation")
+        if checkpoint.copy_line_count <= 0:
+            raise ValueError("Cannot fork before the first rollout line")
+
+        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
+        if checkpoint.copy_line_count > len(lines):
+            raise ValueError("Compaction checkpoint is outside the rollout file")
+        source_session_meta = first_session_meta_line(lines)
+        if source_session_meta is None:
+            raise ValueError("Source rollout does not contain session metadata")
+
+        created_at = datetime.now(timezone.utc)
+        timestamp = utc_timestamp_ms(created_at)
+        fork_id = new_thread_id()
+        new_path = self.new_rollout_path(fork_id, created_at)
+        new_meta_line = synthetic_fork_session_meta_line(
+            source_session_meta,
+            source_thread_id=thread_id,
+            fork_thread_id=fork_id,
+            timestamp=timestamp,
+            row=row,
+        )
+        prefix_lines = lines[: checkpoint.copy_line_count]
+        self.write_synthetic_rollout(new_path, new_meta_line, prefix_lines, fork_id)
+        backup_path: str | None = None
+        try:
+            backup_path = str(self.backup_state_db())
+            self.insert_synthetic_thread_row(
+                source_thread_id=thread_id,
+                fork_thread_id=fork_id,
+                rollout_path=new_path,
+                created_at=created_at,
+                checkpoint=checkpoint,
+                prefix_lines=prefix_lines,
+            )
+        except Exception:
+            try:
+                new_path.unlink()
+            except OSError:
+                pass
+            raise
+
+        self.rollout_parent_cache.pop(str(new_path), None)
+        return {
+            "id": fork_id,
+            "parent_thread_id": thread_id,
+            "rollout_path": str(new_path),
+            "checkpoint": asdict(checkpoint),
+            "resume_command": f"codex resume {fork_id}",
+            "state_db_backup": backup_path,
+        }
+
+    def create_fork_before_rollback(
+        self, thread_id: str, line_number: int
+    ) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        rollout_path = row["rollout_path"]
+        if not rollout_path:
+            raise ValueError("Conversation does not have a rollout path")
+        source_path = Path(rollout_path).expanduser()
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+
+        checkpoints = self.rollout_rollback_checkpoints(rollout_path)
+        checkpoint = next(
+            (item for item in checkpoints if item.line_number == line_number),
+            None,
+        )
+        if checkpoint is None:
+            raise ValueError("Rollback marker was not found in this conversation")
+        if checkpoint.copy_line_count <= 0:
+            raise ValueError("Cannot fork before the first rollout line")
+
+        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
+        if checkpoint.copy_line_count > len(lines):
+            raise ValueError("Rollback marker is outside the rollout file")
+        source_session_meta = first_session_meta_line(lines)
+        if source_session_meta is None:
+            raise ValueError("Source rollout does not contain session metadata")
+
+        created_at = datetime.now(timezone.utc)
+        timestamp = utc_timestamp_ms(created_at)
+        fork_id = new_thread_id()
+        new_path = self.new_rollout_path(fork_id, created_at)
+        new_meta_line = synthetic_fork_session_meta_line(
+            source_session_meta,
+            source_thread_id=thread_id,
+            fork_thread_id=fork_id,
+            timestamp=timestamp,
+            row=row,
+        )
+        prefix_lines = lines[: checkpoint.copy_line_count]
+        self.write_synthetic_rollout(new_path, new_meta_line, prefix_lines, fork_id)
+        backup_path: str | None = None
+        try:
+            backup_path = str(self.backup_state_db())
+            self.insert_synthetic_thread_row(
+                source_thread_id=thread_id,
+                fork_thread_id=fork_id,
+                rollout_path=new_path,
+                created_at=created_at,
+                checkpoint=checkpoint,
+                prefix_lines=prefix_lines,
+                title=fork_title_from_source(row, "Undo rollback"),
+            )
+        except Exception:
+            try:
+                new_path.unlink()
+            except OSError:
+                pass
+            raise
+
+        self.rollout_parent_cache.pop(str(new_path), None)
+        return {
+            "id": fork_id,
+            "parent_thread_id": thread_id,
+            "rollout_path": str(new_path),
+            "rollback": asdict(checkpoint),
+            "resume_command": f"codex resume {fork_id}",
+            "state_db_backup": backup_path,
+        }
+
+    def create_fork_from_message(
+        self, thread_id: str, line_number: int
+    ) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        rollout_path = row["rollout_path"]
+        if not rollout_path:
+            raise ValueError("Conversation does not have a rollout path")
+        source_path = Path(rollout_path).expanduser()
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+
+        messages = self.rollout_messages(rollout_path)
+        target = next((item for item in messages if item.line_number == line_number), None)
+        if target is None:
+            raise ValueError("Target message was not found in this conversation")
+        if target.role != "user":
+            raise ValueError("Forks from a message can only target a user message")
+
+        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
+        if line_number <= 0:
+            raise ValueError("Cannot fork before the first rollout line")
+        if line_number > len(lines):
+            raise ValueError("Target message is outside the rollout file")
+        source_session_meta = first_session_meta_line(lines)
+        if source_session_meta is None:
+            raise ValueError("Source rollout does not contain session metadata")
+
+        created_at = datetime.now(timezone.utc)
+        timestamp = utc_timestamp_ms(created_at)
+        fork_id = new_thread_id()
+        new_path = self.new_rollout_path(fork_id, created_at)
+        new_meta_line = synthetic_fork_session_meta_line(
+            source_session_meta,
+            source_thread_id=thread_id,
+            fork_thread_id=fork_id,
+            timestamp=timestamp,
+            row=row,
+        )
+        prefix_lines = lines[:line_number]
+        self.write_synthetic_rollout(new_path, new_meta_line, prefix_lines, fork_id)
+        backup_path: str | None = None
+        try:
+            backup_path = str(self.backup_state_db())
+            self.insert_synthetic_thread_row(
+                source_thread_id=thread_id,
+                fork_thread_id=fork_id,
+                rollout_path=new_path,
+                created_at=created_at,
+                checkpoint=None,
+                prefix_lines=prefix_lines,
+                title=fork_title_from_message(target),
+            )
+        except Exception:
+            try:
+                new_path.unlink()
+            except OSError:
+                pass
+            raise
+
+        self.rollout_parent_cache.pop(str(new_path), None)
+        return {
+            "id": fork_id,
+            "parent_thread_id": thread_id,
+            "rollout_path": str(new_path),
+            "line_number": line_number,
+            "target": asdict(target),
+            "resume_command": f"codex resume {fork_id}",
+            "state_db_backup": backup_path,
+        }
+
+    def create_rollback_to_message(
+        self, thread_id: str, line_number: int
+    ) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        rollout_path = row["rollout_path"]
+        if not rollout_path:
+            raise ValueError("Conversation does not have a rollout path")
+        source_path = Path(rollout_path).expanduser()
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+
+        before_stat = source_path.stat()
+        messages = self.rollout_messages(rollout_path)
+        target = next((item for item in messages if item.line_number == line_number), None)
+        if target is None:
+            raise ValueError("Target message was not found in this conversation")
+        if target.role != "user":
+            raise ValueError("Rollbacks can only target a user message")
+        if target.rolled_back:
+            raise ValueError("Target message is already inside a rollback")
+
+        later_active_user_turns = [
+            message
+            for message in messages
+            if (
+                message.role == "user"
+                and not message.rolled_back
+                and message.line_number is not None
+                and message.line_number > line_number
+            )
+        ]
+        rollback_turns = len(later_active_user_turns)
+        if rollback_turns <= 0:
+            raise ValueError("There are no later active user turns to roll back")
+
+        current_stat = source_path.stat()
+        if (
+            current_stat.st_mtime_ns != before_stat.st_mtime_ns
+            or current_stat.st_size != before_stat.st_size
+        ):
+            raise ValueError("Conversation changed while preparing rollback; refresh and try again")
+
+        created_at = datetime.now(timezone.utc)
+        timestamp = utc_timestamp_ms(created_at)
+        state_backup_path = str(self.backup_state_db())
+        rollout_backup_path = str(self.backup_rollout_file(source_path))
+
+        current_stat = source_path.stat()
+        if (
+            current_stat.st_mtime_ns != before_stat.st_mtime_ns
+            or current_stat.st_size != before_stat.st_size
+        ):
+            raise ValueError("Conversation changed while preparing rollback; refresh and try again")
+
+        marker = rollback_event_line(timestamp, rollback_turns)
+        with source_path.open("a", encoding="utf-8") as handle:
+            handle.write(marker)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        state_update_error: str | None = None
+        try:
+            self.mark_thread_updated(thread_id, created_at)
+        except sqlite3.Error as exc:
+            state_update_error = str(exc)
+
+        self.rollout_rollback_cache.pop(str(source_path), None)
+        return {
+            "thread_id": thread_id,
+            "line_number": line_number,
+            "rollback_turns": rollback_turns,
+            "timestamp": timestamp,
+            "time": local_time(created_at.timestamp()),
+            "rollout_path": str(source_path),
+            "rollout_backup": rollout_backup_path,
+            "state_db_backup": state_backup_path,
+            "state_update_error": state_update_error,
+        }
+
+    def new_rollout_path(self, thread_id: str, created_at: datetime) -> Path:
+        local_created_at = created_at.astimezone()
+        directory = (
+            self.codex_home
+            / "sessions"
+            / local_created_at.strftime("%Y")
+            / local_created_at.strftime("%m")
+            / local_created_at.strftime("%d")
+        )
+        filename = f"rollout-{local_created_at.strftime('%Y-%m-%dT%H-%M-%S')}-{thread_id}.jsonl"
+        return directory / filename
+
+    def write_synthetic_rollout(
+        self,
+        rollout_path: Path,
+        session_meta_line: dict[str, Any],
+        copied_lines: list[str],
+        expected_thread_id: str,
+    ) -> None:
+        rollout_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = rollout_path.with_name(f".{rollout_path.name}.tmp")
+        if rollout_path.exists():
+            raise FileExistsError(rollout_path)
+        try:
+            with temp_path.open("x", encoding="utf-8") as handle:
+                handle.write(json.dumps(session_meta_line, ensure_ascii=False, separators=(",", ":")))
+                handle.write("\n")
+                handle.writelines(copied_lines)
+            validate_rollout_jsonl(temp_path, expected_thread_id)
+            os.replace(temp_path, rollout_path)
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def backup_rollout_file(self, rollout_path: Path) -> Path:
+        backup_name = (
+            f"{rollout_path.name}.codex-side-reader-backup-"
+            f"{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')}.jsonl"
+        )
+        backup_path = rollout_path.with_name(backup_name)
+        shutil.copy2(rollout_path, backup_path)
+        return backup_path
+
+    def backup_state_db(self) -> Path:
+        backup_name = (
+            f"{self.state_db.name}.codex-side-reader-backup-"
+            f"{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')}.sqlite"
+        )
+        backup_path = self.state_db.with_name(backup_name)
+        with open_readonly_connection(self.state_db) as source:
+            with sqlite3.connect(backup_path) as target:
+                source.backup(target)
+        return backup_path
+
+    def insert_synthetic_thread_row(
+        self,
+        *,
+        source_thread_id: str,
+        fork_thread_id: str,
+        rollout_path: Path,
+        created_at: datetime,
+        checkpoint: CompactionCheckpoint | RollbackCheckpoint | None,
+        prefix_lines: list[str],
+        title: str | None = None,
+    ) -> None:
+        epoch_seconds = int(created_at.timestamp())
+        epoch_millis = int(created_at.timestamp() * 1000)
+        with connect_writable(self.state_db) as conn:
+            source = conn.execute(
+                "select * from threads where id = ?",
+                (source_thread_id,),
+            ).fetchone()
+            if source is None:
+                raise KeyError(source_thread_id)
+            columns = [
+                item["name"]
+                for item in conn.execute("pragma table_info(threads)").fetchall()
+            ]
+            values = {column: source[column] for column in columns}
+            values.update(
+                {
+                    "id": fork_thread_id,
+                    "rollout_path": str(rollout_path),
+                    "created_at": epoch_seconds,
+                    "updated_at": epoch_seconds,
+                    "source": "cli",
+                    "thread_source": "user",
+                    "title": title or fork_title_from_source(source),
+                    "archived": 0,
+                    "archived_at": None,
+                    "tokens_used": token_count_from_rollout_lines(prefix_lines)
+                    or (source["tokens_used"] if "tokens_used" in source.keys() else 0),
+                    "agent_nickname": None,
+                    "agent_role": None,
+                    "agent_path": None,
+                    "created_at_ms": epoch_millis,
+                    "updated_at_ms": epoch_millis,
+                }
+            )
+            values = {column: values.get(column) for column in columns}
+            placeholders = ", ".join("?" for _ in columns)
+            column_sql = ", ".join(columns)
+            conn.execute(
+                f"insert into threads ({column_sql}) values ({placeholders})",
+                [values[column] for column in columns],
+            )
+
+    def mark_thread_updated(self, thread_id: str, updated_at: datetime) -> None:
+        epoch_seconds = int(updated_at.timestamp())
+        epoch_millis = int(updated_at.timestamp() * 1000)
+        with connect_writable(self.state_db) as conn:
+            columns = {
+                item["name"]
+                for item in conn.execute("pragma table_info(threads)").fetchall()
+            }
+            assignments: list[str] = []
+            params: list[int | str] = []
+            if "updated_at" in columns:
+                assignments.append("updated_at = ?")
+                params.append(epoch_seconds)
+            if "updated_at_ms" in columns:
+                assignments.append("updated_at_ms = ?")
+                params.append(epoch_millis)
+            if not assignments:
+                return
+            params.append(thread_id)
+            conn.execute(
+                f"update threads set {', '.join(assignments)} where id = ?",
+                params,
+            )
+
     def main_summary_from_row(
         self, row: sqlite3.Row, messages: list[Message] | None = None
     ) -> MainThreadSummary:
@@ -447,7 +1215,7 @@ class SideConversationReader:
         source = row["source"] or None
         model = row["model"] or None
         app_version = row["cli_version"] or None
-        parent_thread_id = parent_thread_id_from_source(source)
+        parent_thread_id = self.main_parent_thread_id(row)
         agent_nickname = row["agent_nickname"] or None
         agent_role = row["agent_role"] or None
         meta_parts = ["fork" if parent_thread_id else "main"]
@@ -491,7 +1259,7 @@ class SideConversationReader:
         parents: list[dict[str, Any]] = []
         try:
             current_row = self.main_thread_row(thread_id)
-            parent_thread_id = parent_thread_id_from_source(current_row["source"])
+            parent_thread_id = self.main_parent_thread_id(current_row)
             if parent_thread_id:
                 parent_row = self.main_thread_row(parent_thread_id)
                 parents.append(asdict(self.main_summary_from_row(parent_row)))
@@ -537,24 +1305,17 @@ class SideConversationReader:
                         (parent_thread_id,),
                     )
                 )
-                source_rows = conn.execute(
-                    f"""
-                    select {MAIN_THREAD_SELECT_COLUMNS}
-                    from threads
-                    where source like '%thread_spawn%'
-                    order by created_at
-                    """
-                ).fetchall()
         except sqlite3.Error:
-            return []
+            child_ids = set()
 
         summaries: list[MainThreadSummary] = []
-        for row in source_rows:
-            if parent_thread_id_from_source(row["source"]) == parent_thread_id:
-                child_ids.add(row["id"])
-
-        for row in self.main_rows_by_ids(child_ids):
-            summaries.append(self.main_summary_from_row(row))
+        seen: set[str] = set()
+        for row in self.main_thread_rows():
+            if row["id"] in child_ids or self.main_parent_thread_id(row) == parent_thread_id:
+                if row["id"] in seen:
+                    continue
+                seen.add(row["id"])
+                summaries.append(self.main_summary_from_row(row))
         summaries.sort(key=lambda item: (item.started_at or 0, item.id))
         return summaries
 
@@ -655,7 +1416,7 @@ class SideConversationReader:
             return []
         messages: list[Message] = []
         with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle, start=1):
                 line = line.strip()
                 if not line:
                     continue
@@ -665,8 +1426,40 @@ class SideConversationReader:
                     continue
                 message = self.message_from_rollout_event(item)
                 if message is not None and message.text.strip():
+                    message.line_number = line_number
                     messages.append(message)
-        return finalize_messages(messages)
+        messages = finalize_messages(messages)
+        annotate_rolled_back_messages(messages)
+        return messages
+
+    def rollout_search_index(self, rollout_path: str | None) -> tuple[str, list[tuple[str, str]]]:
+        if not rollout_path:
+            return "", []
+        path = Path(rollout_path).expanduser()
+        try:
+            stat = path.stat()
+        except OSError:
+            return "", []
+
+        cache_key = str(path)
+        cached = self.rollout_search_text_cache.get(cache_key)
+        if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2], cached[3]
+
+        entries = []
+        for message in self.rollout_messages(str(path)):
+            if not message.text.strip():
+                continue
+            display_text = normalize_display_text(message.text)
+            entries.append((display_text, display_text.lower()))
+        lower_text = "\n".join(entry[1] for entry in entries)
+        self.rollout_search_text_cache[cache_key] = (
+            stat.st_mtime_ns,
+            stat.st_size,
+            lower_text,
+            entries,
+        )
+        return lower_text, entries
 
     def message_from_rollout_event(self, item: dict[str, Any]) -> Message | None:
         payload = item.get("payload")
@@ -942,6 +1735,128 @@ def append_memory_citation(text: str, citation: Any) -> str:
     )
 
 
+def first_session_meta_line(lines: list[str]) -> dict[str, Any] | None:
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if item.get("type") != "session_meta":
+            return None
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        return item
+    return None
+
+
+def synthetic_fork_session_meta_line(
+    source_session_meta: dict[str, Any],
+    *,
+    source_thread_id: str,
+    fork_thread_id: str,
+    timestamp: str,
+    row: sqlite3.Row,
+) -> dict[str, Any]:
+    source_payload = source_session_meta.get("payload")
+    payload = dict(source_payload if isinstance(source_payload, dict) else {})
+    payload.update(
+        {
+            "id": fork_thread_id,
+            "forked_from_id": source_thread_id,
+            "timestamp": timestamp,
+            "cwd": row["cwd"] or payload.get("cwd") or str(Path.home()),
+            "originator": payload.get("originator") or "codex-tui",
+            "cli_version": row["cli_version"] or payload.get("cli_version") or "",
+            "source": "cli",
+            "thread_source": "user",
+            "model_provider": row["model_provider"] or payload.get("model_provider"),
+        }
+    )
+    for key in ("agent_nickname", "agent_role", "agent_path", "agent_type"):
+        payload.pop(key, None)
+    return {
+        "timestamp": timestamp,
+        "type": "session_meta",
+        "payload": payload,
+    }
+
+
+def validate_rollout_jsonl(path: Path, expected_thread_id: str) -> None:
+    first: dict[str, Any] | None = None
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at line {line_number}: {exc}") from exc
+            if first is None:
+                first = item
+    if first is None:
+        raise ValueError("Generated rollout file is empty")
+    payload = first.get("payload")
+    if first.get("type") != "session_meta" or not isinstance(payload, dict):
+        raise ValueError("Generated rollout does not start with session metadata")
+    if payload.get("id") != expected_thread_id:
+        raise ValueError("Generated rollout session metadata has the wrong thread id")
+
+
+def rollback_event_line(timestamp: str, rollback_turns: int) -> str:
+    item = {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "thread_rolled_back",
+            "num_turns": rollback_turns,
+        },
+    }
+    return json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def token_count_from_rollout_lines(lines: list[str]) -> int:
+    total = 0
+    for line in lines:
+        if "token_count" not in line or "total_token_usage" not in line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = item.get("payload")
+        if item.get("type") != "event_msg" or not isinstance(payload, dict):
+            continue
+        if payload.get("type") != "token_count":
+            continue
+        usage = (
+            payload.get("info", {})
+            if isinstance(payload.get("info"), dict)
+            else {}
+        ).get("total_token_usage")
+        if not isinstance(usage, dict):
+            continue
+        value = usage.get("total_tokens")
+        if isinstance(value, int | float):
+            total = max(0, int(value))
+    return total
+
+
+def fork_title_from_source(row: sqlite3.Row, prefix: str = "Fork before compaction") -> str:
+    title = row["title"] if "title" in row.keys() else ""
+    first_user_message = (
+        row["first_user_message"] if "first_user_message" in row.keys() else ""
+    )
+    source = title or first_user_message or row["id"]
+    return compact(f"{prefix}: {source}", 180)
+
+
+def fork_title_from_message(message: Message) -> str:
+    return compact(f"Fork from message: {message.text}", 180)
+
+
 def session_meta_message(payload: dict[str, Any], timestamp: int | None) -> Message:
     fields = [
         ("Thread ID", payload.get("id")),
@@ -1034,6 +1949,17 @@ def compacted_message(payload: dict[str, Any], timestamp: int | None) -> Message
     return event_message("Context Compacted", fields, blocks, timestamp, "rollout compacted", "compaction")
 
 
+def compaction_checkpoint_summary(payload: dict[str, Any], kind: str) -> str:
+    if kind == "compacted":
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            return compact(message, 110)
+        replacement_history = payload.get("replacement_history")
+        if isinstance(replacement_history, list):
+            return f"{len(replacement_history)} replacement history items"
+    return "Context compaction checkpoint"
+
+
 def event_message_from_payload(payload: dict[str, Any], timestamp: int | None) -> Message | None:
     payload_type = payload.get("type")
     if not isinstance(payload_type, str):
@@ -1041,7 +1967,13 @@ def event_message_from_payload(payload: dict[str, Any], timestamp: int | None) -
     if payload_type == "context_compacted":
         return event_message("Context Compacted", [], [], timestamp, "rollout event_msg", "compaction")
     if payload_type == "thread_rolled_back":
-        return event_message(
+        rollback_turns_value = payload.get("num_turns")
+        rollback_turns = (
+            int(rollback_turns_value)
+            if isinstance(rollback_turns_value, int | float)
+            else None
+        )
+        message = event_message(
             "Thread Rolled Back",
             [("Turns Removed", payload.get("num_turns"))],
             [],
@@ -1049,6 +1981,8 @@ def event_message_from_payload(payload: dict[str, Any], timestamp: int | None) -
             "rollout event_msg",
             "rollback",
         )
+        message.rollback_turns = rollback_turns
+        return message
     if payload_type == "turn_aborted":
         return event_message(
             "Turn Aborted",
@@ -1555,6 +2489,8 @@ def sanitize_value(value: Any, key: str | None = None) -> Any:
     if isinstance(value, str):
         if key == "result" and len(value) > 10000:
             return f"{OMITTED_IMAGE_RESULT_LABEL} ({len(value)} chars)"
+        if is_large_data_image(value):
+            return f"(base64 image data omitted; {len(value)} chars)"
         return truncate_block(value)
     if isinstance(value, dict):
         return {str(item_key): sanitize_value(item_value, str(item_key)) for item_key, item_value in value.items()}
@@ -1567,6 +2503,10 @@ def truncate_block(value: str) -> str:
     if len(value) <= MAX_EVENT_BLOCK_CHARS:
         return value
     return f"{value[:MAX_EVENT_BLOCK_CHARS].rstrip()}\n\n... truncated {len(value) - MAX_EVENT_BLOCK_CHARS} chars ..."
+
+
+def is_large_data_image(value: str) -> bool:
+    return len(value) > 1000 and value.startswith("data:image/") and ";base64," in value[:100]
 
 
 def local_time_from_epoch(value: Any) -> str | None:
@@ -1649,7 +2589,7 @@ def split_tool_output(value: Any) -> tuple[list[str], str, str]:
         terminal_split = split_terminal_output(value)
         if terminal_split is not None:
             return terminal_split
-        return [], value, "text"
+        return [], truncate_block(value), "text"
     if isinstance(value, dict) and "output" in value:
         metadata = metadata_lines(value.get("metadata"))
         output_text, language = format_tool_value(value.get("output"))
@@ -1668,7 +2608,7 @@ def split_terminal_output(value: str) -> tuple[list[str], str, str] | None:
         return None
     metadata_text = normalized[:marker_index].strip("\n")
     output_text = normalized[marker_index + len(marker) :]
-    return [line for line in metadata_text.splitlines() if line.strip()], output_text or "(empty)", "text"
+    return [line for line in metadata_text.splitlines() if line.strip()], truncate_block(output_text or "(empty)"), "text"
 
 
 def metadata_lines(value: Any) -> list[str]:
@@ -1699,12 +2639,12 @@ def format_tool_value(value: Any) -> tuple[str, str]:
         try:
             parsed = json.loads(stripped)
         except json.JSONDecodeError:
-            return value, "text"
+            return truncate_block(value), "text"
         if isinstance(parsed, dict | list):
-            return json.dumps(parsed, ensure_ascii=False, indent=2), "json"
-        return value, "text"
+            return safe_json(parsed), "json"
+        return truncate_block(value), "text"
     if isinstance(value, dict | list):
-        return json.dumps(value, ensure_ascii=False, indent=2), "json"
+        return safe_json(value), "json"
     return str(value), "text"
 
 
@@ -1823,13 +2763,131 @@ def message_from_event(event: dict[str, Any], timestamp: int) -> Message | None:
     return None
 
 
-def message_sort_key(message: Message) -> tuple[int, int, str]:
-    role_order = {"event": 0, "user": 1, "thinking": 2, "tool": 3, "assistant": 4}
-    return (
-        message.timestamp if message.timestamp is not None else 0,
-        role_order.get(message.role, 9),
-        message.item_id or "",
+def message_sort_key(message: Message) -> tuple[float]:
+    return (float(message.timestamp if message.timestamp is not None else 0),)
+
+
+def message_filter_key(message: Message) -> str:
+    if message.rolled_back:
+        return "rolledBack"
+    if message.role in {"user", "assistant", "thinking", "tool"}:
+        return message.role
+    if message.role != "event":
+        return "otherEvent"
+    phase = message.phase or ""
+    if phase == "compaction":
+        return "compaction"
+    if phase in {"rollback", "aborted", "error"}:
+        return "important"
+    if phase in {
+        "patch",
+        "search",
+        "image",
+        "response",
+        "thread",
+        "session",
+        "context",
+        "turn",
+        "usage",
+    }:
+        return phase
+    return "otherEvent"
+
+
+def normalize_search_query(value: str) -> str:
+    return normalize_display_text(str(value or "")).lower()
+
+
+def normalize_display_text(value: str) -> str:
+    return " ".join(str(value or "").split())
+
+
+def summary_matches_search(summary: Any, normalized_query: str) -> bool:
+    values = [
+        getattr(summary, "id", None),
+        getattr(summary, "preview", None),
+        getattr(summary, "started", None),
+        getattr(summary, "ended", None),
+        getattr(summary, "updated", None),
+        getattr(summary, "cwd", None),
+        getattr(summary, "model", None),
+        getattr(summary, "app_version", None),
+        getattr(summary, "source", None),
+        getattr(summary, "meta_label", None),
+    ]
+    return normalized_query in normalize_search_query(" ".join(str(item) for item in values if item))
+
+
+def conversation_match_snippet(messages: list[Message], normalized_query: str) -> str | None:
+    return search_text_match_snippet(
+        [message.text for message in messages if message.text.strip()],
+        normalized_query,
     )
+
+
+def search_text_match_snippet(
+    values: list[str], normalized_query: str, limit: int = 180
+) -> str | None:
+    if not normalized_query:
+        return None
+    for value in values:
+        normalized = normalize_display_text(value)
+        if not normalized:
+            continue
+        snippet = search_normalized_text_match_snippet(
+            normalized,
+            normalized.lower(),
+            normalized_query,
+            limit,
+        )
+        if snippet:
+            return snippet
+    return None
+
+
+def search_indexed_text_match_snippet(
+    entries: list[tuple[str, str]], normalized_query: str, limit: int = 180
+) -> str | None:
+    for display_text, lower_text in entries:
+        snippet = search_normalized_text_match_snippet(
+            display_text,
+            lower_text,
+            normalized_query,
+            limit,
+        )
+        if snippet:
+            return snippet
+    return None
+
+
+def search_normalized_text_match_snippet(
+    display_text: str, lower_text: str, normalized_query: str, limit: int = 180
+) -> str | None:
+    if not normalized_query:
+        return None
+    match_at = lower_text.find(normalized_query)
+    if match_at == -1:
+        return None
+    context = max(24, (limit - len(normalized_query)) // 2)
+    start = max(0, match_at - context)
+    end = min(len(display_text), match_at + len(normalized_query) + context)
+    snippet = display_text[start:end].strip()
+    if start > 0:
+        snippet = f"...{snippet}"
+    if end < len(display_text):
+        snippet = f"{snippet}..."
+    return snippet
+
+
+def count_occurrences(text: str, query: str) -> int:
+    if not query:
+        return 0
+    count = 0
+    start = text.find(query)
+    while start != -1:
+        count += 1
+        start = text.find(query, start + len(query))
+    return count
 
 
 def finalize_messages(messages: list[Message]) -> list[Message]:
@@ -1838,18 +2896,91 @@ def finalize_messages(messages: list[Message]) -> list[Message]:
     return merge_tool_outputs(deduped)
 
 
+def annotate_rolled_back_messages(messages: list[Message]) -> None:
+    for rollback_index, message in enumerate(messages):
+        if message.role != "event" or message.phase != "rollback":
+            continue
+        turns_to_mark = message.rollback_turns or 1
+        if turns_to_mark <= 0:
+            continue
+        ranges = rollback_turn_ranges(messages, rollback_index, turns_to_mark)
+        if not ranges:
+            continue
+        rolled_back_at = message.time or local_time(message.timestamp)
+        rollback_group = rollback_group_id(message.timestamp, rollback_index)
+        for start, end in ranges:
+            for candidate in messages[start:end]:
+                if candidate.role not in {"user", "assistant", "thinking", "tool"}:
+                    continue
+                candidate.rolled_back = True
+                candidate.rolled_back_at = rolled_back_at
+                candidate.rolled_back_by_timestamp = message.timestamp
+                candidate.rollback_group = rollback_group
+
+
+def rollback_group_id(timestamp: int | float | None, fallback_index: int) -> str:
+    if timestamp is not None:
+        return f"rollback-{timestamp}"
+    return f"rollback-index-{fallback_index}"
+
+
+def rollback_turn_ranges(
+    messages: list[Message],
+    rollback_index: int,
+    turns_to_mark: int,
+) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    range_end = rollback_index
+    search_index = rollback_index - 1
+    while turns_to_mark > 0 and search_index >= 0:
+        while search_index >= 0 and not is_active_user_message(messages[search_index]):
+            search_index -= 1
+        if search_index < 0:
+            break
+        ranges.append((search_index, range_end))
+        range_end = search_index
+        search_index -= 1
+        turns_to_mark -= 1
+    return ranges
+
+
+def is_active_user_message(message: Message) -> bool:
+    return message.role == "user" and not message.rolled_back
+
+
 def dedupe_messages(messages: list[Message]) -> list[Message]:
     by_signature: dict[tuple[str, str, int | None], Message] = {}
+    recent_by_content: dict[tuple[str, str | None, str], tuple[int, Message]] = {}
     order: list[tuple[str, str, int | None]] = []
     for message in messages:
+        content_signature = (message.role, message.phase, message.text)
+        recent = recent_by_content.get(content_signature)
+        if recent is not None:
+            recent_index, recent_message = recent
+            recent_timestamp = recent_message.timestamp
+            current_timestamp = message.timestamp
+            if (
+                recent_timestamp is not None
+                and current_timestamp is not None
+                and abs(float(current_timestamp) - float(recent_timestamp))
+                <= DUPLICATE_MESSAGE_WINDOW_SECONDS
+            ):
+                if message_priority(message) > message_priority(recent_message):
+                    recent_order_signature = order[recent_index]
+                    by_signature[recent_order_signature] = message
+                    recent_by_content[content_signature] = (recent_index, message)
+                continue
+
         signature = (message.role, message.text, message.timestamp)
         current = by_signature.get(signature)
         if current is None:
             by_signature[signature] = message
             order.append(signature)
+            recent_by_content[content_signature] = (len(order) - 1, message)
             continue
         if message_priority(message) > message_priority(current):
             by_signature[signature] = message
+            recent_by_content[content_signature] = (order.index(signature), message)
     return [by_signature[signature] for signature in order]
 
 
@@ -1894,6 +3025,7 @@ def merge_tool_outputs(messages: list[Message]) -> list[Message]:
                         source=message.source,
                         phase="call + output",
                         item_id=message.item_id,
+                        line_number=message.line_number,
                     )
                 )
                 consumed_outputs.add(id(output))
@@ -1997,6 +3129,14 @@ def compact(text: str, limit: int = 140) -> str:
     return normalized[: limit - 1].rstrip() + "..."
 
 
+def parse_filter_param(value: str) -> set[str]:
+    return {item for item in value.split(",") if item}
+
+
+def parse_bool_param(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class AppHandler(BaseHTTPRequestHandler):
     reader = SideConversationReader()
 
@@ -2016,16 +3156,40 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_asset_file(ASSET_ROOT / rel)
             elif path == "/api/status":
                 self.send_json(self.status_payload())
+            elif path == "/api/search":
+                params = parse_qs(parsed.query)
+                thread_id = params.get("thread_id", [None])[0]
+                kind = params.get("kind", ["side"])[0]
+                query = params.get("q", [""])[0]
+                filter_values = params.get("filters", [])
+                filters = parse_filter_param(filter_values[0]) if filter_values else None
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread_id")
+                    return
+                if kind not in {"main", "side"}:
+                    self.send_error_json(400, "Invalid kind")
+                    return
+                self.send_json(self.reader.search_thread(kind, thread_id, query, filters))
             elif path == "/api/threads":
-                self.send_json([asdict(item) for item in self.reader.list_threads()])
+                params = parse_qs(parsed.query)
+                query = params.get("q", [""])[0]
+                full_text = parse_bool_param(params.get("full_text", ["0"])[0])
+                self.send_json(
+                    [asdict(item) for item in self.reader.list_threads(query, full_text)]
+                )
             elif path.startswith("/api/threads/"):
                 thread_id = unquote(path.removeprefix("/api/threads/"))
                 self.send_json(self.reader.get_thread(thread_id))
             elif path == "/api/main-threads":
                 params = parse_qs(parsed.query)
                 list_filter = params.get("filter", ["all"])[0]
+                query = params.get("q", [""])[0]
+                full_text = parse_bool_param(params.get("full_text", ["0"])[0])
                 self.send_json(
-                    [asdict(item) for item in self.reader.list_main_threads(list_filter)]
+                    [
+                        asdict(item)
+                        for item in self.reader.list_main_threads(list_filter, query, full_text)
+                    ]
                 )
             elif path.startswith("/api/main-threads/"):
                 thread_id = unquote(path.removeprefix("/api/main-threads/"))
@@ -2051,6 +3215,113 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error_json(500, f"SQLite error: {exc}")
         except OSError as exc:
             self.send_error_json(500, f"I/O error: {exc}")
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            create_rollback_suffix = "/rollback-to-message"
+            fork_message_suffix = "/fork-from-message"
+            rollback_suffix = "/fork-before-rollback"
+            compaction_suffix = "/fork-before-compaction"
+            if path.startswith("/api/main-threads/") and path.endswith(create_rollback_suffix):
+                thread_id = unquote(
+                    path.removeprefix("/api/main-threads/")[: -len(create_rollback_suffix)]
+                ).strip("/")
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread id")
+                    return
+                payload = self.read_json_body()
+                line_number = payload.get("line_number")
+                if not isinstance(line_number, int):
+                    self.send_error_json(400, "Missing target line_number")
+                    return
+                self.send_json(
+                    self.reader.create_rollback_to_message(thread_id, line_number),
+                    status=201,
+                )
+                return
+            if path.startswith("/api/main-threads/") and path.endswith(fork_message_suffix):
+                thread_id = unquote(
+                    path.removeprefix("/api/main-threads/")[: -len(fork_message_suffix)]
+                ).strip("/")
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread id")
+                    return
+                payload = self.read_json_body()
+                line_number = payload.get("line_number")
+                if not isinstance(line_number, int):
+                    self.send_error_json(400, "Missing target line_number")
+                    return
+                self.send_json(
+                    self.reader.create_fork_from_message(thread_id, line_number),
+                    status=201,
+                )
+                return
+            if path.startswith("/api/main-threads/") and path.endswith(rollback_suffix):
+                thread_id = unquote(
+                    path.removeprefix("/api/main-threads/")[: -len(rollback_suffix)]
+                ).strip("/")
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread id")
+                    return
+                payload = self.read_json_body()
+                line_number = payload.get("line_number")
+                if not isinstance(line_number, int):
+                    self.send_error_json(400, "Missing rollback line_number")
+                    return
+                self.send_json(
+                    self.reader.create_fork_before_rollback(thread_id, line_number),
+                    status=201,
+                )
+                return
+            if path.startswith("/api/main-threads/") and path.endswith(compaction_suffix):
+                thread_id = unquote(
+                    path.removeprefix("/api/main-threads/")[: -len(compaction_suffix)]
+                ).strip("/")
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread id")
+                    return
+                payload = self.read_json_body()
+                line_number = payload.get("line_number")
+                if not isinstance(line_number, int):
+                    self.send_error_json(400, "Missing compaction line_number")
+                    return
+                self.send_json(
+                    self.reader.create_fork_before_compaction(thread_id, line_number),
+                    status=201,
+                )
+                return
+            self.send_error_json(404, "Not found")
+        except ValueError as exc:
+            self.send_error_json(400, str(exc))
+        except KeyError:
+            self.send_error_json(404, "Conversation not found")
+        except FileExistsError as exc:
+            self.send_error_json(409, f"Generated rollout already exists: {exc}")
+        except FileNotFoundError as exc:
+            self.send_error_json(500, f"Missing Codex file: {exc}")
+        except sqlite3.Error as exc:
+            self.send_error_json(500, f"SQLite error: {exc}")
+        except OSError as exc:
+            self.send_error_json(500, f"I/O error: {exc}")
+
+    def read_json_body(self) -> dict[str, Any]:
+        length_value = self.headers.get("Content-Length", "0")
+        try:
+            length = int(length_value)
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length") from exc
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid JSON body") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -2103,7 +3374,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
     def send_json(self, payload: Any, status: int = 200) -> None:
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

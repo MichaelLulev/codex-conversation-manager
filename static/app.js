@@ -4,7 +4,6 @@ const MODES = {
     listUrl: "/api/main-threads",
     detailUrl: (id) => `/api/main-threads/${encodeURIComponent(id)}`,
     searchPlaceholder: "Search main conversations",
-    notice: "Main conversations are read from saved Codex rollout transcripts.",
     empty: "Select a main conversation to read it.",
     exportPrefix: "codex-main"
   },
@@ -13,7 +12,6 @@ const MODES = {
     listUrl: "/api/threads",
     detailUrl: (id) => `/api/threads/${encodeURIComponent(id)}`,
     searchPlaceholder: "Search recovered side chats",
-    notice: "Recovered from diagnostic logs and prompt history. These are not normal resumable Codex sessions.",
     empty: "Select a side conversation to read it.",
     exportPrefix: "codex-side"
   }
@@ -23,12 +21,17 @@ const MAIN_FILTER_LABELS = {
   all: "conversations",
   with_side: "with side conversations",
   with_forks: "with forks",
-  forked: "forked conversations"
+  forked: "forked conversations",
+  with_rollback: "with rollbacks"
 };
 
-const MESSAGE_RENDER_BATCH_SIZE = 20;
+const MESSAGE_RENDER_BATCH_SIZE = 100;
+const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
-const CONVERSATION_SEARCH_DEBOUNCE_MS = 140;
+const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
+const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
+const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
+const SEARCH_WORKER_URL = "/static/search-worker.js";
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
 const SEARCH_TEXT_CACHE = new WeakMap();
 const MESSAGE_FILTER_STORAGE_KEY = "codex-reader-message-filters";
@@ -37,7 +40,8 @@ const MESSAGE_FILTER_DESCRIPTIONS = {
   assistant: "Codex replies and progress updates.",
   thinking: "Visible reasoning summaries saved by Codex.",
   tool: "Tool calls and outputs, including shell, MCP, custom tools, and image viewing.",
-  important: "Errors, aborted turns, and rollbacks.",
+  rolledBack: "Messages from turns removed with Esc Esc rollback/undo. Codex still keeps them in the raw transcript.",
+  important: "Errors, aborted turns, and rollback markers.",
   compaction: "Context-compaction events and replacement summaries.",
   patch: "Patch summaries and changed-file metadata.",
   search: "Saved web-search call and completion metadata.",
@@ -55,6 +59,7 @@ const MESSAGE_FILTERS = [
   { key: "assistant", label: "Assistant", defaultEnabled: true },
   { key: "thinking", label: "Thinking", defaultEnabled: true },
   { key: "tool", label: "Tools", defaultEnabled: true },
+  { key: "rolledBack", label: "Rolled back", defaultEnabled: true },
   { key: "important", label: "Important events", defaultEnabled: true },
   { key: "compaction", label: "Compactions", defaultEnabled: true },
   { key: "patch", label: "Patches", defaultEnabled: false },
@@ -76,17 +81,42 @@ const state = {
   selectedId: null,
   currentThread: null,
   pendingBranchId: null,
+  pendingScrollTarget: null,
   scrollAnimationFrame: null,
   listRequestId: 0,
+  listAbortController: null,
   detailRequestId: 0,
   detailAbortController: null,
   renderRequestId: 0,
+  fullTextSearch: false,
+  serverSearchActive: false,
+  threadSearchTimer: null,
+  messagesFrameResizeObserver: null,
+  messagesFrameSyncTimers: [],
+  messagesFrameScrollbarWidth: null,
+  expandedMessages: new Set(),
+  expandedToolRuns: new Set(),
+  toolRunByMessageIndex: new Map(),
+  confirmDialog: {
+    resolve: null,
+    previousFocus: null
+  },
   conversationSearch: {
-    matches: [],
+    matchGroups: [],
+    totalMatches: 0,
     activeIndex: -1,
     lowerQuery: "",
     queryLength: 0,
-    timer: null
+    timer: null,
+    inputFrame: null,
+    abortController: null,
+    requestId: 0,
+    worker: null,
+    workerReady: false,
+    workerRevision: 0,
+    workerIndexing: false,
+    pendingWorkerSearch: false,
+    activeMarks: []
   },
   messageFilters: loadMessageFilters(),
   filter: ""
@@ -97,15 +127,16 @@ const els = {
   sourceLine: document.getElementById("source-line"),
   refreshButton: document.getElementById("refresh-button"),
   exportButton: document.getElementById("export-button"),
+  exportFormatSelect: document.getElementById("export-format-select"),
   copyIdButton: document.getElementById("copy-id-button"),
   mainModeButton: document.getElementById("main-mode-button"),
   sideModeButton: document.getElementById("side-mode-button"),
   searchInput: document.getElementById("search-input"),
+  fullTextSearchInput: document.getElementById("full-text-search-input"),
   mainFilterRow: document.getElementById("main-filter-row"),
   mainFilterSelect: document.getElementById("main-filter-select"),
   threadStats: document.getElementById("thread-stats"),
   threadList: document.getElementById("thread-list"),
-  notice: document.getElementById("notice"),
   emptyState: document.getElementById("empty-state"),
   emptyStateMessage: document.getElementById("empty-state-message"),
   conversationView: document.getElementById("conversation-view"),
@@ -124,18 +155,292 @@ const els = {
   messageFilterOptions: document.getElementById("message-filter-options"),
   messageFilterDefaults: document.getElementById("message-filter-defaults"),
   messageFilterAll: document.getElementById("message-filter-all"),
-  messages: document.getElementById("messages")
+  confirmModal: document.getElementById("confirm-modal"),
+  confirmModalTitle: document.getElementById("confirm-modal-title"),
+  confirmModalBody: document.getElementById("confirm-modal-body"),
+  confirmModalDetails: document.getElementById("confirm-modal-details"),
+  confirmCancelButton: document.getElementById("confirm-cancel-button"),
+  confirmConfirmButton: document.getElementById("confirm-confirm-button"),
+  messagesFrame: document.getElementById("messages-frame"),
+  messagesDocument: null,
+  messages: null
 };
+
+function setupConfirmModal() {
+  els.confirmCancelButton.addEventListener("click", () => settleConfirmDialog(false));
+  els.confirmConfirmButton.addEventListener("click", () => settleConfirmDialog(true));
+  els.confirmModal.addEventListener("click", (event) => {
+    if (event.target?.dataset?.confirmCancel !== undefined) {
+      settleConfirmDialog(false);
+    }
+  });
+  els.confirmModal.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      settleConfirmDialog(false);
+      return;
+    }
+    if (event.key === "Tab") {
+      keepFocusInConfirmDialog(event);
+    }
+  });
+}
+
+function confirmWriteAction({
+  title,
+  body,
+  details = [],
+  confirmLabel = "Confirm",
+  opener = null
+}) {
+  if (state.confirmDialog.resolve) {
+    return Promise.resolve(false);
+  }
+  state.confirmDialog.previousFocus = opener || document.activeElement;
+  els.confirmModalTitle.textContent = title;
+  els.confirmModalBody.textContent = body;
+  els.confirmConfirmButton.textContent = confirmLabel;
+  renderConfirmDetails(details);
+  els.confirmModal.classList.remove("hidden");
+  window.requestAnimationFrame(() => {
+    els.confirmConfirmButton.focus({ preventScroll: true });
+  });
+  return new Promise((resolve) => {
+    state.confirmDialog.resolve = resolve;
+  });
+}
+
+function renderConfirmDetails(details) {
+  const fragment = document.createDocumentFragment();
+  for (const detail of details) {
+    if (!detail || detail.value === undefined || detail.value === null || detail.value === "") {
+      continue;
+    }
+    const row = document.createElement("div");
+    row.className = "confirm-detail-row";
+
+    const term = document.createElement("dt");
+    term.textContent = detail.label;
+
+    const value = document.createElement("dd");
+    const textValue = String(detail.value);
+    setAutoDirection(value, textValue);
+    value.textContent = textValue;
+
+    row.append(term, value);
+    fragment.appendChild(row);
+  }
+  els.confirmModalDetails.replaceChildren(fragment);
+}
+
+function settleConfirmDialog(confirmed) {
+  const resolve = state.confirmDialog.resolve;
+  if (!resolve) {
+    return;
+  }
+  const previousFocus = state.confirmDialog.previousFocus;
+  state.confirmDialog.resolve = null;
+  state.confirmDialog.previousFocus = null;
+  els.confirmModal.classList.add("hidden");
+  els.confirmModalDetails.replaceChildren();
+  resolve(confirmed);
+  if (previousFocus && typeof previousFocus.focus === "function" && previousFocus.isConnected) {
+    window.requestAnimationFrame(() => {
+      previousFocus.focus({ preventScroll: true });
+    });
+  }
+}
+
+function keepFocusInConfirmDialog(event) {
+  const focusable = [els.confirmCancelButton, els.confirmConfirmButton].filter(
+    (element) => element && !element.disabled
+  );
+  if (focusable.length === 0) {
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus({ preventScroll: true });
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus({ preventScroll: true });
+  }
+}
+
+function setupMessagesFrame() {
+  const frame = els.messagesFrame;
+  const doc = frame?.contentDocument || frame?.contentWindow?.document;
+  if (!frame || !doc) {
+    throw new Error("Conversation message frame is unavailable");
+  }
+  doc.open();
+  doc.write(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <base href="${window.location.origin}/">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      html {
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+      }
+      body {
+        width: 100%;
+        max-width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        overflow-x: hidden;
+        overflow-y: scroll;
+        overscroll-behavior: contain;
+      }
+    </style>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body id="messages-root" class="messages messages-frame-body" aria-hidden="true"></body>
+</html>`);
+  doc.close();
+  els.messagesDocument = doc;
+  els.messages = doc.getElementById("messages-root");
+  if (!els.messages) {
+    throw new Error("Conversation message root is unavailable");
+  }
+  installMessagesFrameResizeSync();
+  scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800] });
+}
+
+function installMessagesFrameResizeSync() {
+  if (state.messagesFrameResizeObserver || !els.messagesFrame) {
+    return;
+  }
+  if ("ResizeObserver" in window) {
+    state.messagesFrameResizeObserver = new ResizeObserver(() => {
+      scheduleMessagesFrameSync({ frames: 2, delays: [80] });
+    });
+    state.messagesFrameResizeObserver.observe(els.messagesFrame);
+    state.messagesFrameResizeObserver.observe(els.conversationView);
+  }
+  window.addEventListener("resize", () => scheduleMessagesFrameSync({ frames: 3, delays: [100, 300] }));
+  window.addEventListener("focus", () => scheduleMessagesFrameSync({ frames: 3, delays: [80] }));
+  window.addEventListener("blur", () => syncMessagesFrameViewport());
+}
+
+function scheduleMessagesFrameSync({ frames = 2, delays = [] } = {}) {
+  clearMessagesFrameSyncTimers();
+  const runFrame = (remaining) => {
+    syncMessagesFrameViewport();
+    if (remaining > 0) {
+      const id = window.requestAnimationFrame(() => runFrame(remaining - 1));
+      state.messagesFrameSyncTimers.push({ type: "frame", id });
+    }
+  };
+  const frameId = window.requestAnimationFrame(() => runFrame(frames));
+  state.messagesFrameSyncTimers.push({ type: "frame", id: frameId });
+  for (const delay of delays) {
+    const id = window.setTimeout(() => syncMessagesFrameViewport(), delay);
+    state.messagesFrameSyncTimers.push({ type: "timeout", id });
+  }
+}
+
+function clearMessagesFrameSyncTimers() {
+  for (const item of state.messagesFrameSyncTimers) {
+    if (item.type === "frame") {
+      window.cancelAnimationFrame(item.id);
+    } else {
+      window.clearTimeout(item.id);
+    }
+  }
+  state.messagesFrameSyncTimers = [];
+}
+
+function syncMessagesFrameViewport() {
+  const frame = els.messagesFrame;
+  const root = els.messages;
+  const doc = els.messagesDocument;
+  if (!frame || !root || !doc || els.conversationView.classList.contains("hidden")) {
+    return false;
+  }
+  const frameRect = frame.getBoundingClientRect();
+  const viewRect = els.conversationView.getBoundingClientRect();
+  const contentWidth = Math.max(1, Math.round(viewRect.width));
+  const scrollbarWidth = measureMessagesFrameScrollbarWidth(doc);
+  const width = contentWidth + scrollbarWidth;
+  const height = Math.max(1, Math.round(viewRect.bottom - frameRect.top));
+  if (width <= 1 || height <= 1) {
+    return false;
+  }
+  const widthPx = `${width}px`;
+  const heightPx = `${height}px`;
+  if (frame.getAttribute("width") !== String(width)) {
+    frame.setAttribute("width", String(width));
+  }
+  if (frame.getAttribute("height") !== String(height)) {
+    frame.setAttribute("height", String(height));
+  }
+  frame.style.width = widthPx;
+  frame.style.height = heightPx;
+  doc.documentElement.style.width = widthPx;
+  doc.documentElement.style.height = heightPx;
+  doc.body.style.width = widthPx;
+  doc.body.style.height = heightPx;
+  root.style.width = widthPx;
+  root.style.height = heightPx;
+  // Force WebKitGTK to materialize the iframe viewport before the next paint.
+  void frame.offsetWidth;
+  void root.offsetWidth;
+  return true;
+}
+
+function measureMessagesFrameScrollbarWidth(doc) {
+  if (state.messagesFrameScrollbarWidth !== null) {
+    return state.messagesFrameScrollbarWidth;
+  }
+  const probe = doc.createElement("div");
+  probe.style.cssText = [
+    "position:absolute",
+    "top:-9999px",
+    "left:-9999px",
+    "width:100px",
+    "height:100px",
+    "overflow:scroll",
+    "visibility:hidden"
+  ].join(";");
+  const child = doc.createElement("div");
+  child.style.width = "200px";
+  child.style.height = "200px";
+  probe.appendChild(child);
+  doc.body.appendChild(probe);
+  state.messagesFrameScrollbarWidth = Math.max(0, probe.offsetWidth - probe.clientWidth);
+  probe.remove();
+  return state.messagesFrameScrollbarWidth;
+}
 
 function modeConfig() {
   return MODES[state.mode];
 }
 
 function listUrl() {
-  if (state.mode !== "main") {
-    return modeConfig().listUrl;
+  const url = new URL(modeConfig().listUrl, window.location.origin);
+  if (state.mode === "main") {
+    url.searchParams.set("filter", state.mainFilter);
   }
-  return `${modeConfig().listUrl}?filter=${encodeURIComponent(state.mainFilter)}`;
+  if (threadSearchUsesServer()) {
+    url.searchParams.set("q", state.filter.trim());
+    url.searchParams.set("full_text", "1");
+  }
+  return `${url.pathname}${url.search}`;
+}
+
+function threadSearchUsesServer() {
+  return state.fullTextSearch && state.filter.trim().length > 0;
 }
 
 function text(value) {
@@ -196,6 +501,7 @@ function cancelDetailRequest() {
 
 function cancelMessageRender() {
   state.renderRequestId += 1;
+  state.pendingScrollTarget = null;
 }
 
 function cancelScheduledConversationSearch() {
@@ -203,10 +509,36 @@ function cancelScheduledConversationSearch() {
     window.clearTimeout(state.conversationSearch.timer);
     state.conversationSearch.timer = null;
   }
+  if (state.conversationSearch.inputFrame !== null) {
+    window.cancelAnimationFrame(state.conversationSearch.inputFrame);
+    state.conversationSearch.inputFrame = null;
+  }
+}
+
+function cancelConversationSearchWork() {
+  state.conversationSearch.requestId += 1;
+  state.conversationSearch.pendingWorkerSearch = false;
+  if (state.conversationSearch.abortController) {
+    state.conversationSearch.abortController.abort();
+    state.conversationSearch.abortController = null;
+  }
+  if (state.conversationSearch.worker) {
+    state.conversationSearch.worker.postMessage({
+      type: "cancel",
+      revision: state.conversationSearch.workerRevision
+    });
+  }
 }
 
 function nextFrame() {
   return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+function yieldToBrowser() {
+  if (window.scheduler?.yield) {
+    return window.scheduler.yield();
+  }
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
 async function loadStatus() {
@@ -220,19 +552,37 @@ async function loadStatus() {
   }
 }
 
-async function loadThreads({ preserveSelection = true } = {}) {
+async function loadThreads({ preserveSelection = true, preserveHiddenSelection = false } = {}) {
   const requestId = state.listRequestId + 1;
-  state.listRequestId = requestId;
-  const threads = await fetchJson(listUrl());
-  if (requestId !== state.listRequestId) {
-    return;
+  const usesServerSearch = threadSearchUsesServer();
+  if (state.listAbortController) {
+    state.listAbortController.abort();
   }
+  const controller = new AbortController();
+  state.listRequestId = requestId;
+  state.listAbortController = controller;
+  let threads;
+  try {
+    threads = await fetchJson(listUrl(), { signal: controller.signal });
+  } catch (error) {
+    if (isAbortError(error)) {
+      return;
+    }
+    throw error;
+  } finally {
+    if (state.listAbortController === controller) {
+      state.listAbortController = null;
+    }
+  }
+  if (requestId !== state.listRequestId) return;
+  state.serverSearchActive = usesServerSearch;
   state.threads = threads;
-  await ensureVisibleSelection({ preserveSelection });
+  await ensureVisibleSelection({ preserveSelection, preserveHiddenSelection });
 }
 
 async function setMode(mode) {
   if (state.mode === mode) return;
+  cancelThreadSearchTimer();
   state.mode = mode;
   state.selectedId = null;
   state.currentThread = null;
@@ -244,7 +594,9 @@ async function setMode(mode) {
 
 async function openThread(kind, threadId, options = {}) {
   try {
+    cancelThreadSearchTimer();
     state.pendingBranchId = options.branchId || null;
+    const clearingServerSearch = state.mode === kind && state.serverSearchActive;
     if (state.mode !== kind) {
       cancelDetailRequest();
       state.mode = kind;
@@ -254,11 +606,15 @@ async function openThread(kind, threadId, options = {}) {
       els.searchInput.value = "";
       renderMode();
       state.threads = await fetchJson(listUrl());
+      state.serverSearchActive = false;
       renderThreadList();
     }
     state.filter = "";
     els.searchInput.value = "";
-    await selectThread(threadId, { preservePendingBranch: true });
+    if (clearingServerSearch && state.mode === kind) {
+      await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    }
+    await selectThread(threadId, { preservePendingBranch: true, scrollListBehavior: "smooth" });
   } catch (error) {
     if (!isAbortError(error)) {
       showConversationError(error);
@@ -273,7 +629,6 @@ function renderMode() {
   els.mainFilterRow.classList.toggle("hidden", state.mode !== "main");
   els.mainFilterSelect.value = state.mainFilter;
   els.searchInput.placeholder = config.searchPlaceholder;
-  els.notice.textContent = config.notice;
   els.emptyStateMessage.textContent = config.empty;
 }
 
@@ -295,8 +650,7 @@ function renderMessageFilterControls() {
     input.addEventListener("change", () => {
       state.messageFilters[filter.key] = input.checked;
       saveMessageFilters();
-      applyMessageFilters();
-      scheduleConversationSearch();
+      rerenderMessagesForCurrentFilters();
     });
 
     const textNode = document.createElement("span");
@@ -310,27 +664,68 @@ function setMessageFilters(filters) {
   state.messageFilters = { ...state.messageFilters, ...filters };
   saveMessageFilters();
   renderMessageFilterControls();
-  applyMessageFilters();
-  scheduleConversationSearch();
+  rerenderMessagesForCurrentFilters();
 }
 
-async function ensureVisibleSelection({ preserveSelection = true } = {}) {
+async function ensureVisibleSelection({ preserveSelection = true, preserveHiddenSelection = false } = {}) {
   const threads = filteredThreads();
   renderThreadList();
+  const currentId = state.currentThread && state.currentThread.summary && state.currentThread.summary.id;
+  const hasCurrentSelection = preserveSelection && state.selectedId && currentId === state.selectedId;
   if (threads.length === 0) {
+    if (preserveHiddenSelection && hasCurrentSelection) {
+      return;
+    }
     clearConversation();
   } else if (preserveSelection && state.selectedId && threads.some((item) => item.id === state.selectedId)) {
-    const currentId = state.currentThread && state.currentThread.summary && state.currentThread.summary.id;
     if (currentId !== state.selectedId) {
       await selectThread(state.selectedId);
+    } else {
+      scrollSelectedThreadIntoView();
     }
+  } else if (preserveHiddenSelection && hasCurrentSelection) {
+    return;
   } else {
     await selectThread(threads[0].id);
   }
 }
 
+function cancelThreadSearchTimer() {
+  if (state.threadSearchTimer !== null) {
+    window.clearTimeout(state.threadSearchTimer);
+    state.threadSearchTimer = null;
+  }
+}
+
+function scheduleThreadSearch({ immediate = false } = {}) {
+  cancelThreadSearchTimer();
+  if (threadSearchUsesServer() && !immediate) {
+    els.threadStats.textContent = "Searching full text...";
+    state.threadSearchTimer = window.setTimeout(() => {
+      state.threadSearchTimer = null;
+      applyThreadSearch().catch(showError);
+    }, THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS);
+    return;
+  }
+  applyThreadSearch().catch(showError);
+}
+
+async function applyThreadSearch() {
+  if (threadSearchUsesServer()) {
+    els.threadStats.textContent = "Searching full text...";
+    await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    return;
+  }
+  if (state.serverSearchActive) {
+    await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    return;
+  }
+  await ensureVisibleSelection();
+}
+
 function filteredThreads() {
   const query = state.filter.trim().toLowerCase();
+  if (state.serverSearchActive && query) return state.threads;
   if (!query) return state.threads;
   return state.threads.filter((thread) => {
     const haystack = [
@@ -342,7 +737,8 @@ function filteredThreads() {
       thread.model,
       thread.app_version,
       thread.source,
-      thread.meta_label
+      thread.meta_label,
+      thread.search_match
     ].join(" ").toLowerCase();
     return haystack.includes(query);
   });
@@ -351,7 +747,9 @@ function filteredThreads() {
 function renderThreadList() {
   const threads = filteredThreads();
   const noun = state.mode === "main" ? MAIN_FILTER_LABELS[state.mainFilter] : "recovered";
-  els.threadStats.textContent = `${threads.length} shown, ${state.threads.length} ${noun}`;
+  els.threadStats.textContent = state.serverSearchActive && state.filter.trim()
+    ? `${threads.length} full-text ${threads.length === 1 ? "match" : "matches"}`
+    : `${threads.length} shown, ${state.threads.length} ${noun}`;
   els.threadList.replaceChildren();
 
   for (const thread of threads) {
@@ -360,6 +758,8 @@ function renderThreadList() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `thread-item${thread.id === state.selectedId ? " active" : ""}`;
+    button.dataset.threadId = thread.id;
+    button.tabIndex = -1;
     button.addEventListener("click", () => selectThread(thread.id));
 
     const time = document.createElement("div");
@@ -372,14 +772,40 @@ function renderThreadList() {
     setAutoDirection(preview, previewText);
     preview.textContent = previewText;
 
+    const searchMatch = document.createElement("div");
+    searchMatch.className = "thread-search-match";
+    if (thread.search_match) {
+      setAutoDirection(searchMatch, thread.search_match);
+      searchMatch.textContent = thread.search_match;
+    }
+
     const meta = document.createElement("div");
     meta.className = "thread-meta";
     setAutoDirection(meta, metaText);
     meta.textContent = metaText;
 
-    button.append(time, preview, meta);
+    if (thread.search_match) {
+      button.append(time, preview, searchMatch, meta);
+    } else {
+      button.append(time, preview, meta);
+    }
     els.threadList.appendChild(button);
   }
+}
+
+function scrollSelectedThreadIntoView({ behavior = "auto" } = {}) {
+  if (!state.selectedId) {
+    return;
+  }
+  const selected = els.threadList.querySelector(".thread-item.active");
+  if (!selected) {
+    return;
+  }
+  selected.scrollIntoView({
+    behavior,
+    block: "center",
+    inline: "nearest"
+  });
 }
 
 async function selectThread(threadId, options = {}) {
@@ -395,7 +821,9 @@ async function selectThread(threadId, options = {}) {
   state.detailAbortController = controller;
   state.selectedId = threadId;
   renderThreadList();
+  scrollSelectedThreadIntoView({ behavior: options.scrollListBehavior || "auto" });
   els.exportButton.disabled = true;
+  els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
   try {
     const detail = await fetchJson(modeConfig().detailUrl(threadId), { signal: controller.signal });
@@ -403,7 +831,7 @@ async function selectThread(threadId, options = {}) {
       return;
     }
     state.currentThread = detail;
-    renderConversation(detail);
+    await renderConversation(detail);
   } catch (error) {
     if (requestId === state.detailRequestId && !isAbortError(error)) {
       showConversationError(error);
@@ -420,24 +848,33 @@ function clearConversation() {
   cancelMessageRender();
   state.selectedId = null;
   state.currentThread = null;
+  state.expandedMessages = new Set();
+  state.expandedToolRuns = new Set();
+  state.toolRunByMessageIndex = new Map();
   resetConversationSearch();
   els.emptyState.classList.remove("hidden");
   els.conversationView.classList.add("hidden");
   els.relatedPanel.classList.add("hidden");
   els.relatedPanel.replaceChildren();
   els.exportButton.disabled = true;
+  els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
 }
 
-function renderConversation(detail) {
+async function renderConversation(detail) {
   cancelScrollAnimation();
+  cancelConversationSearchWork();
   clearConversationHighlights();
+  state.expandedMessages = new Set();
+  state.expandedToolRuns = new Set();
+  state.toolRunByMessageIndex = new Map();
   const renderRequestId = state.renderRequestId + 1;
   state.renderRequestId = renderRequestId;
   const summary = detail.summary;
   els.emptyState.classList.add("hidden");
   els.conversationView.classList.remove("hidden");
   els.exportButton.disabled = false;
+  els.exportFormatSelect.disabled = false;
   els.copyIdButton.disabled = false;
   els.conversationSearchInput.disabled = false;
   els.conversationSearchClear.disabled = els.conversationSearchInput.value.trim() === "";
@@ -448,34 +885,360 @@ function renderConversation(detail) {
   els.metaCount.textContent = `${summary.message_count} shown`;
   els.metaModel.textContent = text(summary.model);
   els.metaCwd.textContent = text(summary.cwd);
-  renderRelated(detail.related || {}, summary);
+  renderRelated(
+    detail.related || {},
+    summary,
+    detail.compactions || [],
+    rollbackLinksFor(detail.messages || [], detail.rollbacks || [])
+  );
 
+  await nextFrame();
+  if (renderRequestId !== state.renderRequestId) {
+    return;
+  }
+  setupMessagesFrame();
+  syncMessagesFrameViewport();
+  await nextFrame();
+  if (renderRequestId !== state.renderRequestId) {
+    return;
+  }
+  syncMessagesFrameViewport();
   els.messages.replaceChildren();
   const branchGroups = branchGroupsFor(detail);
-  renderMessages(detail, branchGroups, renderRequestId);
+  await renderMessages(detail, branchGroups, renderRequestId);
 }
 
 async function renderMessages(detail, branchGroups, renderRequestId) {
-  appendBranchMarkerGroup(branchGroups.get("-1"));
+  if (renderRequestId !== state.renderRequestId) {
+    return;
+  }
+  state.toolRunByMessageIndex = new Map();
+  const { units, renderedMessages } = buildMessageUnits(detail, branchGroups, renderRequestId);
+  if (renderRequestId !== state.renderRequestId) {
+    return;
+  }
+  await renderMessageUnits(units, renderRequestId);
+  updateMessageCount(renderedMessages, detail.messages.length);
+  scheduleMessagesFrameSync({ frames: 4, delays: [80, 240, 700] });
+  scheduleConversationSearch({ immediate: true });
+  scrollToPendingBranch();
+}
+
+function buildMessageUnits(detail, branchGroups, renderRequestId) {
+  const units = [];
+  let renderedMessages = 0;
+  let pendingToolRun = [];
+  const rollbackGroups = collectRollbackGroups(detail.messages || []);
+  const jumpMarkers = jumpMarkersFor(detail, rollbackGroups);
+  const flushToolRun = () => {
+    if (pendingToolRun.length === 0) {
+      return;
+    }
+    if (pendingToolRun.length >= TOOL_RUN_GROUP_MIN_SIZE) {
+      units.push(toolRunUnit(pendingToolRun));
+    } else {
+      for (const item of pendingToolRun) {
+        units.push(messageUnit(item.message, item.index));
+      }
+    }
+    pendingToolRun = [];
+  };
+
+  const startBranches = branchGroups.get("-1");
+  if (startBranches && startBranches.length > 0) {
+    units.push(branchUnit(startBranches));
+  }
+
   for (const [index, message] of detail.messages.entries()) {
+    if (renderRequestId !== state.renderRequestId) {
+      break;
+    }
+    if (isMessageVisibleByFilter(message)) {
+      if (rollbackGroups.groupedIndexes.has(index)) {
+        flushToolRun();
+        const group = rollbackGroups.firstIndexToGroup.get(index);
+        if (group) {
+          units.push(rollbackGroupUnit(group));
+          renderedMessages += group.length;
+        }
+      } else if (message.role === "tool") {
+        pendingToolRun.push({ message, index });
+        renderedMessages += 1;
+      } else {
+        flushToolRun();
+        units.push(messageUnit(message, index));
+        renderedMessages += 1;
+      }
+    }
+    const branches = branchGroups.get(String(index));
+    if (branches && branches.length > 0) {
+      flushToolRun();
+      units.push(branchUnit(branches));
+    }
+    const markers = jumpMarkers.get(String(index));
+    if (markers && markers.length > 0) {
+      flushToolRun();
+      units.push(jumpMarkerUnit(markers, index));
+    }
+  }
+  flushToolRun();
+  return { units, renderedMessages };
+}
+
+function collectRollbackGroups(messages, options = {}) {
+  const respectFilters = options.respectFilters !== false;
+  const groupsByKey = new Map();
+  for (const [index, message] of messages.entries()) {
+    if (!message.rolled_back || (respectFilters && !isMessageVisibleByFilter(message))) {
+      continue;
+    }
+    const item = { message, index };
+    const key = rollbackGroupKey(item);
+    if (!groupsByKey.has(key)) {
+      groupsByKey.set(key, []);
+    }
+    groupsByKey.get(key).push(item);
+  }
+
+  const groups = [];
+  const firstIndexToGroup = new Map();
+  const groupedIndexes = new Set();
+  for (const group of groupsByKey.values()) {
+    if (group.length === 0) {
+      continue;
+    }
+    const rollbackTimestamp = group.find((item) => item.message?.rolled_back_by_timestamp)?.message?.rolled_back_by_timestamp;
+    const firstRolledIndex = group[0].index;
+    const rollbackEventIndex = rollbackEventIndexForGroup(messages, rollbackTimestamp, firstRolledIndex);
+    const eventEndIndex = rollbackEventIndex ?? group[group.length - 1].index;
+    for (let index = firstRolledIndex; index <= eventEndIndex; index += 1) {
+      const message = messages[index];
+      if (!message || message.rolled_back || message.role !== "event" || (respectFilters && !isMessageVisibleByFilter(message))) {
+        continue;
+      }
+      group.push({ message, index });
+    }
+    group.sort((left, right) => left.index - right.index);
+    firstIndexToGroup.set(group[0].index, group);
+    for (const item of group) {
+      groupedIndexes.add(item.index);
+    }
+    groups.push(group);
+  }
+  return { firstIndexToGroup, groupedIndexes, groups };
+}
+
+function rollbackEventIndexForGroup(messages, rollbackTimestamp, startIndex) {
+  if (rollbackTimestamp === undefined || rollbackTimestamp === null) {
+    return null;
+  }
+  for (let index = startIndex; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message?.role === "event" && message.phase === "rollback" && message.timestamp === rollbackTimestamp) {
+      return index;
+    }
+  }
+  return null;
+}
+
+function rollbackGroupKey(item) {
+  return item.message?.rollback_group
+    || item.message?.rolled_back_by_timestamp
+    || item.message?.rolled_back_at
+    || item.index;
+}
+
+function messageUnit(message, index) {
+  return {
+    type: "message",
+    message,
+    index,
+    startIndex: index,
+    endIndex: index,
+    messageCount: 1
+  };
+}
+
+function toolRunUnit(run) {
+  const first = run[0];
+  const last = run[run.length - 1];
+  return {
+    type: "toolRun",
+    run,
+    startIndex: first.index,
+    endIndex: last.index,
+    messageCount: run.length
+  };
+}
+
+function rollbackGroupUnit(group) {
+  const first = group[0];
+  const last = group[group.length - 1];
+  return {
+    type: "rollbackGroup",
+    group,
+    startIndex: first.index,
+    endIndex: last.index,
+    messageCount: group.length
+  };
+}
+
+function jumpMarkerUnit(markers, index) {
+  return {
+    type: "jumpMarker",
+    markers,
+    startIndex: index,
+    endIndex: index,
+    messageCount: 0
+  };
+}
+
+function rollbackLinksFor(messages, rollbackCheckpoints = []) {
+  const rollbackGroups = collectRollbackGroups(messages, { respectFilters: false });
+  if (rollbackCheckpoints.length === 0) {
+    return rollbackGroups.groups.map((group, index) => rollbackLinkForGroup(group, { ordinal: index + 1 }));
+  }
+  return rollbackCheckpoints.map((checkpoint) => rollbackLinkForCheckpoint(checkpoint, rollbackGroups.groups, messages));
+}
+
+function rollbackLinkForGroup(group, fallback = {}) {
+  const first = group[0];
+  const last = group[group.length - 1];
+  const rollbackEvent = group.find((item) => item.message?.role === "event" && item.message?.phase === "rollback");
+  const fallbackEventIndex = Number.isInteger(fallback.message_index)
+    ? fallback.message_index
+    : (Number.isInteger(fallback.eventIndex) ? fallback.eventIndex : null);
+  return {
+    ordinal: fallback.ordinal ?? null,
+    groupId: rollbackGroupId(first.index, last.index),
+    messageIndex: first.index,
+    eventIndex: fallbackEventIndex ?? rollbackEvent?.index ?? null,
+    lineNumber: fallback.line_number ?? fallback.lineNumber ?? null,
+    startIndex: first.index,
+    endIndex: last.index,
+    time: fallback.time || rollbackEvent?.message?.time || first.message?.rolled_back_at || "",
+    summary: rollbackLinkSummary(fallback.summary, rollbackLinkPreview(group))
+  };
+}
+
+function rollbackLinkForCheckpoint(checkpoint, groups, messages) {
+  const eventIndex = rollbackEventIndexForCheckpoint(checkpoint, messages);
+  const group = groups.find((candidate) => candidate.some((item) => item.index === eventIndex))
+    || groups.find((candidate) => candidate.some((item) => (
+      item.message?.rolled_back_by_timestamp !== undefined
+      && item.message?.rolled_back_by_timestamp !== null
+      && String(item.message.rolled_back_by_timestamp) === String(checkpoint.timestamp)
+    )));
+  if (group) {
+    return rollbackLinkForGroup(group, checkpoint);
+  }
+  return {
+    ordinal: checkpoint.ordinal ?? null,
+    groupId: null,
+    messageIndex: Number.isInteger(eventIndex) ? eventIndex : checkpoint.message_index,
+    eventIndex: Number.isInteger(eventIndex) ? eventIndex : checkpoint.message_index,
+    lineNumber: checkpoint.line_number ?? null,
+    startIndex: null,
+    endIndex: null,
+    time: checkpoint.time || "",
+    summary: checkpoint.summary || "Rollback marker"
+  };
+}
+
+function rollbackEventIndexForCheckpoint(checkpoint, messages) {
+  if (Number.isInteger(checkpoint?.message_index)) {
+    return checkpoint.message_index;
+  }
+  if (checkpoint?.timestamp === undefined || checkpoint?.timestamp === null) {
+    return null;
+  }
+  const index = messages.findIndex((message) => (
+    message?.role === "event"
+    && message.phase === "rollback"
+    && message.timestamp !== undefined
+    && message.timestamp !== null
+    && String(message.timestamp) === String(checkpoint.timestamp)
+  ));
+  return index >= 0 ? index : null;
+}
+
+function rollbackLinkSummary(checkpointSummary, groupSummary) {
+  if (!checkpointSummary) {
+    return groupSummary || "";
+  }
+  if (!groupSummary || groupSummary === checkpointSummary) {
+    return checkpointSummary;
+  }
+  return `${checkpointSummary} | ${groupSummary}`;
+}
+
+function branchUnit(branches) {
+  return {
+    type: "branch",
+    branches,
+    startIndex: null,
+    endIndex: null,
+    messageCount: 0
+  };
+}
+
+async function renderMessageUnits(units, renderRequestId) {
+  let batchCount = 0;
+  let fragment = document.createDocumentFragment();
+  for (const unit of units) {
     if (renderRequestId !== state.renderRequestId) {
       return;
     }
-    els.messages.appendChild(renderMessage(message, index));
-    appendBranchMarkerGroup(branchGroups.get(String(index)));
-    if ((index + 1) % MESSAGE_RENDER_BATCH_SIZE === 0) {
+    fragment.appendChild(renderUnit(unit));
+    batchCount += unit.messageCount || 1;
+    if (batchCount >= MESSAGE_RENDER_BATCH_SIZE) {
+      els.messages.appendChild(fragment);
+      fragment = document.createDocumentFragment();
+      batchCount = 0;
+      resolvePendingScrollTarget();
       await nextFrame();
     }
   }
   if (renderRequestId !== state.renderRequestId) {
     return;
   }
-  applyMessageFilters();
-  scheduleConversationSearch({ immediate: true });
-  scrollToPendingBranch();
+  if (fragment.childNodes.length > 0) {
+    els.messages.appendChild(fragment);
+  }
+  resolvePendingScrollTarget({ final: true });
 }
 
-function renderRelated(related, summary) {
+function renderUnit(unit) {
+  if (unit.type === "message") {
+    return renderMessage(unit.message, unit.index);
+  }
+  if (unit.type === "toolRun") {
+    return renderToolRun(unit.run);
+  }
+  if (unit.type === "rollbackGroup") {
+    return renderRollbackGroup(unit.group);
+  }
+  if (unit.type === "jumpMarker") {
+    return renderJumpMarker(unit.markers);
+  }
+  return renderBranchMarker(unit.branches);
+}
+
+function rerenderMessagesForCurrentFilters() {
+  if (!state.currentThread) {
+    return;
+  }
+  cancelScrollAnimation();
+  cancelConversationSearchWork();
+  clearConversationHighlights();
+  const renderRequestId = state.renderRequestId + 1;
+  state.renderRequestId = renderRequestId;
+  state.toolRunByMessageIndex = new Map();
+  els.messages.replaceChildren();
+  renderMessages(state.currentThread, branchGroupsFor(state.currentThread), renderRequestId);
+}
+
+function renderRelated(related, summary, compactions = [], rollbacks = []) {
   const sections = [
     { title: "Parent conversation", items: related.parents || [], fallbackKind: "main", isParent: true },
     { title: "Forked conversations", items: related.forks || [], fallbackKind: "main", isParent: false },
@@ -483,9 +1246,17 @@ function renderRelated(related, summary) {
   ].filter(({ items }) => items.length > 0);
 
   els.relatedPanel.replaceChildren();
-  if (sections.length === 0) {
+  if (sections.length === 0 && compactions.length === 0 && rollbacks.length === 0) {
     els.relatedPanel.classList.add("hidden");
     return;
+  }
+
+  if (rollbacks.length > 0) {
+    els.relatedPanel.appendChild(renderRollbackSection(rollbacks));
+  }
+
+  if (compactions.length > 0) {
+    els.relatedPanel.appendChild(renderCompactionSection(compactions, summary));
   }
 
   for (const [sectionIndex, { title, items, fallbackKind, isParent }] of sections.entries()) {
@@ -514,13 +1285,121 @@ function renderRelated(related, summary) {
       toggle.setAttribute("aria-expanded", String(!collapsed));
     });
     for (const item of items) {
-      const options = isParent ? { branchId: summary.id } : { jumpToBranch: true };
-      list.appendChild(renderRelatedItem(item, item.kind || fallbackKind, options));
+      list.appendChild(renderRelatedItem(item, item.kind || fallbackKind, { jumpToBranch: true }));
     }
     section.appendChild(list);
     els.relatedPanel.appendChild(section);
   }
   els.relatedPanel.classList.remove("hidden");
+}
+
+function renderRollbackSection(rollbacks) {
+  const section = document.createElement("section");
+  section.className = "related-section collapsed";
+
+  const heading = document.createElement("h3");
+  const toggle = document.createElement("button");
+  const listId = "related-list-rollbacks";
+  toggle.type = "button";
+  toggle.className = "related-heading";
+  toggle.setAttribute("aria-controls", listId);
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.textContent = `Rollbacks (${rollbacks.length})`;
+  heading.appendChild(toggle);
+  section.appendChild(heading);
+
+  const list = document.createElement("div");
+  list.id = listId;
+  list.className = "related-list";
+  list.hidden = true;
+  toggle.addEventListener("click", () => {
+    const collapsed = section.classList.toggle("collapsed");
+    list.hidden = collapsed;
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+  });
+
+  for (const rollback of rollbacks) {
+    list.appendChild(renderRollbackLink(rollback));
+  }
+  section.appendChild(list);
+  return section;
+}
+
+function renderRollbackLink(rollback) {
+  const wrapper = document.createElement("button");
+  wrapper.type = "button";
+  wrapper.className = "related-item rollback-item";
+  wrapper.title = "Scroll to this rollback in the conversation";
+  wrapper.addEventListener("click", () => scrollToRollbackLink(rollback));
+
+  const title = document.createElement("span");
+  title.className = "related-title";
+  title.textContent = `${rollback.ordinal}. Rollback`;
+
+  const meta = document.createElement("span");
+  meta.className = "related-meta";
+  const metaText = [rollback.time, rollback.summary].filter(Boolean).join(" | ");
+  setAutoDirection(meta, metaText);
+  meta.textContent = metaText;
+
+  wrapper.append(title, meta);
+  return wrapper;
+}
+
+function renderCompactionSection(compactions, summary) {
+  const section = document.createElement("section");
+  section.className = "related-section collapsed";
+
+  const heading = document.createElement("h3");
+  const toggle = document.createElement("button");
+  const listId = "related-list-compactions";
+  toggle.type = "button";
+  toggle.className = "related-heading";
+  toggle.setAttribute("aria-controls", listId);
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.textContent = `Compaction checkpoints (${compactions.length})`;
+  heading.appendChild(toggle);
+  section.appendChild(heading);
+
+  const list = document.createElement("div");
+  list.id = listId;
+  list.className = "related-list";
+  list.hidden = true;
+  toggle.addEventListener("click", () => {
+    const collapsed = section.classList.toggle("collapsed");
+    list.hidden = collapsed;
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+  });
+
+  for (const checkpoint of compactions) {
+    list.appendChild(renderCompactionItem(checkpoint, summary));
+  }
+  section.appendChild(list);
+  return section;
+}
+
+function renderCompactionItem(checkpoint, summary) {
+  const wrapper = document.createElement("button");
+  wrapper.type = "button";
+  wrapper.className = "related-item compaction-item";
+  wrapper.title = "Scroll to this compaction in the conversation";
+  wrapper.addEventListener("click", () => scrollToMessageIndex(
+    checkpoint.message_index,
+    { defer: true, anchorId: compactionAnchorId(checkpoint) }
+  ));
+
+  const title = document.createElement("span");
+  title.className = "related-title";
+  title.textContent = `${checkpoint.ordinal}. ${checkpoint.label}`;
+
+  const meta = document.createElement("span");
+  meta.className = "related-meta";
+  const metaText = [checkpoint.time, checkpoint.summary].filter(Boolean).join(" | ");
+  setAutoDirection(meta, metaText);
+  meta.textContent = metaText;
+
+  wrapper.append(title, meta);
+  return wrapper;
 }
 
 function renderRelatedItem(item, kind, options = {}) {
@@ -529,7 +1408,7 @@ function renderRelatedItem(item, kind, options = {}) {
   button.className = "related-item";
   button.addEventListener("click", () => {
     if (options.jumpToBranch) {
-      jumpToBranch(item.id);
+      jumpToBranch(item.id, { defer: true });
       return;
     }
     openThread(kind, item.id, options);
@@ -550,30 +1429,241 @@ function renderRelatedItem(item, kind, options = {}) {
   return button;
 }
 
-function branchGroupsFor(detail) {
-  if (state.mode !== "main") {
-    return new Map();
+async function createForkBeforeCompaction(checkpoint, summary, button) {
+  if (!summary?.id || !checkpoint?.line_number) {
+    return;
+  }
+  const confirmed = await confirmWriteAction({
+    title: "Create fork before compaction?",
+    body: "This writes a new Codex conversation fork from the point before this compaction. The original conversation is left unchanged.",
+    details: [
+      { label: "Checkpoint", value: checkpoint.label || (checkpoint.ordinal ? `#${checkpoint.ordinal}` : "Compaction") },
+      { label: "Time", value: checkpoint.time },
+      { label: "Summary", value: checkpoint.summary },
+      { label: "Fork point", value: "Immediately before this compaction marker" }
+    ],
+    confirmLabel: "Create fork",
+    opener: button
+  });
+  if (!confirmed) {
+    return;
   }
 
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Creating...";
+  try {
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(summary.id)}/fork-before-compaction`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line_number: checkpoint.line_number })
+      }
+    );
+    els.sourceLine.textContent = `Created ${result.resume_command}`;
+    await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    await openThread("main", result.id);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = originalText;
+    els.sourceLine.textContent = error.message || String(error);
+  }
+}
+
+async function createForkBeforeRollback(rollback, summary, button) {
+  if (!summary?.id || !Number.isInteger(rollback?.lineNumber)) {
+    return;
+  }
+  const rollbackLabel = rollback.ordinal ? `rollback #${rollback.ordinal}` : "this rollback";
+  const confirmed = await confirmWriteAction({
+    title: `Undo ${rollbackLabel} as a fork?`,
+    body: "This writes a new Codex conversation fork from the point before the rollback marker. The original conversation is left unchanged.",
+    details: [
+      { label: "Rollback", value: rollback.ordinal ? `#${rollback.ordinal}` : "Selected rollback" },
+      { label: "Time", value: rollback.time },
+      { label: "Summary", value: rollback.summary },
+      { label: "Fork point", value: "Immediately before this rollback marker" }
+    ],
+    confirmLabel: "Create fork",
+    opener: button
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Creating...";
+  try {
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(summary.id)}/fork-before-rollback`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line_number: rollback.lineNumber })
+      }
+    );
+    els.sourceLine.textContent = `Created ${result.resume_command}`;
+    await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    await openThread("main", result.id);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = originalText;
+    els.sourceLine.textContent = error.message || String(error);
+  }
+}
+
+async function createForkFromMessage(message, index, button) {
+  const summary = state.currentThread?.summary;
+  const lineNumber = message?.line_number;
+  if (!summary?.id || !Number.isInteger(lineNumber)) {
+    return;
+  }
+  const confirmed = await confirmWriteAction({
+    title: "Create fork from this message?",
+    body: "This writes a new Codex conversation containing the history through this user message. Later messages are not copied. The original conversation is left unchanged.",
+    details: [
+      { label: "Target", value: collapsedMessageHeading(message.text || "") || "Selected user message" },
+      { label: "Fork point", value: "Immediately after this user message" },
+      { label: "Change", value: "Creates a new resumable Codex conversation" }
+    ],
+    confirmLabel: "Create fork",
+    opener: button
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Creating...";
+  try {
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(summary.id)}/fork-from-message`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line_number: lineNumber })
+      }
+    );
+    els.sourceLine.textContent = `Created ${result.resume_command}`;
+    await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    await openThread("main", result.id);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = originalText;
+    els.sourceLine.textContent = error.message || String(error);
+  }
+}
+
+function scrollToMessageIndex(messageIndex, { defer = false, anchorId = null } = {}) {
+  if (!Number.isInteger(messageIndex)) {
+    return false;
+  }
+  let wrapper = els.messages.querySelector(`.message[data-message-index="${messageIndex}"]`);
+  if (!wrapper) {
+    wrapper = expandToolRunForMessage(messageIndex);
+  }
+  if (!wrapper) {
+    if (scrollToAnchor(anchorId)) {
+      return true;
+    }
+    if (defer) {
+      state.pendingScrollTarget = { type: "message", messageIndex, anchorId };
+    }
+    return false;
+  }
+  state.pendingScrollTarget = null;
+  if (wrapper.classList.contains("collapsed")) {
+    expandCollapsedMessage(wrapper);
+  }
+  scrollElementIntoMessages(wrapper);
+  wrapper.classList.add("branch-link-focus");
+  window.setTimeout(() => wrapper.classList.remove("branch-link-focus"), 1600);
+  return true;
+}
+
+function scrollToRollbackLink(rollback) {
+  if (!rollback) {
+    return;
+  }
+  const anchorId = rollbackAnchorId(rollback);
+  if (Number.isInteger(rollback.eventIndex)) {
+    if (scrollToMessageIndex(rollback.eventIndex, { defer: true, anchorId })) {
+      return;
+    }
+  }
+  let wrapper = els.messages.querySelector(
+    `.rollback-group[data-rollback-group-id="${rollback.groupId}"]`
+  );
+  if (!wrapper && Number.isInteger(rollback.startIndex)) {
+    wrapper = els.messages.querySelector(
+      `.rollback-group[data-rollback-group-start="${rollback.startIndex}"]`
+    );
+  }
+  if (wrapper) {
+    scrollElementIntoMessages(wrapper);
+    wrapper.classList.add("branch-link-focus");
+    window.setTimeout(() => wrapper.classList.remove("branch-link-focus"), 1600);
+    return;
+  }
+  if (scrollToAnchor(anchorId)) {
+    return;
+  }
+  scrollToMessageIndex(rollback.messageIndex, { defer: true, anchorId });
+}
+
+function scrollToAnchor(anchorId) {
+  if (!anchorId || !els.messagesDocument) {
+    return false;
+  }
+  const anchor = els.messagesDocument.getElementById(anchorId);
+  if (!anchor) {
+    return false;
+  }
+  scrollElementIntoMessages(anchor);
+  anchor.classList.add("branch-link-focus");
+  window.setTimeout(() => anchor.classList.remove("branch-link-focus"), 1600);
+  state.pendingScrollTarget = null;
+  return true;
+}
+
+function branchGroupsFor(detail) {
   const messages = detail.messages || [];
   const related = detail.related || {};
-  const branches = [
-    ...(related.forks || []).map((item) => ({ item, kind: "main", branchType: "fork" })),
-    ...(related.side || []).map((item) => ({ item, kind: "side", branchType: "side" }))
-  ];
   const groups = new Map();
-
-  for (const branch of branches) {
-    const anchor = branchAnchorIndex(messages, branch.item.started_at);
+  const addBranch = (anchor, branch) => {
     const key = String(anchor);
     if (!groups.has(key)) {
       groups.set(key, []);
     }
     groups.get(key).push(branch);
+  };
+
+  for (const item of related.parents || []) {
+    addBranch(-1, {
+      item,
+      kind: item.kind || "main",
+      branchType: "parent",
+      openOptions: detail.summary?.id ? { branchId: detail.summary.id } : {}
+    });
+  }
+
+  if (state.mode === "main") {
+    const branches = [
+      ...(related.forks || []).map((item) => ({ item, kind: "main", branchType: "fork" })),
+      ...(related.side || []).map((item) => ({ item, kind: "side", branchType: "side" }))
+    ];
+
+    for (const branch of branches) {
+      addBranch(branchAnchorIndex(messages, branch.item.started_at), branch);
+    }
   }
 
   for (const group of groups.values()) {
     group.sort((a, b) => {
+      if (a.branchType !== b.branchType) return branchTypeSort(a.branchType) - branchTypeSort(b.branchType);
       const aTime = Number(a.item.started_at || 0);
       const bTime = Number(b.item.started_at || 0);
       if (aTime !== bTime) return aTime - bTime;
@@ -582,6 +1672,13 @@ function branchGroupsFor(detail) {
   }
 
   return groups;
+}
+
+function branchTypeSort(branchType) {
+  if (branchType === "parent") return 0;
+  if (branchType === "fork") return 1;
+  if (branchType === "side") return 2;
+  return 3;
 }
 
 function branchAnchorIndex(messages, startedAt) {
@@ -609,11 +1706,11 @@ function branchAnchorIndex(messages, startedAt) {
   return anchor;
 }
 
-function appendBranchMarkerGroup(branches) {
+function appendBranchMarkerGroup(branches, parent = els.messages) {
   if (!branches || branches.length === 0) {
     return;
   }
-  els.messages.appendChild(renderBranchMarker(branches));
+  parent.appendChild(renderBranchMarker(branches));
 }
 
 function renderBranchMarker(branches) {
@@ -634,16 +1731,163 @@ function renderBranchMarker(branches) {
   return marker;
 }
 
+function renderJumpMarker(markers) {
+  const marker = document.createElement("section");
+  marker.className = "branch-marker jump-marker";
+
+  const heading = document.createElement("div");
+  heading.className = "branch-marker-heading";
+  heading.textContent = markers.length === 1
+    ? "Filtered scroll target here"
+    : `${markers.length} filtered scroll targets here`;
+  marker.appendChild(heading);
+
+  const list = document.createElement("div");
+  list.className = "branch-marker-list";
+  for (const item of markers) {
+    list.appendChild(renderJumpMarkerItem(item));
+  }
+  marker.appendChild(list);
+  return marker;
+}
+
+function renderJumpMarkerItem(item) {
+  const row = document.createElement("button");
+  row.type = "button";
+  row.id = item.id;
+  row.className = `branch-link jump-link ${item.kind}`;
+  row.tabIndex = -1;
+  row.title = item.title;
+  row.addEventListener("click", () => scrollElementIntoMessages(row));
+
+  const kind = document.createElement("span");
+  kind.className = "branch-kind";
+  kind.textContent = item.kindLabel;
+
+  const body = document.createElement("span");
+  body.className = "branch-link-body";
+
+  const title = document.createElement("span");
+  title.className = "branch-link-title";
+  setAutoDirection(title, item.label);
+  title.textContent = item.label;
+
+  const meta = document.createElement("span");
+  meta.className = "branch-link-meta";
+  setAutoDirection(meta, item.meta);
+  meta.textContent = item.meta;
+
+  body.append(title, meta);
+
+  const action = document.createElement("span");
+  action.className = "branch-link-action";
+  action.textContent = "Hidden";
+
+  row.append(kind, body, action);
+  return row;
+}
+
+function jumpMarkersFor(detail, rollbackGroups) {
+  const messages = detail.messages || [];
+  const markers = new Map();
+  const addMarker = (index, item) => {
+    if (!Number.isInteger(index)) {
+      return;
+    }
+    const key = String(index);
+    if (!markers.has(key)) {
+      markers.set(key, []);
+    }
+    markers.get(key).push(item);
+  };
+
+  for (const checkpoint of detail.compactions || []) {
+    const index = checkpoint.message_index;
+    if (!Number.isInteger(index) || messageHasVisibleScrollTarget(messages, rollbackGroups, index)) {
+      continue;
+    }
+    addMarker(index, {
+      id: compactionAnchorId(checkpoint),
+      kind: "compaction",
+      kindLabel: "Compaction",
+      label: `${checkpoint.ordinal}. ${checkpoint.label || "Compaction checkpoint"}`,
+      meta: [checkpoint.time, checkpoint.summary, "hidden by filters"].filter(Boolean).join(" | "),
+      title: "This compaction is hidden by the message filters."
+    });
+  }
+
+  for (const rollback of rollbackLinksFor(messages, detail.rollbacks || [])) {
+    if (rollbackHasVisibleScrollTarget(messages, rollbackGroups, rollback)) {
+      continue;
+    }
+    const index = firstInteger(rollback.eventIndex, rollback.startIndex, rollback.messageIndex);
+    addMarker(index, {
+      id: rollbackAnchorId(rollback),
+      kind: "rollback",
+      kindLabel: "Rollback",
+      label: `${rollback.ordinal || "?"}. Rollback`,
+      meta: [rollback.time, rollback.summary, "hidden by filters"].filter(Boolean).join(" | "),
+      title: "This rollback target is hidden by the message filters."
+    });
+  }
+
+  for (const group of markers.values()) {
+    group.sort((left, right) => {
+      if (left.kind !== right.kind) return left.kind.localeCompare(right.kind);
+      return left.label.localeCompare(right.label);
+    });
+  }
+  return markers;
+}
+
+function messageHasVisibleScrollTarget(messages, rollbackGroups, index) {
+  if (!Number.isInteger(index)) {
+    return false;
+  }
+  const message = messages[index];
+  return Boolean(message && isMessageVisibleByFilter(message) && (
+    !rollbackGroups.groupedIndexes.has(index)
+    || rollbackGroups.firstIndexToGroup.has(index)
+    || [...rollbackGroups.groups].some((group) => group.some((item) => item.index === index))
+  ));
+}
+
+function rollbackHasVisibleScrollTarget(messages, rollbackGroups, rollback) {
+  if (messageHasVisibleScrollTarget(messages, rollbackGroups, rollback.eventIndex)) {
+    return true;
+  }
+  if (Number.isInteger(rollback.startIndex) && rollbackGroups.firstIndexToGroup.has(rollback.startIndex)) {
+    return true;
+  }
+  return messageHasVisibleScrollTarget(messages, rollbackGroups, rollback.messageIndex);
+}
+
+function firstInteger(...values) {
+  return values.find((value) => Number.isInteger(value));
+}
+
+function compactionAnchorId(checkpoint) {
+  return `jump-compaction-${checkpoint.line_number ?? checkpoint.message_index ?? checkpoint.ordinal}`;
+}
+
+function rollbackAnchorId(rollback) {
+  return `jump-rollback-${rollback.lineNumber ?? rollback.eventIndex ?? rollback.messageIndex ?? rollback.ordinal}`;
+}
+
 function branchMarkerHeading(branches) {
+  const parentCount = branches.filter((branch) => branch.branchType === "parent").length;
   const sideCount = branches.filter((branch) => branch.branchType === "side").length;
-  const forkCount = branches.length - sideCount;
+  const forkCount = branches.filter((branch) => branch.branchType === "fork").length;
   if (branches.length === 1) {
-    return sideCount === 1 ? "Side conversation opened here" : "Forked conversation opened here";
+    if (parentCount === 1) return "Parent conversation";
+    if (sideCount === 1) return "Side conversation opened here";
+    return "Forked conversation opened here";
   }
   const parts = [];
+  if (parentCount > 0) parts.push(`${parentCount} parent`);
   if (forkCount > 0) parts.push(`${forkCount} forked`);
   if (sideCount > 0) parts.push(`${sideCount} side`);
-  return `${parts.join(", ")} conversations opened here`;
+  return `${parts.join(", ")} conversation links here`;
 }
 
 function renderBranchLink(branch) {
@@ -651,12 +1895,13 @@ function renderBranchLink(branch) {
   const row = document.createElement("button");
   row.type = "button";
   row.className = `branch-link ${branch.branchType}`;
+  row.tabIndex = -1;
   row.id = branchMarkerId(item.id);
-  row.addEventListener("click", () => openThread(branch.kind, item.id));
+  row.addEventListener("click", () => openThread(branch.kind, item.id, branch.openOptions || {}));
 
   const kind = document.createElement("span");
   kind.className = "branch-kind";
-  kind.textContent = branch.branchType === "side" ? "Side" : "Fork";
+  kind.textContent = branchKindLabel(branch.branchType);
 
   const body = document.createElement("span");
   body.className = "branch-link-body";
@@ -682,6 +1927,12 @@ function renderBranchLink(branch) {
   return row;
 }
 
+function branchKindLabel(branchType) {
+  if (branchType === "parent") return "Parent";
+  if (branchType === "side") return "Side";
+  return "Fork";
+}
+
 function branchMarkerId(threadId) {
   return `branch-${threadId}`;
 }
@@ -695,11 +1946,15 @@ function scrollToPendingBranch() {
   window.requestAnimationFrame(() => jumpToBranch(branchId));
 }
 
-function jumpToBranch(branchId) {
-  const marker = document.getElementById(branchMarkerId(branchId));
+function jumpToBranch(branchId, { defer = false } = {}) {
+  const marker = els.messagesDocument?.getElementById(branchMarkerId(branchId));
   if (!marker) {
-    return;
+    if (defer) {
+      state.pendingScrollTarget = { type: "branch", branchId };
+    }
+    return false;
   }
+  state.pendingScrollTarget = null;
   const markerRect = marker.getBoundingClientRect();
   const messagesRect = els.messages.getBoundingClientRect();
   const target = els.messages.scrollTop
@@ -710,6 +1965,22 @@ function jumpToBranch(branchId) {
   const duration = scrollMessagesTo(Math.max(0, Math.min(target, maxScroll)));
   marker.classList.add("branch-link-focus");
   window.setTimeout(() => marker.classList.remove("branch-link-focus"), duration + 1200);
+  return true;
+}
+
+function resolvePendingScrollTarget({ final = false } = {}) {
+  const target = state.pendingScrollTarget;
+  if (!target) {
+    return;
+  }
+  if (target.type === "message") {
+    scrollToMessageIndex(target.messageIndex, { anchorId: target.anchorId });
+  } else if (target.type === "branch") {
+    jumpToBranch(target.branchId);
+  }
+  if (final && state.pendingScrollTarget === target) {
+    state.pendingScrollTarget = null;
+  }
 }
 
 function scrollMessagesTo(target) {
@@ -758,11 +2029,16 @@ function cancelScrollAnimation() {
 
 function resetConversationSearch() {
   cancelScheduledConversationSearch();
+  cancelConversationSearchWork();
   clearConversationHighlights();
-  state.conversationSearch.matches = [];
+  state.conversationSearch.matchGroups = [];
+  state.conversationSearch.totalMatches = 0;
   state.conversationSearch.activeIndex = -1;
   state.conversationSearch.lowerQuery = "";
   state.conversationSearch.queryLength = 0;
+  state.conversationSearch.workerReady = false;
+  state.conversationSearch.workerIndexing = false;
+  state.conversationSearch.workerRevision += 1;
   els.conversationSearchInput.value = "";
   els.conversationSearchInput.disabled = true;
   updateConversationSearchControls();
@@ -770,23 +2046,42 @@ function resetConversationSearch() {
 
 function scheduleConversationSearch({ immediate = false } = {}) {
   cancelScheduledConversationSearch();
+  cancelConversationSearchWork();
   const query = els.conversationSearchInput.value.trim();
   els.conversationSearchClear.disabled = query === "";
   if (!query || immediate) {
-    applyConversationSearch();
+    void applyConversationSearch();
     return;
   }
-  els.conversationSearchCount.textContent = "Searching...";
   state.conversationSearch.timer = window.setTimeout(() => {
     state.conversationSearch.timer = null;
-    applyConversationSearch();
+    els.conversationSearchCount.textContent = "Searching...";
+    void applyConversationSearch();
   }, CONVERSATION_SEARCH_DEBOUNCE_MS);
 }
 
-function applyConversationSearch() {
+function scheduleConversationSearchAfterPaint() {
+  cancelScheduledConversationSearch();
+  cancelConversationSearchWork();
+  const query = els.conversationSearchInput.value.trim();
+  els.conversationSearchClear.disabled = query === "";
+  state.conversationSearch.inputFrame = window.requestAnimationFrame(() => {
+    state.conversationSearch.inputFrame = null;
+    scheduleConversationSearch();
+  });
+}
+
+async function applyConversationSearch() {
   cancelScheduledConversationSearch();
   clearConversationHighlights();
-  state.conversationSearch.matches = [];
+  if (state.conversationSearch.abortController) {
+    state.conversationSearch.abortController.abort();
+    state.conversationSearch.abortController = null;
+  }
+  const requestId = state.conversationSearch.requestId + 1;
+  state.conversationSearch.requestId = requestId;
+  state.conversationSearch.matchGroups = [];
+  state.conversationSearch.totalMatches = 0;
   state.conversationSearch.activeIndex = -1;
   state.conversationSearch.lowerQuery = "";
   state.conversationSearch.queryLength = 0;
@@ -801,34 +2096,212 @@ function applyConversationSearch() {
   const lowerQuery = query.toLocaleLowerCase();
   state.conversationSearch.lowerQuery = lowerQuery;
   state.conversationSearch.queryLength = query.length;
+  els.conversationSearchCount.textContent = "Searching...";
+  updateConversationSearchButtons();
+  const controller = new AbortController();
+  state.conversationSearch.abortController = controller;
+  try {
+    const result = await fetchJson(conversationSearchUrl(query), { signal: controller.signal });
+    if (requestId !== state.conversationSearch.requestId) {
+      return;
+    }
+    state.conversationSearch.matchGroups = result.matchGroups || [];
+    state.conversationSearch.totalMatches = result.totalMatches || 0;
+    if (state.conversationSearch.totalMatches > 0) {
+      state.conversationSearch.activeIndex = -1;
+      updateConversationSearchControls();
+      return;
+    }
+    updateConversationSearchControls();
+  } catch (error) {
+    if (requestId === state.conversationSearch.requestId && !isAbortError(error)) {
+      state.conversationSearch.activeIndex = -1;
+      state.conversationSearch.matchGroups = [];
+      state.conversationSearch.totalMatches = 0;
+      els.conversationSearchCount.textContent = "Search failed";
+      updateConversationSearchButtons();
+    }
+  } finally {
+    if (state.conversationSearch.abortController === controller) {
+      state.conversationSearch.abortController = null;
+    }
+  }
+}
+
+function conversationSearchUrl(query) {
+  const params = new URLSearchParams({
+    kind: state.mode,
+    thread_id: state.currentThread?.summary?.id || "",
+    q: query,
+    filters: enabledMessageFilterKeys().join(",")
+  });
+  return `/api/search?${params.toString()}`;
+}
+
+function enabledMessageFilterKeys() {
+  return MESSAGE_FILTERS
+    .filter((filter) => state.messageFilters[filter.key] !== false)
+    .map((filter) => filter.key);
+}
+
+async function applyConversationSearchOnMainThread(requestId, query, lowerQuery) {
   const messages = state.currentThread?.messages || [];
+  const matchGroups = [];
+  let totalMatches = 0;
+  let lastYield = performance.now();
   for (const [messageIndex, message] of messages.entries()) {
+    if (requestId !== state.conversationSearch.requestId) {
+      return;
+    }
     if (!isMessageSearchVisible(message)) {
       continue;
     }
     const lowerText = cachedLowerSearchText(message);
-    let occurrenceIndex = 0;
-    let matchIndex = lowerText.indexOf(lowerQuery);
-    while (matchIndex !== -1) {
-      state.conversationSearch.matches.push({
-        messageIndex,
-        occurrenceIndex
-      });
-      occurrenceIndex += 1;
-      matchIndex = lowerText.indexOf(lowerQuery, matchIndex + lowerQuery.length);
+    const count = countSearchOccurrences(lowerText, lowerQuery);
+    if (count > 0) {
+      matchGroups.push({ messageIndex, count });
+      totalMatches += count;
+    }
+    if (performance.now() - lastYield >= CONVERSATION_SEARCH_TIME_BUDGET_MS) {
+      els.conversationSearchCount.textContent = totalMatches > 0
+        ? `${totalMatches} found...`
+        : "Searching...";
+      await nextFrame();
+      lastYield = performance.now();
     }
   }
 
-  if (state.conversationSearch.matches.length > 0) {
-    setActiveConversationMatch(0, { scroll: false });
+  if (requestId !== state.conversationSearch.requestId) {
+    return;
+  }
+  state.conversationSearch.matchGroups = matchGroups;
+  state.conversationSearch.totalMatches = totalMatches;
+  if (totalMatches > 0) {
+    state.conversationSearch.activeIndex = -1;
+    updateConversationSearchControls();
     return;
   }
   updateConversationSearchControls();
 }
 
-function isMessageSearchVisible(message) {
+function countSearchOccurrences(lowerText, lowerQuery) {
+  if (!lowerQuery) {
+    return 0;
+  }
+  let count = 0;
+  let matchIndex = lowerText.indexOf(lowerQuery);
+  while (matchIndex !== -1) {
+    count += 1;
+    matchIndex = lowerText.indexOf(lowerQuery, matchIndex + lowerQuery.length);
+  }
+  return count;
+}
+
+function ensureSearchWorker() {
+  if (!("Worker" in window)) {
+    return null;
+  }
+  if (state.conversationSearch.worker) {
+    return state.conversationSearch.worker;
+  }
+  try {
+    const worker = new Worker(SEARCH_WORKER_URL);
+    worker.addEventListener("message", handleSearchWorkerMessage);
+    worker.addEventListener("error", () => {
+      state.conversationSearch.worker?.terminate();
+      state.conversationSearch.worker = null;
+      state.conversationSearch.workerReady = false;
+    });
+    state.conversationSearch.worker = worker;
+    return worker;
+  } catch {
+    state.conversationSearch.worker = null;
+    return null;
+  }
+}
+
+async function rebuildSearchWorkerIndex() {
+  const worker = ensureSearchWorker();
+  if (!worker || !state.currentThread) {
+    return;
+  }
+  const revision = state.conversationSearch.workerRevision + 1;
+  state.conversationSearch.workerRevision = revision;
+  state.conversationSearch.workerReady = false;
+  state.conversationSearch.workerIndexing = true;
+  state.conversationSearch.pendingWorkerSearch = false;
+  worker.postMessage({ type: "reset", revision });
+  let records = [];
+  for (const [messageIndex, message] of state.currentThread.messages.entries()) {
+    if (revision !== state.conversationSearch.workerRevision) {
+      return;
+    }
+    if (!isMessageSearchVisible(message)) {
+      continue;
+    }
+    records.push({
+      messageIndex,
+      text: message.text || ""
+    });
+    if (records.length >= 80) {
+      worker.postMessage({ type: "append", revision, records });
+      records = [];
+      await yieldToBrowser();
+    }
+  }
+  if (revision !== state.conversationSearch.workerRevision) {
+    return;
+  }
+  if (records.length > 0) {
+    worker.postMessage({ type: "append", revision, records });
+  }
+  worker.postMessage({ type: "finish", revision });
+}
+
+function handleSearchWorkerMessage(event) {
+  const data = event.data || {};
+  if (data.revision !== state.conversationSearch.workerRevision) {
+    return;
+  }
+  if (data.type === "ready") {
+    state.conversationSearch.workerReady = true;
+    state.conversationSearch.workerIndexing = false;
+    if (state.conversationSearch.pendingWorkerSearch && els.conversationSearchInput.value.trim()) {
+      state.conversationSearch.pendingWorkerSearch = false;
+      void applyConversationSearch();
+    }
+    return;
+  }
+  if (data.type === "progress") {
+    if (data.requestId !== state.conversationSearch.requestId) {
+      return;
+    }
+    els.conversationSearchCount.textContent = data.totalMatches > 0
+      ? `${data.totalMatches} found...`
+      : "Searching...";
+    return;
+  }
+  if (data.type !== "result" || data.requestId !== state.conversationSearch.requestId) {
+    return;
+  }
+  state.conversationSearch.matchGroups = data.matchGroups || [];
+  state.conversationSearch.totalMatches = data.totalMatches || 0;
+  if (state.conversationSearch.totalMatches > 0) {
+    state.conversationSearch.activeIndex = -1;
+    updateConversationSearchControls();
+    return;
+  }
+  state.conversationSearch.activeIndex = -1;
+  updateConversationSearchControls();
+}
+
+function isMessageVisibleByFilter(message) {
   const key = messageFilterKey(message);
   return state.messageFilters[key] !== false;
+}
+
+function isMessageSearchVisible(message) {
+  return isMessageVisibleByFilter(message);
 }
 
 function cachedLowerSearchText(message) {
@@ -843,18 +2316,20 @@ function cachedLowerSearchText(message) {
 }
 
 function highlightNthSearchInElement(element, lowerQuery, queryLength, targetOccurrence) {
-  const walker = document.createTreeWalker(
+  const doc = element.ownerDocument || document;
+  const nodeFilter = doc.defaultView?.NodeFilter || NodeFilter;
+  const walker = doc.createTreeWalker(
     element,
-    NodeFilter.SHOW_TEXT,
+    nodeFilter.SHOW_TEXT,
     {
       acceptNode(node) {
         if (!node.nodeValue || !node.nodeValue.trim()) {
-          return NodeFilter.FILTER_REJECT;
+          return nodeFilter.FILTER_REJECT;
         }
         if (node.parentElement?.closest(".search-match")) {
-          return NodeFilter.FILTER_REJECT;
+          return nodeFilter.FILTER_REJECT;
         }
-        return NodeFilter.FILTER_ACCEPT;
+        return nodeFilter.FILTER_ACCEPT;
       }
     }
   );
@@ -867,16 +2342,16 @@ function highlightNthSearchInElement(element, lowerQuery, queryLength, targetOcc
     let matchIndex = lowerValue.indexOf(lowerQuery);
     while (matchIndex !== -1) {
       if (seenOccurrences === targetOccurrence) {
-        const fragment = document.createDocumentFragment();
+        const fragment = doc.createDocumentFragment();
         if (matchIndex > 0) {
-          fragment.appendChild(document.createTextNode(value.slice(0, matchIndex)));
+          fragment.appendChild(doc.createTextNode(value.slice(0, matchIndex)));
         }
-        const mark = document.createElement("mark");
+        const mark = doc.createElement("mark");
         mark.className = "search-match active";
         mark.textContent = value.slice(matchIndex, matchIndex + queryLength);
         fragment.appendChild(mark);
         if (matchIndex + queryLength < value.length) {
-          fragment.appendChild(document.createTextNode(value.slice(matchIndex + queryLength)));
+          fragment.appendChild(doc.createTextNode(value.slice(matchIndex + queryLength)));
         }
         node.replaceWith(fragment);
         return mark;
@@ -892,49 +2367,69 @@ function highlightNthSearchInElement(element, lowerQuery, queryLength, targetOcc
 }
 
 function clearConversationHighlights() {
-  const marks = [...els.messages.querySelectorAll(".search-match")];
+  const marks = state.conversationSearch.activeMarks;
+  state.conversationSearch.activeMarks = [];
   for (const mark of marks) {
+    if (!mark.isConnected) {
+      continue;
+    }
     const parent = mark.parentNode;
-    mark.replaceWith(document.createTextNode(mark.textContent));
+    mark.replaceWith(mark.ownerDocument.createTextNode(mark.textContent));
     parent?.normalize();
   }
 }
 
 function updateConversationSearchControls() {
   const query = els.conversationSearchInput.value.trim();
-  const total = state.conversationSearch.matches.length;
+  const total = state.conversationSearch.totalMatches;
   const active = state.conversationSearch.activeIndex;
   if (!query) {
     els.conversationSearchCount.textContent = "No search";
   } else if (total === 0) {
     els.conversationSearchCount.textContent = "0 matches";
+  } else if (active < 0) {
+    els.conversationSearchCount.textContent = `${total} matches`;
   } else {
     els.conversationSearchCount.textContent = `${active + 1} / ${total}`;
   }
+  updateConversationSearchButtons();
+}
+
+function updateConversationSearchButtons() {
+  const query = els.conversationSearchInput.value.trim();
+  const total = state.conversationSearch.totalMatches;
   els.conversationSearchPrev.disabled = total === 0;
   els.conversationSearchNext.disabled = total === 0;
   els.conversationSearchClear.disabled = query === "";
 }
 
-function setActiveConversationMatch(index, { scroll = true } = {}) {
-  const matches = state.conversationSearch.matches;
-  if (matches.length === 0) {
+function setActiveConversationMatch(index, { scroll = true, expandCollapsed = true } = {}) {
+  const total = state.conversationSearch.totalMatches;
+  if (total === 0) {
     state.conversationSearch.activeIndex = -1;
     updateConversationSearchControls();
     return;
   }
 
-  const normalizedIndex = (index + matches.length) % matches.length;
+  const normalizedIndex = (index + total) % total;
   clearConversationHighlights();
-  const active = matches[normalizedIndex];
-  const wrapper = els.messages.querySelector(`.message[data-message-index="${active.messageIndex}"]`);
+  const active = searchMatchAtIndex(normalizedIndex);
+  if (!active) {
+    state.conversationSearch.activeIndex = -1;
+    updateConversationSearchControls();
+    return;
+  }
+  let wrapper = els.messages.querySelector(`.message[data-message-index="${active.messageIndex}"]`);
+  if (!wrapper && expandCollapsed) {
+    wrapper = expandToolRunForMessage(active.messageIndex);
+  }
   let activeElement = wrapper;
   if (wrapper) {
-    if (wrapper.classList.contains("collapsed")) {
+    if (wrapper.classList.contains("collapsed") && expandCollapsed) {
       expandCollapsedMessage(wrapper);
     }
     const body = wrapper.querySelector(".message-body");
-    const mark = body
+    const mark = body && !body.hidden
       ? highlightNthSearchInElement(
         body,
         state.conversationSearch.lowerQuery,
@@ -942,6 +2437,9 @@ function setActiveConversationMatch(index, { scroll = true } = {}) {
         active.occurrenceIndex
       )
       : null;
+    if (mark) {
+      state.conversationSearch.activeMarks = [mark];
+    }
     activeElement = mark || wrapper;
   }
   state.conversationSearch.activeIndex = normalizedIndex;
@@ -953,13 +2451,34 @@ function setActiveConversationMatch(index, { scroll = true } = {}) {
 }
 
 function stepConversationSearch(direction) {
-  if (state.conversationSearch.matches.length === 0) {
+  if (state.conversationSearch.totalMatches === 0) {
     return;
   }
-  setActiveConversationMatch(state.conversationSearch.activeIndex + direction);
+  const activeIndex = state.conversationSearch.activeIndex;
+  if (activeIndex < 0) {
+    setActiveConversationMatch(direction > 0 ? 0 : state.conversationSearch.totalMatches - 1);
+    return;
+  }
+  setActiveConversationMatch(activeIndex + direction);
+}
+
+function searchMatchAtIndex(index) {
+  let cursor = 0;
+  for (const group of state.conversationSearch.matchGroups) {
+    const next = cursor + group.count;
+    if (index < next) {
+      return {
+        messageIndex: group.messageIndex,
+        occurrenceIndex: index - cursor
+      };
+    }
+    cursor = next;
+  }
+  return null;
 }
 
 function scrollElementIntoMessages(element) {
+  scrollElementHorizontallyIntoView(element);
   const elementRect = element.getBoundingClientRect();
   const messagesRect = els.messages.getBoundingClientRect();
   const target = els.messages.scrollTop
@@ -970,13 +2489,36 @@ function scrollElementIntoMessages(element) {
   scrollMessagesTo(Math.max(0, Math.min(target, maxScroll)));
 }
 
-function renderMessage(message, index = 0) {
+function scrollElementHorizontallyIntoView(element) {
+  let current = element.parentElement;
+  while (current && current !== els.messages) {
+    if (current.scrollWidth > current.clientWidth) {
+      const style = current.ownerDocument.defaultView.getComputedStyle(current);
+      if (style.overflowX === "auto" || style.overflowX === "scroll") {
+        const elementRect = element.getBoundingClientRect();
+        const currentRect = current.getBoundingClientRect();
+        const target = current.scrollLeft
+          + elementRect.left
+          - currentRect.left
+          - ((current.clientWidth - elementRect.width) / 2);
+        const maxScroll = current.scrollWidth - current.clientWidth;
+        current.scrollLeft = Math.max(0, Math.min(target, maxScroll));
+      }
+    }
+    current = current.parentElement;
+  }
+}
+
+function renderMessage(message, index = 0, options = {}) {
   const wrapper = document.createElement("section");
-  wrapper.className = `message ${message.role}`;
+  wrapper.className = `message ${message.role}${message.rolled_back ? " rolled-back" : ""}`;
   wrapper.dataset.filterKey = messageFilterKey(message);
   wrapper.dataset.messageIndex = String(index);
-  const isCollapsible = COLLAPSED_MESSAGE_ROLES.has(message.role);
-  if (isCollapsible) {
+  const collapseRolledBack = message.rolled_back && !options.insideRollbackGroup;
+  const isCollapsible = COLLAPSED_MESSAGE_ROLES.has(message.role) || collapseRolledBack;
+  const shouldLazyRenderBody = isCollapsible;
+  const isExpanded = isCollapsible && state.expandedMessages.has(index);
+  if (isCollapsible && !isExpanded) {
     wrapper.classList.add("collapsed");
   }
 
@@ -989,12 +2531,13 @@ function renderMessage(message, index = 0) {
     roleElement = document.createElement("button");
     roleElement.type = "button";
     roleElement.className = "message-toggle";
-    roleElement.setAttribute("aria-expanded", "false");
+    roleElement.tabIndex = -1;
+    roleElement.setAttribute("aria-expanded", String(isExpanded));
     roleElement.setAttribute("aria-controls", bodyId);
 
     const icon = document.createElement("span");
     icon.className = "message-toggle-icon";
-    icon.textContent = "+";
+    icon.textContent = isExpanded ? "-" : "+";
 
     const role = document.createElement("span");
     role.className = "role";
@@ -1016,21 +2559,27 @@ function renderMessage(message, index = 0) {
   }
 
   const phase = message.phase ? ` | ${message.phase}` : "";
+  const rollback = message.rolled_back
+    ? ` | rolled back${message.rolled_back_at ? ` at ${message.rolled_back_at}` : ""}`
+    : "";
   const source = document.createElement("span");
-  source.textContent = `${text(message.time)} | ${text(message.source)}${phase}`;
+  source.className = "message-source";
+  source.textContent = `${text(message.time)} | ${text(message.source)}${phase}${rollback}`;
 
+  const actions = renderMessageActions(message, index);
   header.append(roleElement, source);
+  if (actions) {
+    header.appendChild(actions);
+  }
 
-  const body = document.createElement("div");
-  body.className = "message-body";
+  let body = null;
   if (isCollapsible) {
-    body.id = bodyId;
-    body.hidden = true;
-    if (message.role === "tool" || message.role === "event") {
-      body.dataset.rendered = "false";
-      body.__messageText = message.text || "";
+    if (shouldLazyRenderBody) {
+      wrapper.dataset.bodyId = bodyId;
+      wrapper.__messageText = message.text || "";
     }
     roleElement.addEventListener("click", () => {
+      body = body || ensureLazyMessageBody(wrapper);
       setCollapsedMessageExpanded(
         wrapper,
         body,
@@ -1039,16 +2588,605 @@ function renderMessage(message, index = 0) {
       );
     });
   }
-  setAutoDirection(body, message.text || "");
-  if (message.role !== "tool" && message.role !== "event") {
-    body.appendChild(renderFormattedText(message.text || ""));
+  if (shouldLazyRenderBody && !isExpanded) {
+    body = null;
+  } else {
+    body = document.createElement("div");
+    body.className = "message-body";
+    if (isCollapsible) {
+      body.id = bodyId;
+      body.dataset.rendered = "false";
+      body.__messageText = message.text || "";
+      ensureMessageBodyRendered(body);
+      body.hidden = !isExpanded;
+    } else {
+      setAutoDirection(body, message.text || "");
+      body.appendChild(renderFormattedText(message.text || ""));
+    }
   }
 
-  wrapper.append(header, body);
+  if (body) {
+    wrapper.append(header, body);
+  } else {
+    wrapper.append(header);
+  }
   return wrapper;
 }
 
+function renderMessageActions(message, index) {
+  const compaction = compactionCheckpointForMessage(index);
+  const canFork = canForkFromMessage(message);
+  const canRollback = canRollbackToMessage(message, index);
+  const rollbackCheckpoint = rollbackCheckpointForMessage(message, index);
+  if (!compaction && !canFork && !canRollback && !rollbackCheckpoint) {
+    return null;
+  }
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+
+  if (canFork) {
+    const fork = document.createElement("button");
+    fork.type = "button";
+    fork.className = "message-action primary";
+    fork.textContent = "Fork here";
+    fork.title = "Create a new fork from the conversation state immediately after this user message.";
+    fork.addEventListener("click", () => createForkFromMessage(message, index, fork));
+    actions.appendChild(fork);
+  }
+
+  if (compaction) {
+    const fork = document.createElement("button");
+    fork.type = "button";
+    fork.className = "message-action primary";
+    fork.textContent = "Fork before";
+    fork.title = "Create a new fork from the conversation state before this compaction.";
+    fork.addEventListener("click", () => createForkBeforeCompaction(compaction, state.currentThread?.summary, fork));
+    actions.appendChild(fork);
+  }
+
+  if (rollbackCheckpoint) {
+    actions.appendChild(createRollbackUndoButton(rollbackCheckpoint));
+  }
+
+  if (canRollback) {
+    const rollback = document.createElement("button");
+    rollback.type = "button";
+    rollback.className = "message-action rollback-create-action";
+    rollback.textContent = "Rollback to here";
+    rollback.title = "Append a Codex rollback marker that keeps this user turn and rolls back later active user turns.";
+    rollback.addEventListener("click", () => createRollbackToMessage(message, index, rollback));
+    actions.appendChild(rollback);
+  }
+  return actions;
+}
+
+function createRollbackUndoButton(rollback, label = "Undo as fork") {
+  const undo = document.createElement("button");
+  undo.type = "button";
+  undo.className = "message-action primary";
+  undo.textContent = label;
+  undo.title = rollbackUndoTitle(rollback);
+  undo.disabled = !Number.isInteger(rollback.lineNumber);
+  undo.addEventListener("click", () => createForkBeforeRollback(rollback, state.currentThread?.summary, undo));
+  return undo;
+}
+
+function rollbackUndoTitle(rollback) {
+  const parts = ["Create a new fork from the conversation state before this rollback marker."];
+  const detail = [rollback.time, rollback.summary].filter(Boolean).join(" | ");
+  if (detail) {
+    parts.push(detail);
+  }
+  return parts.join(" ");
+}
+
+function compactionCheckpointForMessage(index) {
+  return (state.currentThread?.compactions || []).find(
+    (checkpoint) => checkpoint.message_index === index && Number.isInteger(checkpoint.line_number)
+  ) || null;
+}
+
+function rollbackCheckpointForMessage(message, index) {
+  if (message?.role !== "event" || message.phase !== "rollback") {
+    return null;
+  }
+  const checkpoint = (state.currentThread?.rollbacks || []).find(
+    (item) => item.message_index === index && Number.isInteger(item.line_number)
+  ) || (state.currentThread?.rollbacks || []).find((item) => (
+    message.timestamp !== undefined
+    && message.timestamp !== null
+    && item.timestamp !== undefined
+    && item.timestamp !== null
+    && String(item.timestamp) === String(message.timestamp)
+  ));
+  return normalizeRollbackCheckpoint(checkpoint, message, index);
+}
+
+function normalizeRollbackCheckpoint(checkpoint, fallbackMessage = null, fallbackIndex = null) {
+  if (!checkpoint) {
+    return null;
+  }
+  return {
+    ordinal: checkpoint.ordinal ?? null,
+    lineNumber: checkpoint.line_number,
+    messageIndex: Number.isInteger(checkpoint.message_index) ? checkpoint.message_index : fallbackIndex,
+    eventIndex: Number.isInteger(checkpoint.message_index) ? checkpoint.message_index : fallbackIndex,
+    timestamp: checkpoint.timestamp ?? fallbackMessage?.timestamp ?? null,
+    time: checkpoint.time || fallbackMessage?.time || "",
+    summary: checkpoint.summary || "Rollback marker"
+  };
+}
+
+function canForkFromMessage(message) {
+  return (
+    state.mode === "main"
+    && state.currentThread?.summary?.id
+    && message?.role === "user"
+    && Number.isInteger(message.line_number)
+  );
+}
+
+function canRollbackToMessage(message, index) {
+  return (
+    state.mode === "main"
+    && state.currentThread?.summary?.id
+    && message?.role === "user"
+    && !message.rolled_back
+    && Number.isInteger(message.line_number)
+    && activeUserTurnsAfter(index) > 0
+  );
+}
+
+function activeUserTurnsAfter(index) {
+  const messages = state.currentThread?.messages || [];
+  let count = 0;
+  for (let cursor = index + 1; cursor < messages.length; cursor += 1) {
+    const message = messages[cursor];
+    if (message?.role === "user" && !message.rolled_back && Number.isInteger(message.line_number)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+async function createRollbackToMessage(message, index, button) {
+  const summary = state.currentThread?.summary;
+  const lineNumber = message?.line_number;
+  if (!summary?.id || !Number.isInteger(lineNumber)) {
+    return;
+  }
+  const turnCount = activeUserTurnsAfter(index);
+  if (turnCount <= 0) {
+    els.sourceLine.textContent = "No later active user turns to roll back.";
+    return;
+  }
+  const label = turnCount === 1 ? "1 later user turn" : `${turnCount} later user turns`;
+  const confirmed = await confirmWriteAction({
+    title: "Create rollback to this message?",
+    body: `This appends a Codex rollback marker and marks ${label} as rolled back. The original messages stay preserved.`,
+    details: [
+      { label: "Target", value: collapsedMessageHeading(message.text || "") || "Selected user message" },
+      { label: "Turns affected", value: label },
+      { label: "Change", value: "Appends a rollback marker to the current conversation" }
+    ],
+    confirmLabel: "Create rollback",
+    opener: button
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Creating...";
+  try {
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(summary.id)}/rollback-to-message`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line_number: lineNumber })
+      }
+    );
+    const warning = result.state_update_error ? ` State timestamp update failed: ${result.state_update_error}` : "";
+    els.sourceLine.textContent = `Created rollback for ${result.rollback_turns} turn(s).${warning}`;
+    await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    await openThread("main", summary.id);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = originalText;
+    els.sourceLine.textContent = error.message || String(error);
+  }
+}
+
+function renderToolRun(run) {
+  const first = run[0];
+  const last = run[run.length - 1];
+  const runId = toolRunId(first.index, last.index);
+  const isExpanded = state.expandedToolRuns.has(runId);
+  const hasRolledBackMessages = run.some((item) => item.message?.rolled_back);
+  const wrapper = document.createElement("section");
+  wrapper.className = `tool-run${isExpanded ? "" : " collapsed"}${hasRolledBackMessages ? " rolled-back" : ""}`;
+  wrapper.dataset.toolRunId = runId;
+  wrapper.dataset.toolRunStart = String(first.index);
+  wrapper.dataset.toolRunEnd = String(last.index);
+  wrapper.__toolRunItems = run;
+  for (const item of run) {
+    state.toolRunByMessageIndex.set(item.index, runId);
+  }
+
+  const header = document.createElement("div");
+  header.className = "message-header tool-run-header";
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "message-toggle tool-run-toggle";
+  toggle.tabIndex = -1;
+  toggle.setAttribute("aria-expanded", String(isExpanded));
+
+  const icon = document.createElement("span");
+  icon.className = "message-toggle-icon";
+  icon.textContent = isExpanded ? "-" : "+";
+
+  const role = document.createElement("span");
+  role.className = "role";
+  role.textContent = "Tools";
+
+  const preview = document.createElement("span");
+  preview.className = "message-heading-preview";
+  preview.textContent = toolRunPreview(run);
+
+  toggle.append(icon, role, preview);
+
+  const source = document.createElement("span");
+  source.textContent = toolRunMeta(run);
+  header.append(toggle, source);
+  wrapper.appendChild(header);
+
+  let body = null;
+  toggle.addEventListener("click", () => {
+    body = body || ensureToolRunBody(wrapper);
+    setToolRunExpanded(wrapper, body, toggle, wrapper.classList.contains("collapsed"));
+  });
+
+  if (isExpanded) {
+    body = ensureToolRunBody(wrapper);
+    setToolRunExpanded(wrapper, body, toggle, true);
+  }
+
+  return wrapper;
+}
+
+function renderRollbackGroup(group) {
+  const first = group[0];
+  const last = group[group.length - 1];
+  const groupId = rollbackGroupId(first.index, last.index);
+  const isExpanded = state.expandedToolRuns.has(groupId);
+  const wrapper = document.createElement("section");
+  wrapper.className = `rollback-group${isExpanded ? "" : " collapsed"}`;
+  wrapper.dataset.rollbackGroupId = groupId;
+  wrapper.dataset.rollbackGroupStart = String(first.index);
+  wrapper.dataset.rollbackGroupEnd = String(last.index);
+  wrapper.__rollbackGroupItems = group;
+  for (const item of group) {
+    state.toolRunByMessageIndex.set(item.index, groupId);
+  }
+
+  const header = document.createElement("div");
+  header.className = "message-header rollback-group-header";
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "message-toggle rollback-group-toggle";
+  toggle.tabIndex = -1;
+  toggle.setAttribute("aria-expanded", String(isExpanded));
+
+  const icon = document.createElement("span");
+  icon.className = "message-toggle-icon";
+  icon.textContent = isExpanded ? "-" : "+";
+
+  const role = document.createElement("span");
+  role.className = "role";
+  role.textContent = "Rollback";
+
+  const preview = document.createElement("span");
+  preview.className = "message-heading-preview";
+  const headingText = rollbackGroupPreview(group);
+  setAutoDirection(preview, headingText);
+  preview.textContent = headingText;
+
+  toggle.append(icon, role, preview);
+
+  const source = document.createElement("span");
+  source.className = "message-source";
+  source.textContent = rollbackGroupMeta(group);
+  header.append(toggle, source);
+  const actions = renderRollbackGroupActions(group);
+  if (actions) {
+    header.appendChild(actions);
+  }
+  wrapper.appendChild(header);
+
+  let body = null;
+  toggle.addEventListener("click", () => {
+    body = body || ensureRollbackGroupBody(wrapper);
+    setRollbackGroupExpanded(wrapper, body, toggle, wrapper.classList.contains("collapsed"));
+  });
+
+  if (isExpanded) {
+    body = ensureRollbackGroupBody(wrapper);
+    setRollbackGroupExpanded(wrapper, body, toggle, true);
+  }
+
+  return wrapper;
+}
+
+function renderRollbackGroupActions(group) {
+  const rollbacks = rollbackCheckpointsForGroup(group);
+  if (rollbacks.length === 0) {
+    return null;
+  }
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+
+  for (const rollback of rollbacks) {
+    const label = rollbacks.length === 1
+      ? "Undo as fork"
+      : `Undo #${rollback.ordinal || "?"} as fork`;
+    actions.appendChild(createRollbackUndoButton(rollback, label));
+  }
+  return actions;
+}
+
+function rollbackCheckpointsForGroup(group) {
+  const matches = [];
+  const seen = new Set();
+  const add = (rollback) => {
+    if (!rollback) {
+      return;
+    }
+    const key = rollback.lineNumber ?? rollback.timestamp ?? rollback.eventIndex ?? rollback.ordinal;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    matches.push(rollback);
+  };
+
+  for (const item of group) {
+    add(rollbackCheckpointForMessage(item.message, item.index));
+  }
+
+  const timestamps = new Set(
+    group
+      .map((item) => item.message?.rolled_back_by_timestamp)
+      .filter((timestamp) => timestamp !== undefined && timestamp !== null)
+      .map((timestamp) => String(timestamp))
+  );
+  const checkpoints = state.currentThread?.rollbacks || [];
+  for (const checkpoint of checkpoints) {
+    if (checkpoint.timestamp !== undefined && checkpoint.timestamp !== null && timestamps.has(String(checkpoint.timestamp))) {
+      add(normalizeRollbackCheckpoint(checkpoint, null, checkpoint.message_index));
+    }
+  }
+
+  matches.sort((left, right) => (left.ordinal ?? 0) - (right.ordinal ?? 0));
+  return matches;
+}
+
+function rollbackGroupId(start, end) {
+  return `rollback-group-${start}-${end}`;
+}
+
+function rollbackGroupPreview(group) {
+  const firstText = group.find((item) => item.message?.rolled_back && item.message?.text)?.message?.text
+    || group.find((item) => item.message?.text)?.message?.text
+    || "";
+  const heading = collapsedMessageHeading(firstText);
+  const rolledBackCount = group.filter((item) => item.message?.rolled_back).length;
+  const eventCount = group.filter((item) => item.message?.role === "event" && !item.message?.rolled_back).length;
+  const parts = [
+    `${rolledBackCount} rolled-back ${rolledBackCount === 1 ? "message" : "messages"}`
+  ];
+  if (eventCount > 0) {
+    parts.push(`${eventCount} ${eventCount === 1 ? "event" : "events"}`);
+  }
+  const suffix = parts.join(", ");
+  return heading ? `${suffix} | ${heading}` : suffix;
+}
+
+function rollbackLinkPreview(group) {
+  const firstText = group.find((item) => item.message?.rolled_back && item.message?.text)?.message?.text
+    || group.find((item) => item.message?.text)?.message?.text
+    || "";
+  const heading = collapsedMessageHeading(firstText);
+  const rolledBackCount = group.filter((item) => item.message?.rolled_back).length;
+  const suffix = `${rolledBackCount} rolled-back ${rolledBackCount === 1 ? "message" : "messages"}`;
+  return heading ? `${suffix} | ${heading}` : suffix;
+}
+
+function rollbackGroupMeta(group) {
+  const first = group.find((item) => item.message?.rolled_back)?.message || group[0]?.message;
+  const rollbackAt = first?.rolled_back_at;
+  return rollbackAt ? `rolled back at ${rollbackAt}` : "rolled back";
+}
+
+function ensureRollbackGroupBody(wrapper) {
+  let body = wrapper.querySelector(".rollback-group-body");
+  if (body) {
+    return body;
+  }
+  body = document.createElement("div");
+  body.className = "rollback-group-body";
+  const units = rollbackGroupChildUnits(wrapper.__rollbackGroupItems || []);
+  for (const unit of units) {
+    if (unit.type === "toolRun") {
+      body.appendChild(renderToolRun(unit.run));
+    } else {
+      body.appendChild(renderMessage(unit.message, unit.index, { insideRollbackGroup: true }));
+    }
+  }
+  body.hidden = true;
+  wrapper.appendChild(body);
+  return body;
+}
+
+function rollbackGroupChildUnits(items) {
+  const units = [];
+  let pendingToolRun = [];
+  const flushToolRun = () => {
+    if (pendingToolRun.length === 0) {
+      return;
+    }
+    if (pendingToolRun.length >= TOOL_RUN_GROUP_MIN_SIZE) {
+      units.push(toolRunUnit(pendingToolRun));
+    } else {
+      for (const item of pendingToolRun) {
+        units.push(messageUnit(item.message, item.index));
+      }
+    }
+    pendingToolRun = [];
+  };
+  for (const item of items) {
+    if (item.message?.role === "tool") {
+      pendingToolRun.push(item);
+    } else {
+      flushToolRun();
+      units.push(messageUnit(item.message, item.index));
+    }
+  }
+  flushToolRun();
+  return units;
+}
+
+function setRollbackGroupExpanded(wrapper, body, toggle, expanded) {
+  const groupId = wrapper.dataset.rollbackGroupId;
+  wrapper.classList.toggle("collapsed", !expanded);
+  body.hidden = !expanded;
+  toggle.setAttribute("aria-expanded", String(expanded));
+  const icon = toggle.querySelector(".message-toggle-icon");
+  if (icon) {
+    icon.textContent = expanded ? "-" : "+";
+  }
+  if (groupId) {
+    if (expanded) {
+      state.expandedToolRuns.add(groupId);
+    } else {
+      state.expandedToolRuns.delete(groupId);
+    }
+  }
+}
+
+function toolRunId(start, end) {
+  return `tool-run-${start}-${end}`;
+}
+
+function toolRunPreview(run) {
+  const firstHeading = collapsedMessageHeading(run[0]?.message?.text || "");
+  if (!firstHeading) {
+    return `${run.length} tool entries`;
+  }
+  return `${run.length} tool entries | ${firstHeading}`;
+}
+
+function toolRunMeta(run) {
+  const first = run[0]?.message;
+  const last = run[run.length - 1]?.message;
+  const start = text(first?.time);
+  const end = last && last.time && last.time !== first?.time ? ` to ${last.time}` : "";
+  const rolledBack = run.some((item) => item.message?.rolled_back);
+  const rollbackAt = run.find((item) => item.message?.rolled_back_at)?.message?.rolled_back_at;
+  const rollback = rolledBack ? ` | rolled back${rollbackAt ? ` at ${rollbackAt}` : ""}` : "";
+  return `${start}${end}${rollback}`;
+}
+
+function ensureToolRunBody(wrapper) {
+  let body = wrapper.querySelector(".tool-run-body");
+  if (body) {
+    return body;
+  }
+  body = document.createElement("div");
+  body.className = "tool-run-body";
+  for (const item of wrapper.__toolRunItems || []) {
+    body.appendChild(renderMessage(item.message, item.index));
+  }
+  body.hidden = true;
+  wrapper.appendChild(body);
+  return body;
+}
+
+function setToolRunExpanded(wrapper, body, toggle, expanded) {
+  const runId = wrapper.dataset.toolRunId;
+  wrapper.classList.toggle("collapsed", !expanded);
+  body.hidden = !expanded;
+  toggle.setAttribute("aria-expanded", String(expanded));
+  const icon = toggle.querySelector(".message-toggle-icon");
+  if (icon) {
+    icon.textContent = expanded ? "-" : "+";
+  }
+  if (runId) {
+    if (expanded) {
+      state.expandedToolRuns.add(runId);
+    } else {
+      state.expandedToolRuns.delete(runId);
+    }
+  }
+}
+
+function expandToolRunForMessage(messageIndex) {
+  const runId = state.toolRunByMessageIndex.get(messageIndex);
+  if (!runId) {
+    return null;
+  }
+  if (runId.startsWith("rollback-group-")) {
+    return expandRollbackGroupForMessage(messageIndex, runId);
+  }
+  const wrapper = els.messages.querySelector(`.tool-run[data-tool-run-id="${runId}"]`);
+  if (!wrapper) {
+    return null;
+  }
+  expandContainingRollbackGroup(wrapper);
+  const toggle = wrapper.querySelector(".tool-run-toggle");
+  const body = ensureToolRunBody(wrapper);
+  if (toggle && wrapper.classList.contains("collapsed")) {
+    setToolRunExpanded(wrapper, body, toggle, true);
+  }
+  return wrapper.querySelector(`.message[data-message-index="${messageIndex}"]`);
+}
+
+function expandRollbackGroupForMessage(messageIndex, groupId) {
+  const wrapper = els.messages.querySelector(`.rollback-group[data-rollback-group-id="${groupId}"]`);
+  if (!wrapper) {
+    return null;
+  }
+  const toggle = wrapper.querySelector(".rollback-group-toggle");
+  const body = ensureRollbackGroupBody(wrapper);
+  if (toggle && wrapper.classList.contains("collapsed")) {
+    setRollbackGroupExpanded(wrapper, body, toggle, true);
+  }
+  let message = wrapper.querySelector(`.message[data-message-index="${messageIndex}"]`);
+  if (!message) {
+    message = expandToolRunForMessage(messageIndex);
+  }
+  return message;
+}
+
+function expandContainingRollbackGroup(element) {
+  const group = element.closest(".rollback-group");
+  if (!group || !group.classList.contains("collapsed")) {
+    return;
+  }
+  const toggle = group.querySelector(".rollback-group-toggle");
+  const body = ensureRollbackGroupBody(group);
+  if (toggle) {
+    setRollbackGroupExpanded(group, body, toggle, true);
+  }
+}
+
 function messageFilterKey(message) {
+  if (message.rolled_back) {
+    return "rolledBack";
+  }
   if (message.role === "user" || message.role === "assistant" || message.role === "thinking" || message.role === "tool") {
     return message.role;
   }
@@ -1070,34 +3208,46 @@ function messageFilterKey(message) {
   return "otherEvent";
 }
 
-function applyMessageFilters() {
-  const messageElements = [...els.messages.querySelectorAll(".message")];
-  let visible = 0;
-  for (const element of messageElements) {
-    const key = element.dataset.filterKey || "otherEvent";
-    const shown = state.messageFilters[key] !== false;
-    element.classList.toggle("filtered-out", !shown);
-    if (shown) {
-      visible += 1;
-    }
-  }
-  const total = messageElements.length;
+function updateMessageCount(visible, total) {
   if (state.currentThread && state.currentThread.summary) {
     els.metaCount.textContent = `${visible} of ${total} shown`;
   }
 }
 
 function expandCollapsedMessage(wrapper) {
-  const body = wrapper.querySelector(".message-body");
   const toggle = wrapper.querySelector(".message-toggle");
-  if (!body || !toggle) {
+  if (!toggle) {
     return;
   }
+  const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
   setCollapsedMessageExpanded(wrapper, body, toggle, true);
+}
+
+function ensureLazyMessageBody(wrapper) {
+  let body = wrapper.querySelector(".message-body");
+  if (body) {
+    return body;
+  }
+  body = document.createElement("div");
+  body.className = "message-body";
+  body.id = wrapper.dataset.bodyId || `message-body-${wrapper.dataset.messageIndex || "unknown"}`;
+  body.hidden = true;
+  body.dataset.rendered = "false";
+  body.__messageText = wrapper.__messageText || "";
+  wrapper.appendChild(body);
+  return body;
 }
 
 function setCollapsedMessageExpanded(wrapper, body, toggle, expanded) {
   wrapper.classList.toggle("collapsed", !expanded);
+  const messageIndex = Number(wrapper.dataset.messageIndex);
+  if (Number.isInteger(messageIndex)) {
+    if (expanded) {
+      state.expandedMessages.add(messageIndex);
+    } else {
+      state.expandedMessages.delete(messageIndex);
+    }
+  }
   if (expanded) {
     ensureMessageBodyRendered(body);
   }
@@ -1113,25 +3263,40 @@ function ensureMessageBodyRendered(body) {
   if (body.dataset.rendered !== "false") {
     return;
   }
-  body.replaceChildren(renderFormattedText(body.__messageText || ""));
+  const value = body.__messageText || "";
+  setAutoDirection(body, value);
+  body.replaceChildren(renderFormattedText(value));
   body.dataset.rendered = "true";
 }
 
 function collapsedMessageHeading(value) {
-  const lines = String(value)
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (!lines.length) {
-    return "";
-  }
-  const firstLine = lines[0];
+  const firstLine = firstNonEmptyLine(value, 1200);
+  if (!firstLine) return "";
   const heading = firstLine.match(/^#{1,6}\s+(.+)$/)
     || firstLine.match(/^\*\*(.+?)\*\*$/)
     || firstLine.match(/^__(.+?)__$/);
   const textValue = heading ? heading[1] : firstLine;
   return compactInlineText(stripInlineMarkup(textValue), 90);
+}
+
+function firstNonEmptyLine(value, limit) {
+  const textValue = String(value);
+  const scanLength = Math.min(textValue.length, limit);
+  let start = 0;
+  for (let index = 0; index <= scanLength; index += 1) {
+    if (index < scanLength && textValue[index] !== "\n" && textValue[index] !== "\r") {
+      continue;
+    }
+    const line = textValue.slice(start, index).trim();
+    if (line) {
+      return line;
+    }
+    if (textValue[index] === "\r" && textValue[index + 1] === "\n") {
+      index += 1;
+    }
+    start = index + 1;
+  }
+  return textValue.slice(0, scanLength).trim();
 }
 
 function stripInlineMarkup(value) {
@@ -1255,8 +3420,15 @@ function renderFormattedText(value) {
       continue;
     }
 
+    const table = parseMarkdownTable(lines, index);
+    if (table) {
+      fragment.appendChild(renderMarkdownTable(table));
+      index = table.nextIndex;
+      continue;
+    }
+
     const paragraphLines = [];
-    while (index < lines.length && lines[index].trim() !== "" && !isBlockStart(lines[index])) {
+    while (index < lines.length && lines[index].trim() !== "" && !isBlockStart(lines[index], lines, index)) {
       paragraphLines.push(lines[index].trim());
       index += 1;
     }
@@ -1289,13 +3461,14 @@ function appendFormattedLines(parent, lines) {
   }
 }
 
-function isBlockStart(line) {
+function isBlockStart(line, lines = [], index = 0) {
   return /^```/.test(line)
     || /^(#{1,4})\s+/.test(line)
     || /^\s*[-*+]\s+/.test(line)
     || /^\s*\d+[.)]\s+/.test(line)
     || /^\s*>\s?/.test(line)
-    || /^\s*---+\s*$/.test(line);
+    || /^\s*---+\s*$/.test(line)
+    || Boolean(parseMarkdownTable(lines, index));
 }
 
 function renderCodeBlock(codeText, language) {
@@ -1309,6 +3482,161 @@ function renderCodeBlock(codeText, language) {
   code.textContent = codeText;
   pre.appendChild(code);
   return pre;
+}
+
+function parseMarkdownTable(lines, startIndex) {
+  if (!Array.isArray(lines) || startIndex + 1 >= lines.length) {
+    return null;
+  }
+  const header = parseMarkdownTableRow(lines[startIndex]);
+  const alignments = parseMarkdownTableSeparator(lines[startIndex + 1]);
+  if (!header || !alignments || header.length < 2 || header.length !== alignments.length) {
+    return null;
+  }
+
+  const rows = [];
+  let index = startIndex + 2;
+  while (index < lines.length) {
+    if (lines[index].trim() === "") {
+      break;
+    }
+    const row = parseMarkdownTableRow(lines[index]);
+    if (!row) {
+      break;
+    }
+    rows.push(normalizeTableRow(row, header.length));
+    index += 1;
+  }
+
+  return {
+    header: normalizeTableRow(header, header.length),
+    alignments,
+    rows,
+    nextIndex: index
+  };
+}
+
+function parseMarkdownTableSeparator(line) {
+  const cells = splitMarkdownTableRow(line);
+  if (!cells || cells.length < 2) {
+    return null;
+  }
+  const alignments = [];
+  for (const cell of cells) {
+    const value = cell.trim();
+    if (!/^:?-{3,}:?$/.test(value)) {
+      return null;
+    }
+    const starts = value.startsWith(":");
+    const ends = value.endsWith(":");
+    alignments.push(starts && ends ? "center" : ends ? "right" : starts ? "left" : "");
+  }
+  return alignments;
+}
+
+function parseMarkdownTableRow(line) {
+  const cells = splitMarkdownTableRow(line);
+  return cells && cells.length >= 2 ? cells : null;
+}
+
+function splitMarkdownTableRow(line) {
+  const value = String(line);
+  if (!value.includes("|")) {
+    return null;
+  }
+  const cells = [];
+  let current = "";
+  let escaped = false;
+  for (const character of value) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+    } else if (character === "|") {
+      cells.push(current.trim());
+      current = "";
+    } else {
+      current += character;
+    }
+  }
+  if (escaped) {
+    current += "\\";
+  }
+  cells.push(current.trim());
+
+  if (cells[0] === "") {
+    cells.shift();
+  }
+  if (cells[cells.length - 1] === "") {
+    cells.pop();
+  }
+  return cells.length >= 2 ? cells : null;
+}
+
+function normalizeTableRow(row, columnCount) {
+  const normalized = row.slice(0, columnCount);
+  while (normalized.length < columnCount) {
+    normalized.push("");
+  }
+  return normalized;
+}
+
+function renderMarkdownTable(table) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "md-table-wrap";
+  const element = document.createElement("table");
+  element.className = "md-table";
+  element.dir = tableDirection(table);
+
+  const thead = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  for (const [cellIndex, cellText] of table.header.entries()) {
+    const th = document.createElement("th");
+    setAutoDirection(th, cellText);
+    applyTableAlignment(th, table.alignments[cellIndex]);
+    th.appendChild(renderInline(cellText));
+    headerRow.appendChild(th);
+  }
+  thead.appendChild(headerRow);
+  element.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const row of table.rows) {
+    const tr = document.createElement("tr");
+    for (const [cellIndex, cellText] of row.entries()) {
+      const td = document.createElement("td");
+      setAutoDirection(td, cellText);
+      applyTableAlignment(td, table.alignments[cellIndex]);
+      td.appendChild(renderInline(cellText));
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  element.appendChild(tbody);
+  wrapper.appendChild(element);
+  return wrapper;
+}
+
+function tableDirection(table) {
+  const text = [
+    ...(table.header || []),
+    ...(table.rows || []).flat()
+  ].join(" ");
+  return dominantTextDirection(text);
+}
+
+function dominantTextDirection(value) {
+  const textValue = String(value);
+  const rtlCount = (textValue.match(/[\u0590-\u08FF\uFB1D-\uFDFD\uFE70-\uFEFC]/g) || []).length;
+  const ltrCount = (textValue.match(/[A-Za-z]/g) || []).length;
+  return rtlCount > ltrCount ? "rtl" : "ltr";
+}
+
+function applyTableAlignment(element, alignment) {
+  if (alignment) {
+    element.classList.add(`align-${alignment}`);
+  }
 }
 
 function setAutoDirection(element, value) {
@@ -1371,15 +3699,124 @@ function renderSafeLink(label, href) {
 
 function exportCurrentThread() {
   if (!state.currentThread) return;
-  const blob = new Blob([JSON.stringify(state.currentThread, null, 2)], {
-    type: "application/json"
-  });
+  const exportThread = currentFilteredExportThread();
+  const format = els.exportFormatSelect.value || "markdown";
+  const exporters = {
+    json: {
+      content: JSON.stringify(exportThread, null, 2),
+      type: "application/json",
+      extension: "json"
+    },
+    text: {
+      content: conversationAsPlainText(exportThread),
+      type: "text/plain",
+      extension: "txt"
+    },
+    markdown: {
+      content: conversationAsMarkdown(exportThread),
+      type: "text/markdown",
+      extension: "md"
+    }
+  };
+  const exportData = exporters[format] || exporters.markdown;
+  const blob = new Blob([exportData.content], { type: exportData.type });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${modeConfig().exportPrefix}-${state.currentThread.summary.id}.json`;
+  link.download = `${modeConfig().exportPrefix}-${exportThread.summary.id}.${exportData.extension}`;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function currentFilteredExportThread() {
+  const detail = state.currentThread || {};
+  const summary = detail.summary || {};
+  const messages = (detail.messages || []).filter(isMessageVisibleByFilter);
+  return {
+    ...detail,
+    summary: {
+      ...summary,
+      message_count: messages.length
+    },
+    messages
+  };
+}
+
+function conversationAsMarkdown(detail) {
+  const summary = detail.summary || {};
+  const messages = detail.messages || [];
+  const lines = [
+    `# ${summary.preview || "Codex conversation"}`,
+    "",
+    `- Thread ID: ${summary.id || ""}`,
+    `- Type: ${modeConfig().label}`,
+    `- Started: ${text(summary.started)}`,
+    `- Updated: ${text(summary.updated || summary.ended)}`,
+    `- Model: ${text(summary.model)}`,
+    `- Working directory: ${text(summary.cwd)}`,
+    `- Messages: ${messages.length}`,
+    ""
+  ];
+
+  for (const [index, message] of messages.entries()) {
+    lines.push(`## ${index + 1}. ${exportRoleLabel(message)}`);
+    const meta = exportMessageMetadata(message);
+    if (meta.length > 0) {
+      lines.push("", ...meta.map((item) => `- ${item}`));
+    }
+    lines.push("", message.text || "", "");
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function conversationAsPlainText(detail) {
+  const summary = detail.summary || {};
+  const messages = detail.messages || [];
+  const divider = "=".repeat(72);
+  const section = "-".repeat(72);
+  const lines = [
+    summary.preview || "Codex conversation",
+    divider,
+    `Thread ID: ${summary.id || ""}`,
+    `Type: ${modeConfig().label}`,
+    `Started: ${text(summary.started)}`,
+    `Updated: ${text(summary.updated || summary.ended)}`,
+    `Model: ${text(summary.model)}`,
+    `Working directory: ${text(summary.cwd)}`,
+    `Messages: ${messages.length}`,
+    ""
+  ];
+
+  for (const [index, message] of messages.entries()) {
+    lines.push(section, `${index + 1}. ${exportRoleLabel(message)}`);
+    for (const item of exportMessageMetadata(message)) {
+      lines.push(item);
+    }
+    lines.push("", message.text || "", "");
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function exportRoleLabel(message) {
+  const label = roleLabel(message.role);
+  return message.rolled_back ? `${label} (rolled back)` : label;
+}
+
+function exportMessageMetadata(message) {
+  const meta = [];
+  if (message.time) {
+    meta.push(`Time: ${message.time}`);
+  }
+  if (message.source) {
+    meta.push(`Source: ${message.source}`);
+  }
+  if (message.phase) {
+    meta.push(`Phase: ${message.phase}`);
+  }
+  if (message.rolled_back_at) {
+    meta.push(`Rolled back at: ${message.rolled_back_at}`);
+  }
+  return meta;
 }
 
 async function copyCurrentId() {
@@ -1413,10 +3850,12 @@ function showConversationError(error) {
   els.relatedPanel.classList.add("hidden");
   els.relatedPanel.replaceChildren();
   els.exportButton.disabled = true;
+  els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
 }
 
 async function init() {
+  setupConfirmModal();
   els.refreshButton.addEventListener("click", async () => {
     try {
       await loadStatus();
@@ -1441,32 +3880,36 @@ async function init() {
   });
   els.mainFilterSelect.addEventListener("change", async () => {
     state.mainFilter = els.mainFilterSelect.value;
-    state.selectedId = null;
-    state.currentThread = null;
     try {
-      await loadThreads({ preserveSelection: false });
+      await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
     } catch (error) {
       showError(error);
     }
   });
   els.exportButton.addEventListener("click", exportCurrentThread);
   els.copyIdButton.addEventListener("click", copyCurrentId);
-  els.searchInput.addEventListener("input", async () => {
+  els.searchInput.addEventListener("input", () => {
     state.filter = els.searchInput.value;
-    try {
-      await ensureVisibleSelection();
-    } catch (error) {
-      showError(error);
-    }
+    scheduleThreadSearch();
+  });
+  els.fullTextSearchInput.addEventListener("change", () => {
+    state.fullTextSearch = els.fullTextSearchInput.checked;
+    scheduleThreadSearch({ immediate: true });
   });
   els.conversationSearchInput.addEventListener("input", () => {
-    scheduleConversationSearch();
+    scheduleConversationSearchAfterPaint();
   });
   els.conversationSearchInput.addEventListener("keydown", (event) => {
     if (event.key !== "Enter") {
       return;
     }
     event.preventDefault();
+    const query = els.conversationSearchInput.value.trim().toLocaleLowerCase();
+    const searchIsPending = state.conversationSearch.timer !== null || state.conversationSearch.inputFrame !== null;
+    if (query && (searchIsPending || query !== state.conversationSearch.lowerQuery)) {
+      scheduleConversationSearch({ immediate: true });
+      return;
+    }
     stepConversationSearch(event.shiftKey ? -1 : 1);
   });
   els.conversationSearchPrev.addEventListener("click", () => stepConversationSearch(-1));
@@ -1489,6 +3932,7 @@ async function init() {
 
   try {
     renderMessageFilterControls();
+    els.fullTextSearchInput.checked = state.fullTextSearch;
     renderMode();
     await loadStatus();
     await loadThreads({ preserveSelection: false });

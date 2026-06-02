@@ -20,7 +20,12 @@
         </div>
         <div class="topbar-actions">
           <button id="refresh-button" type="button">Refresh</button>
-          <button id="export-button" type="button" disabled>Export JSON</button>
+          <select id="export-format-select" aria-label="Export format" disabled>
+            <option value="markdown">Markdown</option>
+            <option value="text">Plain text</option>
+            <option value="json">JSON</option>
+          </select>
+          <button id="export-button" type="button" disabled>Export</button>
           <button id="copy-id-button" type="button" disabled>Copy ID</button>
         </div>
       </header>
@@ -32,7 +37,11 @@
             <button id="side-mode-button" type="button">Side</button>
           </div>
           <div class="search-row">
-            <input id="search-input" type="search" placeholder="Search main conversations" autocomplete="off">
+            <input id="search-input" type="search" placeholder="Search main conversations" autocomplete="off" spellcheck="false" autocorrect="off" autocapitalize="none">
+            <label class="thread-search-scope" title="Search saved message text inside each conversation, not only the conversation title and metadata. This can take longer on large histories.">
+              <input id="full-text-search-input" type="checkbox">
+              <span>Search inside conversations</span>
+            </label>
           </div>
           <div class="filter-row" id="main-filter-row">
             <select id="main-filter-select" aria-label="Main conversation filter">
@@ -40,17 +49,14 @@
               <option value="with_side">With side conversations</option>
               <option value="with_forks">With forks</option>
               <option value="forked">Forked conversations</option>
+              <option value="with_rollback">With rollbacks</option>
             </select>
           </div>
           <div class="thread-stats" id="thread-stats">Loading...</div>
-          <div class="thread-list" id="thread-list" aria-label="Conversations"></div>
+          <div class="thread-list" id="thread-list" aria-hidden="true"></div>
         </aside>
 
         <section class="reader-panel">
-          <div class="notice" id="notice">
-            Main conversations are read from saved Codex rollout transcripts.
-          </div>
-
           <div id="empty-state" class="empty-state">
             <div class="empty-brand">
               <img src="/assets/codex-conversation-reader.png" alt="" aria-hidden="true">
@@ -84,7 +90,7 @@
               </dl>
               <div id="related-panel" class="related-panel hidden"></div>
               <div class="conversation-search" id="conversation-search">
-                <input id="conversation-search-input" type="search" placeholder="Search this conversation" autocomplete="off" disabled>
+                <input id="conversation-search-input" type="search" placeholder="Search this conversation" autocomplete="off" spellcheck="false" autocorrect="off" autocapitalize="none" disabled>
                 <div class="conversation-search-actions">
                   <span id="conversation-search-count" class="conversation-search-count">No search</span>
                   <button id="conversation-search-prev" type="button" disabled>Prev</button>
@@ -92,19 +98,40 @@
                   <button id="conversation-search-clear" type="button" disabled>Clear</button>
                 </div>
               </div>
-              <fieldset class="message-filters" id="message-filters">
-                <legend>Show</legend>
-                <div class="message-filter-options" id="message-filter-options"></div>
-                <div class="message-filter-actions">
-                  <button id="message-filter-defaults" type="button">Defaults</button>
-                  <button id="message-filter-all" type="button">All</button>
+              <details class="message-filters" id="message-filters">
+                <summary class="message-filters-summary">
+                  <span class="message-filters-icon" aria-hidden="true"></span>
+                  <span>Show filters</span>
+                </summary>
+                <div class="message-filters-content">
+                  <div class="message-filter-options" id="message-filter-options"></div>
+                  <div class="message-filter-actions">
+                    <button id="message-filter-defaults" type="button">Defaults</button>
+                    <button id="message-filter-all" type="button">All</button>
+                  </div>
                 </div>
-              </fieldset>
+              </details>
             </div>
-            <div id="messages" class="messages"></div>
+            <iframe id="messages-frame" class="messages-frame" title="Conversation messages" aria-hidden="true" tabindex="-1" scrolling="yes"></iframe>
           </article>
         </section>
       </main>
+    </div>
+
+    <div id="confirm-modal" class="confirm-modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title" aria-describedby="confirm-modal-body">
+      <div class="confirm-modal-backdrop" data-confirm-cancel></div>
+      <section class="confirm-dialog" tabindex="-1">
+        <div class="confirm-dialog-copy">
+          <span class="confirm-dialog-kicker">Confirm action</span>
+          <h2 id="confirm-modal-title">Confirm</h2>
+          <p id="confirm-modal-body"></p>
+        </div>
+        <dl id="confirm-modal-details" class="confirm-dialog-details"></dl>
+        <div class="confirm-dialog-actions">
+          <button id="confirm-cancel-button" type="button">Cancel</button>
+          <button id="confirm-confirm-button" type="button" class="confirm-primary">Confirm</button>
+        </div>
+      </section>
     </div>
 
     <script src="/static/app.js"></script>
