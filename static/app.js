@@ -140,6 +140,7 @@ const els = {
   emptyState: document.getElementById("empty-state"),
   emptyStateMessage: document.getElementById("empty-state-message"),
   conversationView: document.getElementById("conversation-view"),
+  conversationHeader: document.querySelector(".conversation-header"),
   conversationTitle: document.getElementById("conversation-title"),
   conversationMeta: document.getElementById("conversation-meta"),
   metaId: document.getElementById("meta-id"),
@@ -153,6 +154,7 @@ const els = {
   conversationSearchNext: document.getElementById("conversation-search-next"),
   conversationSearchClear: document.getElementById("conversation-search-clear"),
   messageFilterOptions: document.getElementById("message-filter-options"),
+  messageFilters: document.getElementById("message-filters"),
   messageFilterDefaults: document.getElementById("message-filter-defaults"),
   messageFilterAll: document.getElementById("message-filter-all"),
   confirmModal: document.getElementById("confirm-modal"),
@@ -323,10 +325,19 @@ function installMessagesFrameResizeSync() {
   }
   if ("ResizeObserver" in window) {
     state.messagesFrameResizeObserver = new ResizeObserver(() => {
-      scheduleMessagesFrameSync({ frames: 2, delays: [80] });
+      scheduleMessagesFrameSync({ frames: 3, delays: [40, 120] });
     });
-    state.messagesFrameResizeObserver.observe(els.messagesFrame);
-    state.messagesFrameResizeObserver.observe(els.conversationView);
+    for (const element of [
+      els.messagesFrame,
+      els.conversationView,
+      els.conversationHeader,
+      els.relatedPanel,
+      els.messageFilters
+    ]) {
+      if (element) {
+        state.messagesFrameResizeObserver.observe(element);
+      }
+    }
   }
   window.addEventListener("resize", () => scheduleMessagesFrameSync({ frames: 3, delays: [100, 300] }));
   window.addEventListener("focus", () => scheduleMessagesFrameSync({ frames: 3, delays: [80] }));
@@ -1280,9 +1291,7 @@ function renderRelated(related, summary, compactions = [], rollbacks = []) {
     list.className = "related-list";
     list.hidden = startsCollapsed;
     toggle.addEventListener("click", () => {
-      const collapsed = section.classList.toggle("collapsed");
-      list.hidden = collapsed;
-      toggle.setAttribute("aria-expanded", String(!collapsed));
+      toggleRelatedSection(section, list, toggle);
     });
     for (const item of items) {
       list.appendChild(renderRelatedItem(item, item.kind || fallbackKind, { jumpToBranch: true }));
@@ -1313,9 +1322,7 @@ function renderRollbackSection(rollbacks) {
   list.className = "related-list";
   list.hidden = true;
   toggle.addEventListener("click", () => {
-    const collapsed = section.classList.toggle("collapsed");
-    list.hidden = collapsed;
-    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggleRelatedSection(section, list, toggle);
   });
 
   for (const rollback of rollbacks) {
@@ -1366,9 +1373,7 @@ function renderCompactionSection(compactions, summary) {
   list.className = "related-list";
   list.hidden = true;
   toggle.addEventListener("click", () => {
-    const collapsed = section.classList.toggle("collapsed");
-    list.hidden = collapsed;
-    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggleRelatedSection(section, list, toggle);
   });
 
   for (const checkpoint of compactions) {
@@ -1376,6 +1381,18 @@ function renderCompactionSection(compactions, summary) {
   }
   section.appendChild(list);
   return section;
+}
+
+function toggleRelatedSection(section, list, toggle) {
+  const collapsed = section.classList.toggle("collapsed");
+  list.hidden = collapsed;
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  syncConversationChromeResize();
+}
+
+function syncConversationChromeResize() {
+  syncMessagesFrameViewport();
+  scheduleMessagesFrameSync({ frames: 4, delays: [40, 120, 300] });
 }
 
 function renderCompactionItem(checkpoint, summary) {
@@ -3918,6 +3935,9 @@ async function init() {
     els.conversationSearchInput.value = "";
     scheduleConversationSearch({ immediate: true });
     els.conversationSearchInput.focus();
+  });
+  els.messageFilters.addEventListener("toggle", () => {
+    syncConversationChromeResize();
   });
   els.messageFilterDefaults.addEventListener("click", () => {
     setMessageFilters(defaultMessageFilters());
