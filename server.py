@@ -9,11 +9,13 @@ import json
 import mimetypes
 import os
 import re
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import asdict
@@ -44,6 +46,8 @@ DUPLICATE_MESSAGE_WINDOW_SECONDS = 0.05
 ASK_CODEX_MAX_QUESTION_CHARS = 8000
 ASK_CODEX_TIMEOUT_SECONDS = 300
 ASK_CODEX_OUTPUT_TAIL_CHARS = 12000
+ASK_CODEX_CANCEL_TOMBSTONE_SECONDS = 600
+ASK_CODEX_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
 SESSIONS_SUBDIR = "sessions"
 ARCHIVED_SESSIONS_SUBDIR = "archived_sessions"
 OMITTED_IMAGE_RESULT_LABEL = "(base64 image result omitted; saved path/status is shown when available)"
@@ -162,6 +166,21 @@ class ArchiveCandidate:
     before_stat: os.stat_result
 
 
+@dataclass
+class AskCodexProcessState:
+    process: subprocess.Popen[str] | None = None
+    cancelled: bool = False
+
+
+ASK_CODEX_PROCESS_LOCK = threading.Lock()
+ASK_CODEX_PROCESS_BY_ID: dict[str, AskCodexProcessState] = {}
+ASK_CODEX_CANCELLED_AT: dict[str, float] = {}
+
+
+class AskCodexCancelled(RuntimeError):
+    pass
+
+
 def local_time(ts: int | float | None) -> str | None:
     if ts is None:
         return None
@@ -219,87 +238,213 @@ def trim_text(value: str, max_chars: int) -> tuple[str, bool]:
     return trimmed, True
 
 
+def ask_codex_request_id(payload: dict[str, Any]) -> str:
+    value = payload.get("request_id")
+    if value is None:
+        return new_thread_id()
+    if not isinstance(value, str) or not ASK_CODEX_REQUEST_ID_RE.fullmatch(value):
+        raise ValueError("Invalid Ask Codex request id")
+    return value
+
+
+def register_ask_codex_request(request_id: str) -> AskCodexProcessState:
+    with ASK_CODEX_PROCESS_LOCK:
+        purge_ask_codex_cancel_tombstones_locked()
+        if request_id in ASK_CODEX_PROCESS_BY_ID:
+            raise ValueError("Ask Codex request id is already active")
+        state = AskCodexProcessState(cancelled=request_id in ASK_CODEX_CANCELLED_AT)
+        ASK_CODEX_CANCELLED_AT.pop(request_id, None)
+        ASK_CODEX_PROCESS_BY_ID[request_id] = state
+        return state
+
+
+def attach_ask_codex_process(
+    request_id: str,
+    state: AskCodexProcessState,
+    process: subprocess.Popen[str],
+) -> bool:
+    with ASK_CODEX_PROCESS_LOCK:
+        current = ASK_CODEX_PROCESS_BY_ID.get(request_id)
+        if current is not state:
+            return True
+        state.process = process
+        return state.cancelled
+
+
+def unregister_ask_codex_request(request_id: str, state: AskCodexProcessState) -> None:
+    with ASK_CODEX_PROCESS_LOCK:
+        if ASK_CODEX_PROCESS_BY_ID.get(request_id) is state:
+            ASK_CODEX_PROCESS_BY_ID.pop(request_id, None)
+        ASK_CODEX_CANCELLED_AT.pop(request_id, None)
+
+
+def cancel_ask_codex_request(request_id: str) -> dict[str, Any]:
+    if not ASK_CODEX_REQUEST_ID_RE.fullmatch(request_id):
+        raise ValueError("Invalid Ask Codex request id")
+    with ASK_CODEX_PROCESS_LOCK:
+        purge_ask_codex_cancel_tombstones_locked()
+        state = ASK_CODEX_PROCESS_BY_ID.get(request_id)
+        if state is None:
+            ASK_CODEX_CANCELLED_AT[request_id] = time.monotonic()
+            return {
+                "request_id": request_id,
+                "cancelled": True,
+                "process_started": False,
+            }
+        state.cancelled = True
+        process = state.process
+    if process is not None:
+        request_process_termination(process)
+    return {
+        "request_id": request_id,
+        "cancelled": True,
+        "process_started": process is not None,
+    }
+
+
+def purge_ask_codex_cancel_tombstones_locked() -> None:
+    cutoff = time.monotonic() - ASK_CODEX_CANCEL_TOMBSTONE_SECONDS
+    for request_id, cancelled_at in list(ASK_CODEX_CANCELLED_AT.items()):
+        if cancelled_at < cutoff:
+            ASK_CODEX_CANCELLED_AT.pop(request_id, None)
+
+
+def request_process_termination(process: subprocess.Popen[str]) -> None:
+    terminate_process_group(process, signal.SIGTERM)
+    killer = threading.Thread(
+        target=force_kill_process_after_delay,
+        args=(process, 2.0),
+        daemon=True,
+    )
+    killer.start()
+
+
+def force_kill_process_after_delay(process: subprocess.Popen[str], delay_seconds: float) -> None:
+    time.sleep(delay_seconds)
+    if process.poll() is None:
+        terminate_process_group(process, signal.SIGKILL)
+
+
+def terminate_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            if sig == signal.SIGKILL:
+                process.kill()
+            else:
+                process.terminate()
+        except OSError:
+            return
+
+
 def ask_codex_about_conversation(payload: dict[str, Any], codex_home: Path) -> dict[str, Any]:
+    request_id = ask_codex_request_id(payload)
+    process_state = register_ask_codex_request(request_id)
     question_value = payload.get("question")
     context_value = payload.get("context")
-    if not isinstance(question_value, str) or not question_value.strip():
-        raise ValueError("Missing question")
-    if not isinstance(context_value, str) or not context_value.strip():
-        raise ValueError("Missing conversation context")
+    try:
+        if process_state.cancelled:
+            raise AskCodexCancelled("Ask Codex was stopped")
+        if not isinstance(question_value, str) or not question_value.strip():
+            raise ValueError("Missing question")
+        if not isinstance(context_value, str) or not context_value.strip():
+            raise ValueError("Missing conversation context")
 
-    question, question_truncated = trim_text(question_value.strip(), ASK_CODEX_MAX_QUESTION_CHARS)
-    context = context_value
-    context_truncated_server = False
-    client_truncated = bool(payload.get("context_truncated"))
-    prompt = build_ask_codex_prompt(
-        question=question,
-        context=context,
-        kind=payload.get("kind"),
-        thread_id=payload.get("thread_id"),
-        title=payload.get("title"),
-        context_truncated=client_truncated or context_truncated_server,
-    )
+        question, question_truncated = trim_text(question_value.strip(), ASK_CODEX_MAX_QUESTION_CHARS)
+        context = context_value
+        context_truncated_server = False
+        client_truncated = bool(payload.get("context_truncated"))
+        prompt = build_ask_codex_prompt(
+            question=question,
+            context=context,
+            kind=payload.get("kind"),
+            thread_id=payload.get("thread_id"),
+            title=payload.get("title"),
+            context_truncated=client_truncated or context_truncated_server,
+        )
 
-    codex_bin = codex_exec_binary()
-    env = os.environ.copy()
-    env["CODEX_HOME"] = str(codex_home)
-    env["NO_COLOR"] = "1"
+        codex_bin = codex_exec_binary()
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(codex_home)
+        env["NO_COLOR"] = "1"
 
-    with tempfile.TemporaryDirectory(prefix="codex-reader-ask-") as tmp_dir:
-        output_path = Path(tmp_dir) / "answer.txt"
-        command = [
-            codex_bin,
-            "exec",
-            "--sandbox",
-            "read-only",
-            "--ephemeral",
-            "--color",
-            "never",
-            "--cd",
-            str(PROJECT_ROOT),
-            "--output-last-message",
-            str(output_path),
-            "-",
-        ]
-        try:
-            result = subprocess.run(
+        with tempfile.TemporaryDirectory(prefix="codex-reader-ask-") as tmp_dir:
+            output_path = Path(tmp_dir) / "answer.txt"
+            command = [
+                codex_bin,
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--ephemeral",
+                "--color",
+                "never",
+                "--cd",
+                str(PROJECT_ROOT),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            process = subprocess.Popen(
                 command,
-                input=prompt,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 cwd=PROJECT_ROOT,
                 env=env,
-                timeout=ASK_CODEX_TIMEOUT_SECONDS,
-                check=False,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError("Codex did not finish before the 5 minute timeout") from exc
+            if attach_ask_codex_process(request_id, process_state, process):
+                request_process_termination(process)
+            try:
+                stdout, stderr = process.communicate(
+                    input=prompt,
+                    timeout=ASK_CODEX_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                request_process_termination(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    terminate_process_group(process, signal.SIGKILL)
+                    stdout, stderr = process.communicate()
+                raise TimeoutError("Codex did not finish before the 5 minute timeout") from exc
 
-        answer = ""
-        if output_path.exists():
-            answer = output_path.read_text(encoding="utf-8", errors="replace").strip()
-        if not answer:
-            answer = (result.stdout or "").strip()
-        if result.returncode != 0:
-            details = "\n".join(
-                item.strip()
-                for item in [result.stderr, result.stdout]
-                if item and item.strip()
-            )
-            details = details[-ASK_CODEX_OUTPUT_TAIL_CHARS:] if details else "No output"
-            raise RuntimeError(f"Codex failed with exit code {result.returncode}: {details}")
-        if not answer:
-            raise RuntimeError("Codex finished without an answer")
+            if process_state.cancelled:
+                raise AskCodexCancelled("Ask Codex was stopped")
 
-    return {
-        "answer": answer,
-        "context_chars": len(context),
-        "context_truncated": client_truncated or context_truncated_server,
-        "question_truncated": question_truncated,
-    }
+            answer = ""
+            if output_path.exists():
+                answer = output_path.read_text(encoding="utf-8", errors="replace").strip()
+            if not answer:
+                answer = (stdout or "").strip()
+            if process.returncode != 0:
+                details = "\n".join(
+                    item.strip()
+                    for item in [stderr, stdout]
+                    if item and item.strip()
+                )
+                details = details[-ASK_CODEX_OUTPUT_TAIL_CHARS:] if details else "No output"
+                raise RuntimeError(f"Codex failed with exit code {process.returncode}: {details}")
+            if not answer:
+                raise RuntimeError("Codex finished without an answer")
+
+        return {
+            "answer": answer,
+            "context_chars": len(context),
+            "context_truncated": client_truncated or context_truncated_server,
+            "question_truncated": question_truncated,
+            "request_id": request_id,
+        }
+    finally:
+        unregister_ask_codex_request(request_id, process_state)
 
 
 def build_ask_codex_prompt(
@@ -3694,6 +3839,14 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/ask-codex/cancel":
+                payload = self.read_json_body()
+                request_id = payload.get("request_id")
+                if not isinstance(request_id, str):
+                    self.send_error_json(400, "Missing Ask Codex request id")
+                    return
+                self.send_json(cancel_ask_codex_request(request_id), status=200)
+                return
             if path == "/api/ask-codex":
                 self.send_json(
                     ask_codex_about_conversation(self.read_json_body(), self.reader.codex_home),
@@ -3799,6 +3952,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error_json(409, f"Generated rollout already exists: {exc}")
         except FileNotFoundError as exc:
             self.send_error_json(500, f"Missing Codex file: {exc}")
+        except AskCodexCancelled as exc:
+            self.send_error_json(499, str(exc))
         except TimeoutError as exc:
             self.send_error_json(504, str(exc))
         except RuntimeError as exc:

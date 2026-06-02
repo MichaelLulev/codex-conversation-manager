@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -308,6 +310,48 @@ class ArchiveConversationTests(unittest.TestCase):
                 {item.id for item in reader.list_main_threads("archived")},
                 {parent_id, child_id, grandchild_id},
             )
+
+
+class AskCodexCancellationTests(unittest.TestCase):
+    def test_cancel_before_registration_marks_request_cancelled_on_registration(self):
+        request_id = "test-prelaunch-cancel"
+        result = server.cancel_ask_codex_request(request_id)
+        self.assertTrue(result["cancelled"])
+        self.assertFalse(result["process_started"])
+        state = server.register_ask_codex_request(request_id)
+        try:
+            self.assertTrue(state.cancelled)
+        finally:
+            server.unregister_ask_codex_request(request_id, state)
+
+    def test_cancel_ask_codex_request_terminates_registered_process(self):
+        request_id = "test-cancel-request"
+        state = server.register_ask_codex_request(request_id)
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            cancelled_before_attach = server.attach_ask_codex_process(
+                request_id,
+                state,
+                process,
+            )
+            self.assertFalse(cancelled_before_attach)
+            result = server.cancel_ask_codex_request(request_id)
+            self.assertTrue(result["cancelled"])
+            self.assertTrue(result["process_started"])
+            process.wait(timeout=5)
+            self.assertIsNotNone(process.returncode)
+            self.assertNotEqual(process.returncode, 0)
+        finally:
+            if process.poll() is None:
+                server.terminate_process_group(process, server.signal.SIGKILL)
+                process.wait(timeout=5)
+            server.unregister_ask_codex_request(request_id, state)
 
 
 if __name__ == "__main__":

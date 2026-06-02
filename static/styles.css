@@ -611,6 +611,17 @@ button:disabled {
   background: #eef5f3;
 }
 
+#ask-codex-stop-button:not(:disabled) {
+  border-color: rgba(176, 72, 72, 0.38);
+  background: #fff5f2;
+  color: #8f3932;
+}
+
+#ask-codex-stop-button:hover:not(:disabled) {
+  border-color: rgba(176, 72, 72, 0.6);
+  background: #ffe9e3;
+}
+
 .ask-codex-status {
   min-width: 0;
   color: var(--muted);

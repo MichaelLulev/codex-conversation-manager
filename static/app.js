@@ -106,6 +106,7 @@ const state = {
   },
   askCodex: {
     requestId: 0,
+    serverRequestId: null,
     abortController: null,
     selectedText: "",
     selectedMessageIndex: null,
@@ -170,6 +171,7 @@ const els = {
   askCodexQuestion: document.getElementById("ask-codex-question"),
   askSelectedButton: document.getElementById("ask-selected-button"),
   askCodexButton: document.getElementById("ask-codex-button"),
+  askCodexStopButton: document.getElementById("ask-codex-stop-button"),
   askCodexStatus: document.getElementById("ask-codex-status"),
   askCodexAnswer: document.getElementById("ask-codex-answer"),
   messageFilterDefaults: document.getElementById("message-filter-defaults"),
@@ -534,6 +536,13 @@ function isAbortError(error) {
   return error && error.name === "AbortError";
 }
 
+function newAskCodexServerRequestId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `ask-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 function cancelDetailRequest() {
   state.detailRequestId += 1;
   if (state.detailAbortController) {
@@ -573,12 +582,58 @@ function cancelConversationSearchWork() {
   }
 }
 
+function setAskCodexRunning(running) {
+  els.askCodexButton.textContent = running ? "Asking..." : "Ask";
+  els.askCodexButton.disabled = running || els.askCodexQuestion.value.trim() === "" || !state.currentThread;
+  els.askCodexStopButton.disabled = !running;
+  els.askSelectedButton.disabled = running || !state.askCodex.selectedText || !state.currentThread;
+}
+
+function cancelAskCodexServerRequest(requestId) {
+  if (!requestId) {
+    return Promise.resolve(null);
+  }
+  return fetchJson("/api/ask-codex/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request_id: requestId })
+  }).catch(() => null);
+}
+
 function cancelAskCodexRequest() {
   state.askCodex.requestId += 1;
+  const serverRequestId = state.askCodex.serverRequestId;
+  state.askCodex.serverRequestId = null;
   if (state.askCodex.abortController) {
     state.askCodex.abortController.abort();
     state.askCodex.abortController = null;
   }
+  if (serverRequestId) {
+    void cancelAskCodexServerRequest(serverRequestId);
+  }
+  setAskCodexRunning(false);
+}
+
+function stopAskCodexRequest() {
+  const serverRequestId = state.askCodex.serverRequestId;
+  if (!serverRequestId) {
+    return;
+  }
+  const revision = state.askCodex.requestId + 1;
+  state.askCodex.requestId = revision;
+  state.askCodex.serverRequestId = null;
+  if (state.askCodex.abortController) {
+    state.askCodex.abortController.abort();
+    state.askCodex.abortController = null;
+  }
+  setAskCodexRunning(false);
+  els.askCodexStopButton.disabled = true;
+  els.askCodexStatus.textContent = "Stopping Codex...";
+  void cancelAskCodexServerRequest(serverRequestId).finally(() => {
+    if (state.askCodex.requestId === revision && !state.askCodex.serverRequestId) {
+      els.askCodexStatus.textContent = "Ask Codex stopped.";
+    }
+  });
 }
 
 function resetAskCodex() {
@@ -601,7 +656,7 @@ function updateSelectedTranscriptText() {
   const textValue = collapseWhitespace(selection ? selection.toString() : "");
   state.askCodex.selectedText = textValue;
   state.askCodex.selectedMessageIndex = selectedMessageIndex(selection);
-  els.askSelectedButton.disabled = !textValue || !state.currentThread;
+  els.askSelectedButton.disabled = Boolean(state.askCodex.serverRequestId) || !textValue || !state.currentThread;
   if (textValue) {
     const source = Number.isInteger(state.askCodex.selectedMessageIndex)
       ? ` in message ${state.askCodex.selectedMessageIndex + 1}`
@@ -1009,7 +1064,7 @@ async function renderConversation(detail) {
   els.conversationSearchInput.disabled = false;
   els.conversationSearchClear.disabled = els.conversationSearchInput.value.trim() === "";
   resetAskCodex();
-  els.askCodexButton.disabled = els.askCodexQuestion.value.trim() === "";
+  setAskCodexRunning(false);
 
   els.conversationTitle.textContent = summary.preview || "Conversation";
   els.conversationMeta.textContent = `${text(summary.started)} to ${text(summary.ended || summary.updated)}`;
@@ -4155,7 +4210,7 @@ function prepareAskCodexQuestion(question, statusText) {
   }
   els.askCodexPanel.open = true;
   els.askCodexQuestion.value = question;
-  els.askCodexButton.disabled = false;
+  setAskCodexRunning(false);
   els.askCodexStatus.textContent = statusText;
   els.askCodexAnswer.classList.add("hidden");
   els.askCodexPanel.classList.remove("has-answer");
@@ -4173,13 +4228,14 @@ async function askCodexAboutCurrentThread() {
   }
   cancelAskCodexRequest();
   const requestId = state.askCodex.requestId + 1;
+  const serverRequestId = newAskCodexServerRequestId();
   const controller = new AbortController();
   state.askCodex.requestId = requestId;
+  state.askCodex.serverRequestId = serverRequestId;
   state.askCodex.abortController = controller;
 
   const askContext = currentAskCodexContext();
-  els.askCodexButton.disabled = true;
-  els.askCodexButton.textContent = "Asking...";
+  setAskCodexRunning(true);
   els.askCodexStatus.textContent = `Sending compact filtered export (${askContext.messageCount} messages, ${formatCount(askContext.context.length)} chars) to Codex...`;
   els.askCodexAnswer.classList.add("hidden");
   els.askCodexPanel.classList.remove("has-answer");
@@ -4190,6 +4246,7 @@ async function askCodexAboutCurrentThread() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        request_id: serverRequestId,
         question,
         context: askContext.context,
         context_truncated: askContext.truncated,
@@ -4219,8 +4276,8 @@ async function askCodexAboutCurrentThread() {
       state.askCodex.abortController = null;
     }
     if (requestId === state.askCodex.requestId) {
-      els.askCodexButton.textContent = "Ask";
-      els.askCodexButton.disabled = els.askCodexQuestion.value.trim() === "";
+      state.askCodex.serverRequestId = null;
+      setAskCodexRunning(false);
     }
     syncConversationChromeResize();
   }
@@ -4729,7 +4786,7 @@ async function init() {
     syncConversationChromeResize();
   });
   els.askCodexQuestion.addEventListener("input", () => {
-    els.askCodexButton.disabled = els.askCodexQuestion.value.trim() === "" || !state.currentThread;
+    setAskCodexRunning(Boolean(state.askCodex.serverRequestId));
   });
   els.askCodexQuestion.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -4742,6 +4799,9 @@ async function init() {
   });
   els.askCodexButton.addEventListener("click", () => {
     void askCodexAboutCurrentThread();
+  });
+  els.askCodexStopButton.addEventListener("click", () => {
+    stopAskCodexRequest();
   });
   els.messageFilterDefaults.addEventListener("click", () => {
     setMessageFilters(defaultMessageFilters());
