@@ -4026,7 +4026,9 @@ function exportCurrentThread() {
 function currentFilteredExportThread() {
   const detail = state.currentThread || {};
   const summary = detail.summary || {};
-  const messages = (detail.messages || []).filter(isMessageVisibleByFilter);
+  const messages = (detail.messages || [])
+    .filter(isMessageVisibleByFilter)
+    .map(exportMessageObject);
   return {
     ...detail,
     summary: {
@@ -4035,6 +4037,22 @@ function currentFilteredExportThread() {
     },
     messages
   };
+}
+
+function exportMessageObject(message) {
+  const exported = {
+    ...message,
+    display_role: exportRoleLabel(message)
+  };
+  delete exported.__finalAssistantReply;
+  if (message?.role === "assistant") {
+    exported.assistant_stage = assistantStage(message);
+  }
+  return exported;
+}
+
+function assistantStage(message) {
+  return message?.__finalAssistantReply ? "final" : "interim";
 }
 
 function conversationAsMarkdown(detail) {
@@ -4099,6 +4117,9 @@ function exportRoleLabel(message) {
 
 function exportMessageMetadata(message) {
   const meta = [];
+  if (message.role === "assistant") {
+    meta.push(`Assistant stage: ${message.assistant_stage || assistantStage(message)}`);
+  }
   if (message.time) {
     meta.push(`Time: ${message.time}`);
   }
