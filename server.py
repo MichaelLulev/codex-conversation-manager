@@ -45,6 +45,12 @@ ASK_CODEX_MAX_QUESTION_CHARS = 8000
 ASK_CODEX_TIMEOUT_SECONDS = 300
 ASK_CODEX_OUTPUT_TAIL_CHARS = 12000
 OMITTED_IMAGE_RESULT_LABEL = "(base64 image result omitted; saved path/status is shown when available)"
+TURN_ABORTED_GUIDANCE = (
+    "The user interrupted the previous turn on purpose. Any running unified exec "
+    "processes may still be running in the background. If any tools/commands were "
+    "aborted, they may have partially executed."
+)
+TURN_ABORTED_MARKER_TEXT = f"<turn_aborted>\n{TURN_ABORTED_GUIDANCE}\n</turn_aborted>"
 MAIN_THREAD_SELECT_COLUMNS = """
     id, rollout_path, created_at, updated_at, title, first_user_message,
     cwd, model, cli_version, archived, archived_at, source, model_provider,
@@ -961,53 +967,15 @@ class SideConversationReader:
         if checkpoint.copy_line_count <= 0:
             raise ValueError("Cannot fork before the first rollout line")
 
-        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
-        if checkpoint.copy_line_count > len(lines):
-            raise ValueError("Compaction checkpoint is outside the rollout file")
-        source_session_meta = first_session_meta_line(lines)
-        if source_session_meta is None:
-            raise ValueError("Source rollout does not contain session metadata")
-
-        created_at = datetime.now(timezone.utc)
-        timestamp = utc_timestamp_ms(created_at)
-        fork_id = new_thread_id()
-        new_path = self.new_rollout_path(fork_id, created_at)
-        new_meta_line = synthetic_fork_session_meta_line(
-            source_session_meta,
-            source_thread_id=thread_id,
-            fork_thread_id=fork_id,
-            timestamp=timestamp,
+        fork = self.create_synthetic_fork(
             row=row,
+            source_thread_id=thread_id,
+            source_path=source_path,
+            prefix_line_count=checkpoint.copy_line_count,
+            checkpoint=checkpoint,
         )
-        prefix_lines = lines[: checkpoint.copy_line_count]
-        self.write_synthetic_rollout(new_path, new_meta_line, prefix_lines, fork_id)
-        backup_path: str | None = None
-        try:
-            backup_path = str(self.backup_state_db())
-            self.insert_synthetic_thread_row(
-                source_thread_id=thread_id,
-                fork_thread_id=fork_id,
-                rollout_path=new_path,
-                created_at=created_at,
-                checkpoint=checkpoint,
-                prefix_lines=prefix_lines,
-            )
-        except Exception:
-            try:
-                new_path.unlink()
-            except OSError:
-                pass
-            raise
-
-        self.rollout_parent_cache.pop(str(new_path), None)
-        return {
-            "id": fork_id,
-            "parent_thread_id": thread_id,
-            "rollout_path": str(new_path),
-            "checkpoint": asdict(checkpoint),
-            "resume_command": f"codex resume {fork_id}",
-            "state_db_backup": backup_path,
-        }
+        fork["checkpoint"] = asdict(checkpoint)
+        return fork
 
     def create_fork_before_rollback(
         self, thread_id: str, line_number: int
@@ -1030,54 +998,16 @@ class SideConversationReader:
         if checkpoint.copy_line_count <= 0:
             raise ValueError("Cannot fork before the first rollout line")
 
-        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
-        if checkpoint.copy_line_count > len(lines):
-            raise ValueError("Rollback marker is outside the rollout file")
-        source_session_meta = first_session_meta_line(lines)
-        if source_session_meta is None:
-            raise ValueError("Source rollout does not contain session metadata")
-
-        created_at = datetime.now(timezone.utc)
-        timestamp = utc_timestamp_ms(created_at)
-        fork_id = new_thread_id()
-        new_path = self.new_rollout_path(fork_id, created_at)
-        new_meta_line = synthetic_fork_session_meta_line(
-            source_session_meta,
-            source_thread_id=thread_id,
-            fork_thread_id=fork_id,
-            timestamp=timestamp,
+        fork = self.create_synthetic_fork(
             row=row,
+            source_thread_id=thread_id,
+            source_path=source_path,
+            prefix_line_count=checkpoint.copy_line_count,
+            checkpoint=checkpoint,
+            title=fork_title_from_source(row, "Undo rollback"),
         )
-        prefix_lines = lines[: checkpoint.copy_line_count]
-        self.write_synthetic_rollout(new_path, new_meta_line, prefix_lines, fork_id)
-        backup_path: str | None = None
-        try:
-            backup_path = str(self.backup_state_db())
-            self.insert_synthetic_thread_row(
-                source_thread_id=thread_id,
-                fork_thread_id=fork_id,
-                rollout_path=new_path,
-                created_at=created_at,
-                checkpoint=checkpoint,
-                prefix_lines=prefix_lines,
-                title=fork_title_from_source(row, "Undo rollback"),
-            )
-        except Exception:
-            try:
-                new_path.unlink()
-            except OSError:
-                pass
-            raise
-
-        self.rollout_parent_cache.pop(str(new_path), None)
-        return {
-            "id": fork_id,
-            "parent_thread_id": thread_id,
-            "rollout_path": str(new_path),
-            "rollback": asdict(checkpoint),
-            "resume_command": f"codex resume {fork_id}",
-            "state_db_backup": backup_path,
-        }
+        fork["rollback"] = asdict(checkpoint)
+        return fork
 
     def create_fork_from_message(
         self, thread_id: str, line_number: int
@@ -1090,18 +1020,50 @@ class SideConversationReader:
         if not source_path.exists():
             raise FileNotFoundError(source_path)
 
+        before_stat = source_path.stat()
         messages = self.rollout_messages(rollout_path)
+        if source_stat_changed(before_stat, source_path.stat()):
+            raise ValueError("Conversation changed while preparing fork; refresh and try again")
         target = next((item for item in messages if item.line_number == line_number), None)
         if target is None:
             raise ValueError("Target message was not found in this conversation")
         if target.role != "user":
             raise ValueError("Forks from a message can only target a user message")
 
-        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
         if line_number <= 0:
             raise ValueError("Cannot fork before the first rollout line")
-        if line_number > len(lines):
-            raise ValueError("Target message is outside the rollout file")
+
+        fork = self.create_synthetic_fork(
+            row=row,
+            source_thread_id=thread_id,
+            source_path=source_path,
+            prefix_line_count=line_number,
+            title=fork_title_from_message(target),
+        )
+        fork["line_number"] = line_number
+        fork["target"] = asdict(target)
+        return fork
+
+    def create_synthetic_fork(
+        self,
+        *,
+        row: sqlite3.Row,
+        source_thread_id: str,
+        source_path: Path,
+        prefix_line_count: int,
+        checkpoint: CompactionCheckpoint | RollbackCheckpoint | None = None,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        if prefix_line_count <= 0:
+            raise ValueError("Cannot fork before the first rollout line")
+
+        before_stat = source_path.stat()
+        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
+        if source_stat_changed(before_stat, source_path.stat()):
+            raise ValueError("Conversation changed while preparing fork; refresh and try again")
+        if prefix_line_count > len(lines):
+            raise ValueError("Fork point is outside the rollout file")
+
         source_session_meta = first_session_meta_line(lines)
         if source_session_meta is None:
             raise ValueError("Source rollout does not contain session metadata")
@@ -1112,24 +1074,29 @@ class SideConversationReader:
         new_path = self.new_rollout_path(fork_id, created_at)
         new_meta_line = synthetic_fork_session_meta_line(
             source_session_meta,
-            source_thread_id=thread_id,
+            source_thread_id=source_thread_id,
             fork_thread_id=fork_id,
             timestamp=timestamp,
             row=row,
         )
-        prefix_lines = lines[:line_number]
-        self.write_synthetic_rollout(new_path, new_meta_line, prefix_lines, fork_id)
+        copied_lines = strip_leading_session_meta(lines[:prefix_line_count])
+        copied_lines, interrupted_boundary_added = append_interrupted_boundary_if_needed(
+            copied_lines,
+            timestamp,
+        )
+        self.write_synthetic_rollout(new_path, new_meta_line, copied_lines, fork_id)
+
         backup_path: str | None = None
         try:
             backup_path = str(self.backup_state_db())
             self.insert_synthetic_thread_row(
-                source_thread_id=thread_id,
+                source_thread_id=source_thread_id,
                 fork_thread_id=fork_id,
                 rollout_path=new_path,
                 created_at=created_at,
-                checkpoint=None,
-                prefix_lines=prefix_lines,
-                title=fork_title_from_message(target),
+                checkpoint=checkpoint,
+                prefix_lines=copied_lines,
+                title=title,
             )
         except Exception:
             try:
@@ -1141,12 +1108,11 @@ class SideConversationReader:
         self.rollout_parent_cache.pop(str(new_path), None)
         return {
             "id": fork_id,
-            "parent_thread_id": thread_id,
+            "parent_thread_id": source_thread_id,
             "rollout_path": str(new_path),
-            "line_number": line_number,
-            "target": asdict(target),
             "resume_command": f"codex resume {fork_id}",
             "state_db_backup": backup_path,
+            "interrupted_boundary_added": interrupted_boundary_added,
         }
 
     def create_rollback_to_message(
@@ -1905,6 +1871,146 @@ def first_session_meta_line(lines: list[str]) -> dict[str, Any] | None:
             return None
         return item
     return None
+
+
+def source_stat_changed(before_stat: os.stat_result, current_stat: os.stat_result) -> bool:
+    return (
+        current_stat.st_mtime_ns != before_stat.st_mtime_ns
+        or current_stat.st_size != before_stat.st_size
+    )
+
+
+def parse_rollout_json_line(line: str) -> dict[str, Any] | None:
+    if not line.strip():
+        return None
+    try:
+        item = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return item if isinstance(item, dict) else None
+
+
+def strip_leading_session_meta(lines: list[str]) -> list[str]:
+    copied = list(lines)
+    for index, line in enumerate(copied):
+        if not line.strip():
+            continue
+        item = parse_rollout_json_line(line)
+        if item is None:
+            return copied
+        if item.get("type") == "session_meta":
+            return copied[:index] + copied[index + 1 :]
+        return copied
+    return copied
+
+
+def response_item_is_real_user_message(payload: dict[str, Any]) -> bool:
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return False
+    text = response_content_text(payload.get("content"))
+    return bool(text.strip()) and not is_context_input_text(text)
+
+
+def response_item_is_assistant_message(payload: dict[str, Any]) -> bool:
+    return payload.get("type") == "message" and payload.get("role") == "assistant"
+
+
+def event_item_is_real_user_message(payload: dict[str, Any]) -> bool:
+    if payload.get("type") != "user_message":
+        return False
+    text = user_message_text(payload)
+    return isinstance(text, str) and bool(text.strip()) and not is_context_input_text(text)
+
+
+def event_item_is_assistant_message(payload: dict[str, Any]) -> bool:
+    return payload.get("type") == "agent_message" and isinstance(payload.get("message"), str)
+
+
+def fork_interrupt_state(lines: list[str]) -> tuple[bool, str | None]:
+    last_conversation_item: str | None = None
+    active_turn_id: str | None = None
+    explicit_turn_open = False
+
+    for line in lines:
+        item = parse_rollout_json_line(line)
+        if item is None:
+            continue
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "response_item":
+            if response_item_is_real_user_message(payload):
+                last_conversation_item = "user"
+            elif response_item_is_assistant_message(payload):
+                last_conversation_item = "assistant"
+            continue
+
+        if item_type != "event_msg":
+            continue
+
+        payload_type = payload.get("type")
+        if payload_type == "user_message" and event_item_is_real_user_message(payload):
+            last_conversation_item = "user"
+        elif event_item_is_assistant_message(payload):
+            last_conversation_item = "assistant"
+        elif payload_type in {"turn_started", "task_started"}:
+            value = payload.get("turn_id")
+            active_turn_id = value if isinstance(value, str) and value else None
+            explicit_turn_open = True
+        elif payload_type in {"turn_complete", "task_complete", "turn_aborted", "task_aborted"}:
+            explicit_turn_open = False
+            active_turn_id = None
+            if last_conversation_item in {"user", "assistant"}:
+                last_conversation_item = "boundary"
+        elif payload_type == "thread_rolled_back":
+            explicit_turn_open = False
+            active_turn_id = None
+            last_conversation_item = "boundary"
+
+    if explicit_turn_open:
+        return True, active_turn_id
+    return last_conversation_item == "user", None
+
+
+def interrupted_marker_line(timestamp: str) -> str:
+    item = {
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": TURN_ABORTED_MARKER_TEXT}],
+        },
+    }
+    return json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def turn_aborted_event_line(timestamp: str, turn_id: str | None) -> str:
+    item = {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "turn_aborted",
+            "turn_id": turn_id,
+            "reason": "interrupted",
+        },
+    }
+    return json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def append_interrupted_boundary_if_needed(
+    lines: list[str],
+    timestamp: str,
+) -> tuple[list[str], bool]:
+    needs_interrupt, turn_id = fork_interrupt_state(lines)
+    if not needs_interrupt:
+        return lines, False
+    return (
+        lines + [interrupted_marker_line(timestamp), turn_aborted_event_line(timestamp, turn_id)],
+        True,
+    )
 
 
 def synthetic_fork_session_meta_line(
