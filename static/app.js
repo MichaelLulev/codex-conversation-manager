@@ -3458,13 +3458,6 @@ function roleLabel(role) {
   return "You";
 }
 
-function messageRoleLabel(message) {
-  if (message?.role === "assistant") {
-    return message.__finalAssistantReply ? "Assistant final" : "Assistant interim";
-  }
-  return roleLabel(message?.role);
-}
-
 function renderRoleLabel(message) {
   const wrapper = document.createElement("span");
   wrapper.className = "role";
@@ -3862,8 +3855,10 @@ function askCodexAboutMessage(message, index) {
   }
   const label = `${index + 1}. ${exportRoleLabel(message)}`;
   const preview = trimForPrompt(collapseWhitespace(message.text || ""), 500);
+  const stage = message.role === "assistant" ? `Assistant stage: ${assistantStage(message)}` : "";
   const question = [
     `Explain this specific message: ${label}.`,
+    stage,
     preview ? `Message text: "${preview}"` : "",
     "Use the surrounding conversation context where helpful."
   ].filter(Boolean).join("\n");
@@ -4040,10 +4035,7 @@ function currentFilteredExportThread() {
 }
 
 function exportMessageObject(message) {
-  const exported = {
-    ...message,
-    display_role: exportRoleLabel(message)
-  };
+  const exported = { ...message };
   delete exported.__finalAssistantReply;
   if (message?.role === "assistant") {
     exported.assistant_stage = assistantStage(message);
@@ -4111,7 +4103,7 @@ function conversationAsPlainText(detail) {
 }
 
 function exportRoleLabel(message) {
-  const label = messageRoleLabel(message);
+  const label = roleLabel(message.role);
   return message.rolled_back ? `${label} (rolled back)` : label;
 }
 
