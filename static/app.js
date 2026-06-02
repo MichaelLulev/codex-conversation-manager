@@ -3464,7 +3464,7 @@ function roleLabel(role) {
 
 function messageRoleLabel(message) {
   if (message?.role === "assistant") {
-    return message.__finalAssistantReply ? "Assistant reply" : "Assistant interim";
+    return message.__finalAssistantReply ? "Assistant final" : "Assistant interim";
   }
   return roleLabel(message?.role);
 }
