@@ -1792,6 +1792,49 @@ async function createForkFromMessage(message, index, button) {
   }
 }
 
+async function createForkBeforeMessage(message, index, button) {
+  const summary = state.currentThread?.summary;
+  const lineNumber = message?.line_number;
+  if (!summary?.id || !Number.isInteger(lineNumber)) {
+    return;
+  }
+  const confirmed = await confirmWriteAction({
+    title: "Create fork before this message?",
+    body: "This writes a new Codex conversation containing the history before this user message. The selected message and later messages are not copied, so resuming the fork continues from the previous conversation state.",
+    details: [
+      { label: "Target", value: collapsedMessageHeading(message.text || "") || "Selected user message" },
+      { label: "Fork point", value: "Immediately before this user message" },
+      { label: "Change", value: "Creates a new resumable Codex conversation" }
+    ],
+    confirmLabel: "Create fork",
+    opener: button
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Creating...";
+  try {
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(summary.id)}/fork-before-message`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line_number: lineNumber })
+      }
+    );
+    els.sourceLine.textContent = `Created ${result.resume_command}`;
+    await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    await openThread("main", result.id);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = originalText;
+    els.sourceLine.textContent = error.message || String(error);
+  }
+}
+
 function scrollToMessageIndex(messageIndex, { defer = false, anchorId = null } = {}) {
   if (!Number.isInteger(messageIndex)) {
     return false;
@@ -2911,6 +2954,14 @@ function renderMessageActions(message, index) {
   actions.appendChild(ask);
 
   if (canFork) {
+    const forkBefore = document.createElement("button");
+    forkBefore.type = "button";
+    forkBefore.className = "message-action";
+    forkBefore.textContent = "Fork before";
+    forkBefore.title = "Create a new fork from the conversation state before this user message.";
+    forkBefore.addEventListener("click", () => createForkBeforeMessage(message, index, forkBefore));
+    actions.appendChild(forkBefore);
+
     const fork = document.createElement("button");
     fork.type = "button";
     fork.className = "message-action primary";

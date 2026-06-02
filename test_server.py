@@ -204,6 +204,22 @@ def create_rollout(home: Path, thread_id: str, minute: int) -> Path:
     return rollout_path
 
 
+def create_two_turn_rollout(home: Path, thread_id: str) -> Path:
+    rollout_dir = home / "sessions" / "2026" / "06" / "02"
+    rollout_dir.mkdir(parents=True, exist_ok=True)
+    rollout_path = rollout_dir / f"rollout-2026-06-02T12-30-00-{thread_id}.jsonl"
+    rollout_path.write_text(
+        session_meta_line(thread_id)
+        + response_message_line("user", "first prompt")
+        + response_message_line("assistant", "first answer")
+        + event_line({"type": "turn_complete", "turn_id": "turn-1"})
+        + response_message_line("user", "second prompt")
+        + response_message_line("assistant", "second answer"),
+        encoding="utf-8",
+    )
+    return rollout_path
+
+
 def insert_thread(conn: sqlite3.Connection, thread_id: str, rollout_path: Path, title: str) -> None:
     conn.execute(
         """
@@ -227,6 +243,43 @@ def insert_thread(conn: sqlite3.Connection, thread_id: str, rollout_path: Path, 
         ),
     )
     conn.commit()
+
+
+class ConversationForkTests(unittest.TestCase):
+    def test_fork_before_message_excludes_target_user_prompt_without_interruption(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            conn = create_state_db(home)
+            thread_id = "00000000-0000-0000-0000-000000000301"
+            rollout_path = create_two_turn_rollout(home, thread_id)
+            insert_thread(conn, thread_id, rollout_path, "Fork source")
+            conn.close()
+
+            reader = server.SideConversationReader(home)
+            target = next(
+                item for item in reader.rollout_messages(str(rollout_path))
+                if item.text == "second prompt"
+            )
+            result = reader.create_fork_before_message(thread_id, target.line_number)
+
+            self.assertFalse(result["interrupted_boundary_added"])
+            fork_path = Path(result["rollout_path"])
+            fork_text = fork_path.read_text(encoding="utf-8")
+            self.assertIn("first prompt", fork_text)
+            self.assertIn("first answer", fork_text)
+            self.assertNotIn("second prompt", fork_text)
+            self.assertNotIn(server.TURN_ABORTED_MARKER_TEXT, fork_text)
+
+            fork_lines = [json.loads(line) for line in fork_text.splitlines() if line.strip()]
+            self.assertEqual(fork_lines[0]["type"], "session_meta")
+            self.assertEqual(fork_lines[0]["payload"]["id"], result["id"])
+            self.assertEqual(fork_lines[0]["payload"]["forked_from_id"], thread_id)
+
+            fork_messages = [
+                item for item in reader.rollout_messages(str(fork_path))
+                if item.role in {"user", "assistant"}
+            ]
+            self.assertEqual([item.text for item in fork_messages], ["first prompt", "first answer"])
 
 
 class ArchiveConversationTests(unittest.TestCase):

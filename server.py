@@ -1202,6 +1202,42 @@ class SideConversationReader:
         fork["target"] = asdict(target)
         return fork
 
+    def create_fork_before_message(
+        self, thread_id: str, line_number: int
+    ) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        rollout_path = row["rollout_path"]
+        if not rollout_path:
+            raise ValueError("Conversation does not have a rollout path")
+        source_path = Path(rollout_path).expanduser()
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+
+        before_stat = source_path.stat()
+        messages = self.rollout_messages(rollout_path)
+        if source_stat_changed(before_stat, source_path.stat()):
+            raise ValueError("Conversation changed while preparing fork; refresh and try again")
+        target = next((item for item in messages if item.line_number == line_number), None)
+        if target is None:
+            raise ValueError("Target message was not found in this conversation")
+        if target.role != "user":
+            raise ValueError("Forks before a message can only target a user message")
+
+        prefix_line_count = line_number - 1
+        if prefix_line_count <= 0:
+            raise ValueError("Cannot fork before the first rollout line")
+
+        fork = self.create_synthetic_fork(
+            row=row,
+            source_thread_id=thread_id,
+            source_path=source_path,
+            prefix_line_count=prefix_line_count,
+            title=fork_title_before_message(target),
+        )
+        fork["line_number"] = line_number
+        fork["target"] = asdict(target)
+        return fork
+
     def create_synthetic_fork(
         self,
         *,
@@ -2474,6 +2510,10 @@ def fork_title_from_source(row: sqlite3.Row, prefix: str = "Fork before compacti
 
 def fork_title_from_message(message: Message) -> str:
     return compact(f"Fork from message: {message.text}", 180)
+
+
+def fork_title_before_message(message: Message) -> str:
+    return compact(f"Fork before message: {message.text}", 180)
 
 
 def session_meta_message(payload: dict[str, Any], timestamp: int | None) -> Message:
@@ -3855,6 +3895,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             create_rollback_suffix = "/rollback-to-message"
             fork_message_suffix = "/fork-from-message"
+            fork_before_message_suffix = "/fork-before-message"
             rollback_suffix = "/fork-before-rollback"
             compaction_suffix = "/fork-before-compaction"
             archive_suffix = "/archive"
@@ -3889,6 +3930,23 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(
                     self.reader.create_rollback_to_message(thread_id, line_number),
+                    status=201,
+                )
+                return
+            if path.startswith("/api/main-threads/") and path.endswith(fork_before_message_suffix):
+                thread_id = unquote(
+                    path.removeprefix("/api/main-threads/")[: -len(fork_before_message_suffix)]
+                ).strip("/")
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread id")
+                    return
+                payload = self.read_json_body()
+                line_number = payload.get("line_number")
+                if not isinstance(line_number, int):
+                    self.send_error_json(400, "Missing target line_number")
+                    return
+                self.send_json(
+                    self.reader.create_fork_before_message(thread_id, line_number),
                     status=201,
                 )
                 return
