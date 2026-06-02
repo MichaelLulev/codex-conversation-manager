@@ -39,6 +39,7 @@ const MESSAGE_FILTER_STORAGE_KEY = "codex-reader-message-filters";
 const MESSAGE_FILTER_DESCRIPTIONS = {
   user: "Your prompts and messages.",
   assistant: "Codex replies and progress updates.",
+  assistantInterim: "Assistant messages before the final assistant message in each reply. Turn this off to show only the last assistant message per reply.",
   thinking: "Visible reasoning summaries saved by Codex.",
   tool: "Tool calls and outputs, including shell, MCP, custom tools, and image viewing.",
   rolledBack: "Messages from turns removed with Esc Esc rollback/undo. Codex still keeps them in the raw transcript.",
@@ -58,6 +59,7 @@ const MESSAGE_FILTER_DESCRIPTIONS = {
 const MESSAGE_FILTERS = [
   { key: "user", label: "User", defaultEnabled: true },
   { key: "assistant", label: "Assistant", defaultEnabled: true },
+  { key: "assistantInterim", label: "Assistant interim", defaultEnabled: true },
   { key: "thinking", label: "Thinking", defaultEnabled: true },
   { key: "tool", label: "Tools", defaultEnabled: true },
   { key: "rolledBack", label: "Rolled back", defaultEnabled: true },
@@ -946,6 +948,7 @@ async function renderConversation(detail) {
   cancelScrollAnimation();
   cancelConversationSearchWork();
   clearConversationHighlights();
+  markFinalAssistantReplies(detail.messages || []);
   state.expandedMessages = new Set();
   state.expandedToolRuns = new Set();
   state.toolRunByMessageIndex = new Map();
@@ -989,6 +992,35 @@ async function renderConversation(detail) {
   els.messages.replaceChildren();
   const branchGroups = branchGroupsFor(detail);
   await renderMessages(detail, branchGroups, renderRequestId);
+}
+
+function markFinalAssistantReplies(messages) {
+  for (const message of messages) {
+    Object.defineProperty(message, "__finalAssistantReply", {
+      value: false,
+      writable: true,
+      configurable: true
+    });
+  }
+
+  let lastAssistantIndex = null;
+  const markLastAssistant = () => {
+    if (lastAssistantIndex !== null && messages[lastAssistantIndex]) {
+      messages[lastAssistantIndex].__finalAssistantReply = true;
+    }
+    lastAssistantIndex = null;
+  };
+
+  for (const [index, message] of messages.entries()) {
+    if (message.role === "user") {
+      markLastAssistant();
+      continue;
+    }
+    if (message.role === "assistant") {
+      lastAssistantIndex = index;
+    }
+  }
+  markLastAssistant();
 }
 
 async function renderMessages(detail, branchGroups, renderRequestId) {
@@ -2386,7 +2418,17 @@ function handleSearchWorkerMessage(event) {
 
 function isMessageVisibleByFilter(message) {
   const key = messageFilterKey(message);
-  return state.messageFilters[key] !== false;
+  if (state.messageFilters[key] === false) {
+    return false;
+  }
+  if (
+    message?.role === "assistant"
+    && state.messageFilters.assistantInterim === false
+    && !message.__finalAssistantReply
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function isMessageSearchVisible(message) {
