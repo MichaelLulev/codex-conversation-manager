@@ -2670,9 +2670,7 @@ function renderMessage(message, index = 0, options = {}) {
     icon.className = "message-toggle-icon";
     icon.textContent = isExpanded ? "-" : "+";
 
-    const role = document.createElement("span");
-    role.className = "role";
-    role.textContent = messageRoleLabel(message);
+    const role = renderRoleLabel(message);
     roleElement.append(icon, role);
 
     const headingText = collapsedMessageHeading(message.text || "");
@@ -2684,9 +2682,7 @@ function renderMessage(message, index = 0, options = {}) {
       roleElement.appendChild(heading);
     }
   } else {
-    roleElement = document.createElement("span");
-    roleElement.className = "role";
-    roleElement.textContent = messageRoleLabel(message);
+    roleElement = renderRoleLabel(message);
   }
 
   const phase = message.phase ? ` | ${message.phase}` : "";
@@ -3467,6 +3463,26 @@ function messageRoleLabel(message) {
     return message.__finalAssistantReply ? "Assistant final" : "Assistant interim";
   }
   return roleLabel(message?.role);
+}
+
+function renderRoleLabel(message) {
+  const wrapper = document.createElement("span");
+  wrapper.className = "role";
+  if (message?.role !== "assistant") {
+    wrapper.textContent = roleLabel(message?.role);
+    return wrapper;
+  }
+
+  const role = document.createElement("span");
+  role.className = "role-word";
+  role.textContent = "Assistant";
+
+  const stage = document.createElement("span");
+  stage.className = `role-stage ${message.__finalAssistantReply ? "final" : "interim"}`;
+  stage.textContent = message.__finalAssistantReply ? "final" : "interim";
+
+  wrapper.append(role, stage);
+  return wrapper;
 }
 
 function renderFormattedText(value) {

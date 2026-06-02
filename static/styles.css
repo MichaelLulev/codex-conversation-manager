@@ -1236,9 +1236,30 @@ button:disabled {
 }
 
 .role {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   color: var(--text);
   font-size: 15px;
   font-weight: 800;
+}
+
+.role-stage {
+  border: 1px solid rgba(98, 112, 116, 0.28);
+  border-radius: 999px;
+  padding: 1px 6px;
+  color: var(--muted);
+  background: rgba(255, 253, 248, 0.64);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.35;
+  text-transform: lowercase;
+}
+
+.role-stage.final {
+  border-color: rgba(0, 143, 131, 0.26);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .message-toggle {
