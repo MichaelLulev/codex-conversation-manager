@@ -104,7 +104,8 @@ const state = {
   },
   askCodex: {
     requestId: 0,
-    abortController: null
+    abortController: null,
+    selectedText: ""
   },
   conversationSearch: {
     matchGroups: [],
@@ -162,6 +163,7 @@ const els = {
   messageFilters: document.getElementById("message-filters"),
   askCodexPanel: document.getElementById("ask-codex-panel"),
   askCodexQuestion: document.getElementById("ask-codex-question"),
+  askSelectedButton: document.getElementById("ask-selected-button"),
   askCodexButton: document.getElementById("ask-codex-button"),
   askCodexStatus: document.getElementById("ask-codex-status"),
   askCodexAnswer: document.getElementById("ask-codex-answer"),
@@ -325,8 +327,20 @@ function setupMessagesFrame() {
   if (!els.messages) {
     throw new Error("Conversation message root is unavailable");
   }
+  installMessagesSelectionTracking();
   installMessagesFrameResizeSync();
   scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800] });
+}
+
+function installMessagesSelectionTracking() {
+  const doc = els.messagesDocument;
+  if (!doc) {
+    return;
+  }
+  const update = () => updateSelectedTranscriptText();
+  doc.addEventListener("selectionchange", update);
+  doc.addEventListener("mouseup", update);
+  doc.addEventListener("keyup", update);
 }
 
 function installMessagesFrameResizeSync() {
@@ -562,11 +576,37 @@ function cancelAskCodexRequest() {
 
 function resetAskCodex() {
   cancelAskCodexRequest();
+  state.askCodex.selectedText = "";
   els.askCodexQuestion.value = "";
   els.askCodexButton.disabled = true;
+  els.askSelectedButton.disabled = true;
   els.askCodexStatus.textContent = "Uses the currently filtered conversation text.";
   els.askCodexAnswer.classList.add("hidden");
   els.askCodexAnswer.replaceChildren();
+}
+
+function updateSelectedTranscriptText() {
+  const selection = els.messagesDocument?.getSelection?.();
+  const textValue = collapseWhitespace(selection ? selection.toString() : "");
+  state.askCodex.selectedText = textValue;
+  els.askSelectedButton.disabled = !textValue || !state.currentThread;
+  if (textValue) {
+    els.askSelectedButton.title = `Ask about selected text: ${trimForPrompt(textValue, 120)}`;
+  } else {
+    els.askSelectedButton.title = "Select text in the conversation transcript first.";
+  }
+}
+
+function collapseWhitespace(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function trimForPrompt(value, maxChars) {
+  const textValue = String(value || "");
+  if (textValue.length <= maxChars) {
+    return textValue;
+  }
+  return `${textValue.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
 }
 
 function nextFrame() {
@@ -2667,11 +2707,16 @@ function renderMessageActions(message, index) {
   const canFork = canForkFromMessage(message);
   const canRollback = canRollbackToMessage(message, index);
   const rollbackCheckpoint = rollbackCheckpointForMessage(message, index);
-  if (!compaction && !canFork && !canRollback && !rollbackCheckpoint) {
-    return null;
-  }
   const actions = document.createElement("div");
   actions.className = "message-actions";
+
+  const ask = document.createElement("button");
+  ask.type = "button";
+  ask.className = "message-action";
+  ask.textContent = "Ask";
+  ask.title = "Ask Codex about this specific message.";
+  ask.addEventListener("click", () => askCodexAboutMessage(message, index));
+  actions.appendChild(ask);
 
   if (canFork) {
     const fork = document.createElement("button");
@@ -3746,6 +3791,54 @@ function renderSafeLink(label, href) {
   return span;
 }
 
+function askCodexAboutMessage(message, index) {
+  if (!message) {
+    return;
+  }
+  const label = `${index + 1}. ${exportRoleLabel(message)}`;
+  const preview = trimForPrompt(collapseWhitespace(message.text || ""), 500);
+  const question = [
+    `Explain this specific message: ${label}.`,
+    preview ? `Message text: "${preview}"` : "",
+    "Use the surrounding conversation context where helpful."
+  ].filter(Boolean).join("\n");
+  prepareAskCodexQuestion(question, `Prepared question for ${label}.`);
+  scrollToMessageIndex(index, { defer: true });
+}
+
+function askCodexAboutSelectedText() {
+  const selectedText = state.askCodex.selectedText || collapseWhitespace(
+    els.messagesDocument?.getSelection?.()?.toString() || ""
+  );
+  if (!selectedText) {
+    els.askCodexStatus.textContent = "Select text in the conversation first.";
+    return;
+  }
+  state.askCodex.selectedText = selectedText;
+  const question = [
+    "Explain this selected text from the conversation:",
+    `"${trimForPrompt(selectedText, 1200)}"`,
+    "Use the surrounding conversation context where helpful."
+  ].join("\n");
+  prepareAskCodexQuestion(question, "Prepared question for selected text.");
+}
+
+function prepareAskCodexQuestion(question, statusText) {
+  if (!state.currentThread) {
+    return;
+  }
+  els.askCodexPanel.open = true;
+  els.askCodexQuestion.value = question;
+  els.askCodexButton.disabled = false;
+  els.askCodexStatus.textContent = statusText;
+  els.askCodexAnswer.classList.add("hidden");
+  els.askCodexAnswer.replaceChildren();
+  window.requestAnimationFrame(() => {
+    els.askCodexQuestion.focus({ preventScroll: true });
+    syncConversationChromeResize();
+  });
+}
+
 async function askCodexAboutCurrentThread() {
   const question = els.askCodexQuestion.value.trim();
   if (!state.currentThread || !question) {
@@ -4061,6 +4154,7 @@ async function init() {
     syncConversationChromeResize();
   });
   els.askCodexPanel.addEventListener("toggle", () => {
+    updateSelectedTranscriptText();
     syncConversationChromeResize();
   });
   els.askCodexQuestion.addEventListener("input", () => {
@@ -4071,6 +4165,9 @@ async function init() {
       event.preventDefault();
       void askCodexAboutCurrentThread();
     }
+  });
+  els.askSelectedButton.addEventListener("click", () => {
+    askCodexAboutSelectedText();
   });
   els.askCodexButton.addEventListener("click", () => {
     void askCodexAboutCurrentThread();

@@ -582,6 +582,10 @@ button:disabled {
   padding: 0 10px;
 }
 
+#ask-selected-button {
+  background: #eef5f3;
+}
+
 .ask-codex-status {
   min-width: 0;
   color: var(--muted);
