@@ -38,8 +38,8 @@ const SEARCH_TEXT_CACHE = new WeakMap();
 const MESSAGE_FILTER_STORAGE_KEY = "codex-reader-message-filters";
 const MESSAGE_FILTER_DESCRIPTIONS = {
   user: "Your prompts and messages.",
-  assistant: "Codex replies and progress updates.",
-  assistantInterim: "Assistant messages before the final assistant message in each reply. Turn this off to show only the last assistant message per reply.",
+  assistant: "The final assistant message in each reply.",
+  assistantInterim: "Assistant messages before the final assistant message in each reply.",
   thinking: "Visible reasoning summaries saved by Codex.",
   tool: "Tool calls and outputs, including shell, MCP, custom tools, and image viewing.",
   rolledBack: "Messages from turns removed with Esc Esc rollback/undo. Codex still keeps them in the raw transcript.",
@@ -58,7 +58,7 @@ const MESSAGE_FILTER_DESCRIPTIONS = {
 };
 const MESSAGE_FILTERS = [
   { key: "user", label: "User", defaultEnabled: true },
-  { key: "assistant", label: "Assistant", defaultEnabled: true },
+  { key: "assistant", label: "Assistant final", defaultEnabled: true },
   { key: "assistantInterim", label: "Assistant interim", defaultEnabled: true },
   { key: "thinking", label: "Thinking", defaultEnabled: true },
   { key: "tool", label: "Tools", defaultEnabled: true },
@@ -2226,8 +2226,9 @@ async function applyConversationSearch() {
     if (requestId !== state.conversationSearch.requestId) {
       return;
     }
-    state.conversationSearch.matchGroups = result.matchGroups || [];
-    state.conversationSearch.totalMatches = result.totalMatches || 0;
+    const visibleResult = filterSearchResultToVisibleMessages(result);
+    state.conversationSearch.matchGroups = visibleResult.matchGroups;
+    state.conversationSearch.totalMatches = visibleResult.totalMatches;
     if (state.conversationSearch.totalMatches > 0) {
       state.conversationSearch.activeIndex = -1;
       updateConversationSearchControls();
@@ -2254,7 +2255,7 @@ function conversationSearchUrl(query) {
     kind: state.mode,
     thread_id: state.currentThread?.summary?.id || "",
     q: query,
-    filters: enabledMessageFilterKeys().join(",")
+    filters: enabledServerMessageFilterKeys().join(",")
   });
   return `/api/search?${params.toString()}`;
 }
@@ -2263,6 +2264,30 @@ function enabledMessageFilterKeys() {
   return MESSAGE_FILTERS
     .filter((filter) => state.messageFilters[filter.key] !== false)
     .map((filter) => filter.key);
+}
+
+function enabledServerMessageFilterKeys() {
+  const keys = enabledMessageFilterKeys().filter((key) => key !== "assistantInterim");
+  const assistantVisible = state.messageFilters.assistant !== false || state.messageFilters.assistantInterim !== false;
+  if (assistantVisible && !keys.includes("assistant")) {
+    keys.push("assistant");
+  }
+  return keys;
+}
+
+function filterSearchResultToVisibleMessages(result) {
+  const messages = state.currentThread?.messages || [];
+  const matchGroups = [];
+  let totalMatches = 0;
+  for (const group of result.matchGroups || []) {
+    const message = messages[group.messageIndex];
+    if (!message || !isMessageSearchVisible(message)) {
+      continue;
+    }
+    matchGroups.push(group);
+    totalMatches += group.count || 0;
+  }
+  return { matchGroups, totalMatches };
 }
 
 async function applyConversationSearchOnMainThread(requestId, query, lowerQuery) {
@@ -2418,14 +2443,14 @@ function handleSearchWorkerMessage(event) {
 
 function isMessageVisibleByFilter(message) {
   const key = messageFilterKey(message);
-  if (state.messageFilters[key] === false) {
-    return false;
+  if (message?.role === "assistant") {
+    if (key !== "assistant" && state.messageFilters[key] === false) {
+      return false;
+    }
+    const stageKey = message.__finalAssistantReply ? "assistant" : "assistantInterim";
+    return state.messageFilters[stageKey] !== false;
   }
-  if (
-    message?.role === "assistant"
-    && state.messageFilters.assistantInterim === false
-    && !message.__finalAssistantReply
-  ) {
+  if (state.messageFilters[key] === false) {
     return false;
   }
   return true;
