@@ -397,7 +397,6 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space);
-  margin-bottom: var(--space);
   padding-inline-end: var(--space);
   padding-bottom: var(--space);
 }
