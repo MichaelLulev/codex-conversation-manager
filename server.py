@@ -1223,7 +1223,11 @@ class SideConversationReader:
         if target.role != "user":
             raise ValueError("Forks before a message can only target a user message")
 
-        prefix_line_count = line_number - 1
+        prefix_line_count = self.prefix_line_count_before_user_turn(
+            source_path,
+            line_number,
+            target.text,
+        )
         if prefix_line_count <= 0:
             raise ValueError("Cannot fork before the first rollout line")
 
@@ -1237,6 +1241,50 @@ class SideConversationReader:
         fork["line_number"] = line_number
         fork["target"] = asdict(target)
         return fork
+
+    def prefix_line_count_before_user_turn(
+        self,
+        source_path: Path,
+        line_number: int,
+        target_text: str,
+    ) -> int:
+        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
+        target_index = line_number - 1
+        if target_index < 0 or target_index >= len(lines):
+            raise ValueError("Target message line is outside the rollout file")
+
+        current_turn_start_index: int | None = None
+        scan_floor = max(0, target_index - 80)
+        for index in range(target_index, scan_floor - 1, -1):
+            item = parse_rollout_json_line(lines[index])
+            payload = item.get("payload") if item else None
+            if not isinstance(payload, dict) or item.get("type") != "event_msg":
+                continue
+            payload_type = payload.get("type")
+            if payload_type in {"turn_started", "task_started"}:
+                current_turn_start_index = index
+                break
+            if index < target_index and payload_type in {
+                "turn_complete",
+                "task_complete",
+                "turn_aborted",
+                "task_aborted",
+            }:
+                break
+
+        target_normalized = normalize_display_text(target_text)
+        earliest_user_index = target_index
+        range_start = current_turn_start_index if current_turn_start_index is not None else scan_floor
+        for index in range(range_start, target_index + 1):
+            item = parse_rollout_json_line(lines[index])
+            text = rollout_real_user_message_text(item)
+            if text is not None and normalize_display_text(text) == target_normalized:
+                earliest_user_index = index
+                break
+
+        if current_turn_start_index is not None and current_turn_start_index < earliest_user_index:
+            return current_turn_start_index
+        return earliest_user_index
 
     def create_synthetic_fork(
         self,
@@ -2323,6 +2371,19 @@ def event_item_is_real_user_message(payload: dict[str, Any]) -> bool:
         return False
     text = user_message_text(payload)
     return isinstance(text, str) and bool(text.strip()) and not is_context_input_text(text)
+
+
+def rollout_real_user_message_text(item: dict[str, Any] | None) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    payload = item.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if item.get("type") == "response_item" and response_item_is_real_user_message(payload):
+        return response_content_text(payload.get("content"))
+    if item.get("type") == "event_msg" and event_item_is_real_user_message(payload):
+        return user_message_text(payload)
+    return None
 
 
 def fork_interrupt_state(lines: list[str]) -> tuple[bool, str | None]:

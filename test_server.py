@@ -47,6 +47,16 @@ def event_line(payload):
     )
 
 
+def turn_context_line():
+    return json_line(
+        {
+            "timestamp": "2026-06-02T12:00:00.000Z",
+            "type": "turn_context",
+            "payload": {"cwd": "/tmp"},
+        }
+    )
+
+
 class SyntheticForkTests(unittest.TestCase):
     def test_strip_leading_session_meta_removes_source_meta(self):
         user_line = response_message_line("user", "hello")
@@ -213,7 +223,10 @@ def create_two_turn_rollout(home: Path, thread_id: str) -> Path:
         + response_message_line("user", "first prompt")
         + response_message_line("assistant", "first answer")
         + event_line({"type": "turn_complete", "turn_id": "turn-1"})
+        + event_line({"type": "task_started", "turn_id": "turn-2"})
+        + turn_context_line()
         + response_message_line("user", "second prompt")
+        + event_line({"type": "user_message", "message": "second prompt"})
         + response_message_line("assistant", "second answer"),
         encoding="utf-8",
     )
@@ -258,7 +271,7 @@ class ConversationForkTests(unittest.TestCase):
             reader = server.SideConversationReader(home)
             target = next(
                 item for item in reader.rollout_messages(str(rollout_path))
-                if item.text == "second prompt"
+                if item.text == "second prompt" and item.source == "rollout event_msg"
             )
             result = reader.create_fork_before_message(thread_id, target.line_number)
 
@@ -268,6 +281,7 @@ class ConversationForkTests(unittest.TestCase):
             self.assertIn("first prompt", fork_text)
             self.assertIn("first answer", fork_text)
             self.assertNotIn("second prompt", fork_text)
+            self.assertNotIn("turn-2", fork_text)
             self.assertNotIn(server.TURN_ABORTED_MARKER_TEXT, fork_text)
 
             fork_lines = [json.loads(line) for line in fork_text.splitlines() if line.strip()]
