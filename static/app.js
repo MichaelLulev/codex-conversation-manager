@@ -32,7 +32,6 @@ const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
 const SEARCH_WORKER_URL = "/static/search-worker.js";
-const ASK_CODEX_CONTEXT_CHAR_LIMIT = 120000;
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
 const SEARCH_TEXT_CACHE = new WeakMap();
 const MESSAGE_FILTER_STORAGE_KEY = "codex-reader-message-filters";
@@ -586,7 +585,7 @@ function resetAskCodex() {
   els.askCodexQuestion.value = "";
   els.askCodexButton.disabled = true;
   els.askSelectedButton.disabled = true;
-  els.askCodexStatus.textContent = "Uses the currently filtered conversation text.";
+  els.askCodexStatus.textContent = "Uses the full filtered export.";
   els.askCodexAnswer.classList.add("hidden");
   els.askCodexAnswer.replaceChildren();
 }
@@ -4123,7 +4122,7 @@ async function askCodexAboutCurrentThread() {
   const askContext = currentAskCodexContext();
   els.askCodexButton.disabled = true;
   els.askCodexButton.textContent = "Asking...";
-  els.askCodexStatus.textContent = `Sending ${askContext.messageCount} filtered messages (${formatCount(askContext.context.length)} chars) to Codex...`;
+  els.askCodexStatus.textContent = `Sending full filtered export (${askContext.messageCount} messages, ${formatCount(askContext.context.length)} chars) to Codex...`;
   els.askCodexAnswer.classList.add("hidden");
   els.askCodexAnswer.replaceChildren();
   clearAskCodexNavigationHighlights();
@@ -4219,26 +4218,12 @@ function isValidConversationMessageNumber(messageNumber) {
 
 function currentAskCodexContext() {
   const exportThread = currentFilteredExportThread({ includeNavigationRefs: true });
-  const original = conversationAsPlainText(exportThread, { includeNavigationRefs: true });
-  const [context, truncated] = trimMiddle(original, ASK_CODEX_CONTEXT_CHAR_LIMIT);
+  const context = JSON.stringify(exportThread, null, 2);
   return {
     context,
-    truncated,
+    truncated: false,
     messageCount: exportThread.messages.length
   };
-}
-
-function trimMiddle(value, maxChars) {
-  if (value.length <= maxChars) {
-    return [value, false];
-  }
-  const headChars = Math.floor(maxChars / 2);
-  const tailChars = maxChars - headChars;
-  const omitted = value.length - maxChars;
-  return [
-    `${value.slice(0, headChars).trimEnd()}\n\n[... ${omitted} characters omitted from the middle before sending to Codex ...]\n\n${value.slice(-tailChars).trimStart()}`,
-    true
-  ];
 }
 
 function formatCount(value) {

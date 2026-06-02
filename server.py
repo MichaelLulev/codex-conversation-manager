@@ -42,7 +42,6 @@ SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
 DUPLICATE_MESSAGE_WINDOW_SECONDS = 0.05
 ASK_CODEX_MAX_QUESTION_CHARS = 8000
-ASK_CODEX_MAX_CONTEXT_CHARS = 220000
 ASK_CODEX_TIMEOUT_SECONDS = 300
 ASK_CODEX_OUTPUT_TAIL_CHARS = 12000
 OMITTED_IMAGE_RESULT_LABEL = "(base64 image result omitted; saved path/status is shown when available)"
@@ -213,7 +212,8 @@ def ask_codex_about_conversation(payload: dict[str, Any], codex_home: Path) -> d
         raise ValueError("Missing conversation context")
 
     question, question_truncated = trim_text(question_value.strip(), ASK_CODEX_MAX_QUESTION_CHARS)
-    context, context_truncated_server = trim_text(context_value, ASK_CODEX_MAX_CONTEXT_CHARS)
+    context = context_value
+    context_truncated_server = False
     client_truncated = bool(payload.get("context_truncated"))
     prompt = build_ask_codex_prompt(
         question=question,
@@ -302,12 +302,12 @@ def build_ask_codex_prompt(
         f"Context truncated: {'yes' if context_truncated else 'no'}",
     ]
     return (
-        "You are answering a question about a saved Codex conversation transcript.\n"
-        "Use only the provided transcript and metadata. Do not inspect files, run commands, "
-        "modify files, browse the web, or infer facts that are not supported by the transcript.\n"
-        "If the transcript is insufficient, say what is missing. When useful, refer to message "
-        "numbers or role headings from the transcript. When a reference should be clickable in "
-        "the GUI, use markdown links with the transcript link target, for example "
+        "You are answering a question about a saved Codex conversation JSON export.\n"
+        "Use only the provided export and metadata. Do not inspect files, run commands, "
+        "modify files, browse the web, or infer facts that are not supported by the export.\n"
+        "If the export is insufficient, say what is missing. When useful, refer to message "
+        "numbers, message_number fields, or role headings from the export. When a reference should be clickable in "
+        "the GUI, use markdown links with the navigation_href target, for example "
         "[message 123](codex-message:123). To link to specific text inside a message, use a "
         "short exact quote as the label and URL-encode it in the text parameter, for example "
         "[quoted text](codex-message:123?text=quoted%20text).\n\n"
@@ -315,7 +315,7 @@ def build_ask_codex_prompt(
         f"{question}\n\n"
         "Conversation metadata:\n"
         + "\n".join(f"- {item}" for item in metadata)
-        + "\n\nTranscript:\n"
+        + "\n\nConversation export JSON:\n"
         f"{context}\n"
     )
 
