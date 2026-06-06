@@ -48,6 +48,8 @@ ASK_CODEX_TIMEOUT_SECONDS = 300
 ASK_CODEX_OUTPUT_TAIL_CHARS = 12000
 ASK_CODEX_CANCEL_TOMBSTONE_SECONDS = 600
 ASK_CODEX_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
+EXPORT_FILE_MAX_CHARS = 200_000_000
+EXPORTS_DIR_NAME = "Codex Conversation Reader"
 SESSIONS_SUBDIR = "sessions"
 ARCHIVED_SESSIONS_SUBDIR = "archived_sessions"
 OMITTED_IMAGE_RESULT_LABEL = "(base64 image result omitted; saved path/status is shown when available)"
@@ -236,6 +238,52 @@ def trim_text(value: str, max_chars: int) -> tuple[str, bool]:
         + value[-tail_chars:].lstrip()
     )
     return trimmed, True
+
+
+def save_export_file(payload: dict[str, Any]) -> dict[str, Any]:
+    filename_value = payload.get("filename")
+    content_value = payload.get("content")
+    if not isinstance(filename_value, str) or not filename_value.strip():
+        raise ValueError("Missing export filename")
+    if not isinstance(content_value, str):
+        raise ValueError("Missing export content")
+    if len(content_value) > EXPORT_FILE_MAX_CHARS:
+        raise ValueError("Export is too large")
+
+    export_dir = Path.home() / "Downloads" / EXPORTS_DIR_NAME
+    export_dir.mkdir(parents=True, exist_ok=True)
+    filename = safe_export_filename(filename_value)
+    export_path = unique_export_path(export_dir / filename)
+    export_path.write_text(content_value, encoding="utf-8")
+    return {
+        "filename": export_path.name,
+        "path": str(export_path),
+        "bytes": export_path.stat().st_size,
+    }
+
+
+def safe_export_filename(value: str) -> str:
+    name = Path(value).name.strip()
+    stem = Path(name).stem
+    suffix = Path(name).suffix.lower()
+    if suffix not in {".md", ".txt", ".json"}:
+        suffix = ".txt"
+    safe_stem = re.sub(r"[^A-Za-z0-9._ -]+", "-", stem).strip(" .-")
+    if not safe_stem:
+        safe_stem = "codex-export"
+    return f"{safe_stem[:160]}{suffix}"
+
+
+def unique_export_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(path)
 
 
 def ask_codex_request_id(payload: dict[str, Any]) -> str:
@@ -3940,6 +3988,9 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/export":
+                self.send_json(save_export_file(self.read_json_body()), status=201)
+                return
             if path == "/api/ask-codex/cancel":
                 payload = self.read_json_body()
                 request_id = payload.get("request_id")

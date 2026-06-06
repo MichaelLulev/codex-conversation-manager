@@ -1,10 +1,12 @@
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import server
 
@@ -294,6 +296,29 @@ class ConversationForkTests(unittest.TestCase):
                 if item.role in {"user", "assistant"}
             ]
             self.assertEqual([item.text for item in fork_messages], ["first prompt", "first answer"])
+
+
+class ExportTests(unittest.TestCase):
+    def test_save_export_file_writes_unique_file_under_downloads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.dict(os.environ, {"HOME": temp_dir}):
+                first = server.save_export_file({
+                    "filename": "../../conversation:one?.md",
+                    "content": "# first\n",
+                })
+                second = server.save_export_file({
+                    "filename": "../../conversation:one?.md",
+                    "content": "# second\n",
+                })
+
+            first_path = Path(first["path"])
+            second_path = Path(second["path"])
+            expected_dir = Path(temp_dir) / "Downloads" / server.EXPORTS_DIR_NAME
+            self.assertEqual(first_path.parent, expected_dir)
+            self.assertEqual(second_path.parent, expected_dir)
+            self.assertNotEqual(first_path, second_path)
+            self.assertEqual(first_path.read_text(encoding="utf-8"), "# first\n")
+            self.assertEqual(second_path.read_text(encoding="utf-8"), "# second\n")
 
 
 class ArchiveConversationTests(unittest.TestCase):

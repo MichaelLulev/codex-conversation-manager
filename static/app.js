@@ -4521,7 +4521,7 @@ function compactAttributeValue(value) {
   return /^[^\s"=]+$/.test(normalized) ? normalized : JSON.stringify(normalized);
 }
 
-function exportCurrentThread() {
+async function exportCurrentThread() {
   if (!state.currentThread) return;
   const exportThread = currentFilteredExportThread();
   const format = els.exportFormatSelect.value || "markdown";
@@ -4543,13 +4543,26 @@ function exportCurrentThread() {
     }
   };
   const exportData = exporters[format] || exporters.markdown;
-  const blob = new Blob([exportData.content], { type: exportData.type });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `${modeConfig().exportPrefix}-${exportThread.summary.id}.${exportData.extension}`;
-  link.click();
-  URL.revokeObjectURL(url);
+  const filename = `${modeConfig().exportPrefix}-${exportThread.summary.id}.${exportData.extension}`;
+  const originalText = els.exportButton.textContent;
+  els.exportButton.disabled = true;
+  els.exportButton.textContent = "Exporting...";
+  try {
+    const result = await fetchJson("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename,
+        content: exportData.content
+      })
+    });
+    els.sourceLine.textContent = `Exported to ${result.path}`;
+  } catch (error) {
+    els.sourceLine.textContent = error.message || String(error);
+  } finally {
+    els.exportButton.textContent = originalText;
+    els.exportButton.disabled = !state.currentThread;
+  }
 }
 
 function currentFilteredExportThread(options = {}) {
@@ -4793,7 +4806,9 @@ async function init() {
       showError(error);
     }
   });
-  els.exportButton.addEventListener("click", exportCurrentThread);
+  els.exportButton.addEventListener("click", () => {
+    void exportCurrentThread();
+  });
   els.copyIdButton.addEventListener("click", copyCurrentId);
   els.archiveButton.addEventListener("click", () => {
     void archiveCurrentThread();
