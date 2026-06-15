@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 set -eu
-cd /home/michael/Projects/CodexSideReader
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+cd "$script_dir"
 
-log_dir="${XDG_CACHE_HOME:-"$HOME/.cache"}/codex-conversation-reader"
+log_dir="${XDG_CACHE_HOME:-"$HOME/.cache"}/codex-conversation-manager"
 mkdir -p "$log_dir"
 log_file="$log_dir/desktop.log"
 
@@ -12,6 +13,6 @@ export GDK_BACKEND="${GDK_BACKEND:-x11}"
 export WEBKIT_DISABLE_DMABUF_RENDERER="${WEBKIT_DISABLE_DMABUF_RENDERER:-1}"
 
 {
-  printf '\n[%s] starting Codex Conversation Reader\n' "$(date -Is)"
+  printf '\n[%s] starting Codex Conversation Manager\n' "$(date -Is)"
   exec python3 desktop_app.py "$@"
 } >>"$log_file" 2>&1

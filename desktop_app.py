@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desktop shell for Codex Conversation Reader."""
+"""Desktop shell for Codex Conversation Manager."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ from urllib.request import urlopen
 from server import DEFAULT_CODEX_HOME
 
 
-APP_NAME = "Codex Conversation Reader"
+APP_NAME = "Codex Conversation Manager"
 PROJECT_ROOT = Path(__file__).resolve().parent
-ICON_PATH = PROJECT_ROOT / "assets" / "codex-conversation-reader.png"
+ICON_PATH = PROJECT_ROOT / "assets" / "codex-conversation-manager.png"
 DEFAULT_ZOOM = 1.0
 MIN_ZOOM = 0.5
 MAX_ZOOM = 2.0

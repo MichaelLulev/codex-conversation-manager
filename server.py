@@ -49,7 +49,7 @@ ASK_CODEX_OUTPUT_TAIL_CHARS = 12000
 ASK_CODEX_CANCEL_TOMBSTONE_SECONDS = 600
 ASK_CODEX_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
 EXPORT_FILE_MAX_CHARS = 200_000_000
-EXPORTS_DIR_NAME = "Codex Conversation Reader"
+EXPORTS_DIR_NAME = "Codex Conversation Manager"
 SESSIONS_SUBDIR = "sessions"
 ARCHIVED_SESSIONS_SUBDIR = "archived_sessions"
 OMITTED_IMAGE_RESULT_LABEL = "(base64 image result omitted; saved path/status is shown when available)"
@@ -3915,7 +3915,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/":
                 self.send_static_file(STATIC_ROOT / "index.html")
             elif path == "/favicon.ico":
-                self.send_asset_file(ASSET_ROOT / "codex-conversation-reader.png")
+                self.send_asset_file(ASSET_ROOT / "codex-conversation-manager.png")
             elif path.startswith("/static/"):
                 rel = Path(unquote(path.removeprefix("/static/")))
                 self.send_static_file(STATIC_ROOT / rel)
@@ -4228,7 +4228,7 @@ def main() -> int:
     server, port = create_server(args.host, args.port)
     if port != args.port:
         print(f"Port {args.port} is unavailable; using {port}.")
-    print(f"Codex Conversation Reader running at http://{args.host}:{port}/")
+    print(f"Codex Conversation Manager running at http://{args.host}:{port}/")
     print(f"Reading Codex data from {Path(args.codex_home).expanduser()}")
     try:
         server.serve_forever()
