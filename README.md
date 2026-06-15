@@ -1,6 +1,6 @@
 # Codex Conversation Manager
 
-An unofficial local GUI for browsing and managing Codex CLI conversation history.
+An unofficial Linux-first local GUI for browsing and managing Codex CLI conversation history.
 
 The app reads Codex CLI data from your local `~/.codex` directory and presents main conversations, side conversations, forks, rollbacks, compactions, tool calls, thinking traces, exports, and message-level search in a desktop or browser UI.
 
@@ -46,6 +46,8 @@ Do not publish your `~/.codex` directory, exported conversations, screenshots, P
 
 ## Requirements
 
+Linux is the only currently tested platform.
+
 The web UI uses only Python's standard library at runtime.
 
 Desktop mode additionally requires GTK 3, PyGObject, and WebKit2GTK 4.1. On Debian/Ubuntu-like systems, the packages are typically:
@@ -55,6 +57,8 @@ sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
 ```
 
 The **Ask Codex** feature requires the `codex` CLI to be installed and authenticated.
+
+The browser UI may work on macOS or WSL if Codex CLI uses the same `~/.codex` storage layout there, but those platforms are not currently tested. Native Windows is not supported.
 
 ## Run
 
