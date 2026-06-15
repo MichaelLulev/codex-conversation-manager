@@ -176,6 +176,7 @@ const els = {
   askCodexAnswer: document.getElementById("ask-codex-answer"),
   messageFilterDefaults: document.getElementById("message-filter-defaults"),
   messageFilterAll: document.getElementById("message-filter-all"),
+  messageFilterNone: document.getElementById("message-filter-none"),
   confirmModal: document.getElementById("confirm-modal"),
   confirmModalTitle: document.getElementById("confirm-modal-title"),
   confirmModalBody: document.getElementById("confirm-modal-body"),
@@ -844,6 +845,14 @@ function setMessageFilters(filters) {
   saveMessageFilters();
   renderMessageFilterControls();
   rerenderMessagesForCurrentFilters();
+}
+
+function allMessageFilters(enabled) {
+  const filters = {};
+  for (const filter of MESSAGE_FILTERS) {
+    filters[filter.key] = enabled;
+  }
+  return filters;
 }
 
 async function ensureVisibleSelection({ preserveSelection = true, preserveHiddenSelection = false } = {}) {
@@ -4873,11 +4882,10 @@ async function init() {
     setMessageFilters(defaultMessageFilters());
   });
   els.messageFilterAll.addEventListener("click", () => {
-    const allFilters = {};
-    for (const filter of MESSAGE_FILTERS) {
-      allFilters[filter.key] = true;
-    }
-    setMessageFilters(allFilters);
+    setMessageFilters(allMessageFilters(true));
+  });
+  els.messageFilterNone.addEventListener("click", () => {
+    setMessageFilters(allMessageFilters(false));
   });
 
   try {
