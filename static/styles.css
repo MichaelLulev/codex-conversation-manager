@@ -681,22 +681,45 @@ button:disabled {
   align-items: center;
 }
 
+.message-filter-actions-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.message-filter-action-group {
+  display: inline-flex;
+  align-items: center;
+}
+
 .message-filter-actions button {
-  min-height: 24px;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--accent);
-  padding: 0 4px;
+  min-height: 28px;
+  margin-left: -1px;
+  border: 1px solid rgba(206, 219, 215, 0.92);
+  border-radius: 0;
+  background: #f7faf8;
+  color: #344246;
+  padding: 0 9px;
   font-size: 12px;
   font-weight: 700;
-  text-decoration: underline;
-  text-underline-offset: 3px;
+}
+
+.message-filter-actions button:first-child {
+  margin-left: 0;
+  border-radius: 6px 0 0 6px;
+}
+
+.message-filter-actions button:last-child {
+  border-radius: 0 6px 6px 0;
 }
 
 .message-filter-actions button:hover:not(:disabled) {
-  background: rgba(0, 143, 131, 0.08);
-  color: #005e58;
+  position: relative;
+  z-index: 1;
+  border-color: var(--accent);
+  background: #eef8f5;
+  color: var(--accent);
 }
 
 .message-filter {
