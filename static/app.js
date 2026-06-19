@@ -110,7 +110,8 @@ const state = {
     abortController: null,
     selectedText: "",
     selectedMessageIndex: null,
-    activeMarks: []
+    activeMarks: [],
+    turns: []
   },
   conversationSearch: {
     matchGroups: [],
@@ -642,6 +643,7 @@ function resetAskCodex() {
   clearAskCodexNavigationHighlights();
   state.askCodex.selectedText = "";
   state.askCodex.selectedMessageIndex = null;
+  state.askCodex.turns = [];
   els.askCodexQuestion.value = "";
   els.askCodexButton.disabled = true;
   els.askSelectedButton.disabled = true;
@@ -4295,11 +4297,10 @@ async function askCodexAboutCurrentThread() {
   state.askCodex.abortController = controller;
 
   const askContext = currentAskCodexContext();
+  const askHistory = askCodexHistoryText();
   setAskCodexRunning(true);
   els.askCodexStatus.textContent = `Sending compact filtered export (${askContext.messageCount} messages, ${formatCount(askContext.context.length)} chars) to Codex...`;
-  els.askCodexAnswer.classList.add("hidden");
-  els.askCodexPanel.classList.remove("has-answer");
-  els.askCodexAnswer.replaceChildren();
+  renderAskCodexAnswer();
   clearAskCodexNavigationHighlights();
   try {
     const result = await fetchJson("/api/ask-codex", {
@@ -4308,6 +4309,7 @@ async function askCodexAboutCurrentThread() {
       body: JSON.stringify({
         request_id: serverRequestId,
         question,
+        ask_history: askHistory,
         context: askContext.context,
         context_truncated: askContext.truncated,
         kind: state.mode,
@@ -4320,15 +4322,20 @@ async function askCodexAboutCurrentThread() {
       return;
     }
     const answer = result.answer || "";
-    renderAskCodexAnswer(answer);
+    state.askCodex.turns.push({ question, answer });
+    renderAskCodexAnswer();
+    els.askCodexQuestion.value = "";
     els.askCodexStatus.textContent = [
       "Answer from Codex.",
       result.context_truncated ? "Context was truncated." : "",
+      result.history_truncated ? "Ask history was truncated." : "",
       result.question_truncated ? "Question was truncated." : ""
     ].filter(Boolean).join(" ");
   } catch (error) {
     if (requestId === state.askCodex.requestId && !isAbortError(error)) {
-      renderAskCodexAnswer(error.message || String(error));
+      if (state.askCodex.turns.length === 0) {
+        renderAskCodexAnswer(error.message || String(error));
+      }
       els.askCodexStatus.textContent = "Ask Codex failed.";
     }
   } finally {
@@ -4343,8 +4350,14 @@ async function askCodexAboutCurrentThread() {
   }
 }
 
-function renderAskCodexAnswer(answer) {
-  const textValue = String(answer || "");
+function askCodexHistoryText() {
+  return state.askCodex.turns
+    .map((turn, index) => `Turn ${index + 1}\nQuestion: ${turn.question}\nAnswer: ${turn.answer}`)
+    .join("\n\n");
+}
+
+function renderAskCodexAnswer(answer = "") {
+  const textValue = state.askCodex.turns.length ? askCodexHistoryText() : String(answer || "");
   els.askCodexAnswer.replaceChildren(renderFormattedText(textValue, { autoLinkMessageRefs: true }));
   els.askCodexAnswer.classList.toggle("hidden", textValue === "");
   els.askCodexPanel.classList.toggle("has-answer", textValue !== "");

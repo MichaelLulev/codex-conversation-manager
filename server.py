@@ -44,6 +44,7 @@ SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
 DUPLICATE_MESSAGE_WINDOW_SECONDS = 0.05
 ASK_CODEX_MAX_QUESTION_CHARS = 8000
+ASK_CODEX_MAX_HISTORY_CHARS = 20000
 ASK_CODEX_TIMEOUT_SECONDS = 300
 ASK_CODEX_OUTPUT_TAIL_CHARS = 12000
 ASK_CODEX_CANCEL_TOMBSTONE_SECONDS = 600
@@ -404,11 +405,17 @@ def ask_codex_about_conversation(payload: dict[str, Any], codex_home: Path) -> d
             raise ValueError("Missing conversation context")
 
         question, question_truncated = trim_text(question_value.strip(), ASK_CODEX_MAX_QUESTION_CHARS)
+        history_value = payload.get("ask_history")
+        history, history_truncated = trim_text(
+            history_value.strip() if isinstance(history_value, str) else "",
+            ASK_CODEX_MAX_HISTORY_CHARS,
+        )
         context = context_value
         context_truncated_server = False
         client_truncated = bool(payload.get("context_truncated"))
         prompt = build_ask_codex_prompt(
             question=question,
+            history=history,
             context=context,
             kind=payload.get("kind"),
             thread_id=payload.get("thread_id"),
@@ -488,6 +495,7 @@ def ask_codex_about_conversation(payload: dict[str, Any], codex_home: Path) -> d
             "answer": answer,
             "context_chars": len(context),
             "context_truncated": client_truncated or context_truncated_server,
+            "history_truncated": history_truncated,
             "question_truncated": question_truncated,
             "request_id": request_id,
         }
@@ -498,6 +506,7 @@ def ask_codex_about_conversation(payload: dict[str, Any], codex_home: Path) -> d
 def build_ask_codex_prompt(
     *,
     question: str,
+    history: str = "",
     context: str,
     kind: Any,
     thread_id: Any,
@@ -521,7 +530,8 @@ def build_ask_codex_prompt(
         "[message 123](codex-message:123). To link to specific text inside a message, use a "
         "short exact quote as the label and URL-encode it in the text parameter, for example "
         "[quoted text](codex-message:123?text=quoted%20text).\n\n"
-        "Question:\n"
+        + (f"Previous Ask Codex exchange:\n{history}\n\n" if history else "")
+        + "Question:\n"
         f"{question}\n\n"
         "Conversation metadata:\n"
         + "\n".join(f"- {item}" for item in metadata)

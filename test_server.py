@@ -321,6 +321,21 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(second_path.read_text(encoding="utf-8"), "# second\n")
 
 
+class AskCodexPromptTests(unittest.TestCase):
+    def test_build_prompt_includes_ask_history_before_question(self):
+        prompt = server.build_ask_codex_prompt(
+            question="follow up?",
+            history="Turn 1\nQuestion: first?\nAnswer: first.",
+            context="MSG 1\nhello",
+            kind="main",
+            thread_id="thread-1",
+            title="Thread",
+            context_truncated=False,
+        )
+
+        self.assertLess(prompt.index("Previous Ask Codex exchange:"), prompt.index("Question:\nfollow up?"))
+
+
 class ArchiveConversationTests(unittest.TestCase):
     def test_archive_moves_rollout_updates_state_and_filters_active_list(self):
         with tempfile.TemporaryDirectory() as temp_dir:
