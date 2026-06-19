@@ -136,6 +136,8 @@ codex exec --sandbox read-only --ephemeral
 
 The request uses your local Codex CLI installation and authentication. The app does not require an OpenAI API key.
 
+Follow-up questions include the previous Ask Codex Q/A turns for the currently selected conversation. This Ask history is kept only in the current GUI session.
+
 ## Development
 
 Run the test suite and syntax checks:
