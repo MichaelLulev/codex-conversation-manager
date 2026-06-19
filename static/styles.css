@@ -678,23 +678,24 @@ button:disabled {
   flex-wrap: wrap;
   gap: var(--space-xs);
   margin-top: var(--space-sm);
-  padding-top: var(--space-sm);
-  border-top: 1px solid rgba(206, 219, 215, 0.72);
+  align-items: center;
 }
 
 .message-filter-actions button {
-  min-height: 28px;
-  border-color: rgba(0, 143, 131, 0.34);
-  background: #e7f5f2;
-  color: #006f67;
-  padding: 0 8px;
+  min-height: 24px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--accent);
+  padding: 0 4px;
   font-size: 12px;
-  font-weight: 750;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .message-filter-actions button:hover:not(:disabled) {
-  border-color: rgba(0, 143, 131, 0.58);
-  background: var(--accent-soft);
+  background: rgba(0, 143, 131, 0.08);
   color: #005e58;
 }
 
