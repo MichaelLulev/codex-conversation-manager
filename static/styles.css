@@ -714,12 +714,28 @@ button:disabled {
   border-radius: 0 6px 6px 0;
 }
 
-.message-filter-actions button:hover:not(:disabled) {
+.message-filter-actions button:not([aria-disabled="true"]):hover:not(:disabled) {
   position: relative;
   z-index: 1;
   border-color: var(--accent);
   background: #eef8f5;
   color: var(--accent);
+}
+
+.message-filter-actions button.active {
+  position: relative;
+  z-index: 2;
+  border-color: var(--accent);
+  background: var(--brand);
+  color: var(--brand-ink);
+}
+
+.message-filter-actions button[aria-disabled="true"] {
+  cursor: default;
+}
+
+.message-filter-actions button[aria-disabled="true"]:not(.active) {
+  color: var(--muted);
 }
 
 .message-filter {

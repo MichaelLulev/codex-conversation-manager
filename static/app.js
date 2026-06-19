@@ -178,6 +178,7 @@ const els = {
   messageFilterDefaults: document.getElementById("message-filter-defaults"),
   messageFilterAll: document.getElementById("message-filter-all"),
   messageFilterNone: document.getElementById("message-filter-none"),
+  messageFilterCustom: document.getElementById("message-filter-custom"),
   confirmModal: document.getElementById("confirm-modal"),
   confirmModalTitle: document.getElementById("confirm-modal-title"),
   confirmModalBody: document.getElementById("confirm-modal-body"),
@@ -832,6 +833,7 @@ function renderMessageFilterControls() {
     input.addEventListener("change", () => {
       state.messageFilters[filter.key] = input.checked;
       saveMessageFilters();
+      updateMessageFilterPresetState();
       rerenderMessagesForCurrentFilters();
     });
 
@@ -840,6 +842,7 @@ function renderMessageFilterControls() {
     label.append(input, textNode);
     els.messageFilterOptions.appendChild(label);
   }
+  updateMessageFilterPresetState();
 }
 
 function setMessageFilters(filters) {
@@ -847,6 +850,38 @@ function setMessageFilters(filters) {
   saveMessageFilters();
   renderMessageFilterControls();
   rerenderMessagesForCurrentFilters();
+}
+
+function messageFiltersEqual(a, b) {
+  return MESSAGE_FILTERS.every((filter) => a[filter.key] === b[filter.key]);
+}
+
+function currentMessageFilterPreset() {
+  if (messageFiltersEqual(state.messageFilters, defaultMessageFilters())) {
+    return "defaults";
+  }
+  if (messageFiltersEqual(state.messageFilters, allMessageFilters(true))) {
+    return "all";
+  }
+  if (messageFiltersEqual(state.messageFilters, allMessageFilters(false))) {
+    return "none";
+  }
+  return "custom";
+}
+
+function updateMessageFilterPresetState() {
+  const activePreset = currentMessageFilterPreset();
+  const buttons = {
+    defaults: els.messageFilterDefaults,
+    all: els.messageFilterAll,
+    none: els.messageFilterNone,
+    custom: els.messageFilterCustom
+  };
+  for (const [preset, button] of Object.entries(buttons)) {
+    const active = preset === activePreset;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  }
 }
 
 function allMessageFilters(enabled) {
