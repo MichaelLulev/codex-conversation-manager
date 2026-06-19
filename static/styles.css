@@ -678,12 +678,24 @@ button:disabled {
   flex-wrap: wrap;
   gap: var(--space-xs);
   margin-top: var(--space-sm);
+  padding-top: var(--space-sm);
+  border-top: 1px solid rgba(206, 219, 215, 0.72);
 }
 
 .message-filter-actions button {
   min-height: 28px;
+  border-color: rgba(0, 143, 131, 0.34);
+  background: #e7f5f2;
+  color: #006f67;
   padding: 0 8px;
   font-size: 12px;
+  font-weight: 750;
+}
+
+.message-filter-actions button:hover:not(:disabled) {
+  border-color: rgba(0, 143, 131, 0.58);
+  background: var(--accent-soft);
+  color: #005e58;
 }
 
 .message-filter {
