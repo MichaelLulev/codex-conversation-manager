@@ -154,9 +154,15 @@ class DesktopApp:
 
     def on_key_press(self, _widget: object, event: object) -> bool:
         control = bool(event.state & self.Gdk.ModifierType.CONTROL_MASK)
+        if event.keyval == self.Gdk.KEY_F5:
+            self.reload()
+            return True
         if not control:
             return False
 
+        if event.keyval in {self.Gdk.KEY_r, self.Gdk.KEY_R}:
+            self.reload()
+            return True
         if event.keyval in {
             self.Gdk.KEY_plus,
             self.Gdk.KEY_KP_Add,
@@ -180,6 +186,9 @@ class DesktopApp:
         self.webview.set_zoom_level(self.zoom)
         percent = round(self.zoom * 100)
         self.window.set_title(f"{APP_NAME} - {percent}%")
+
+    def reload(self) -> None:
+        self.webview.reload()
 
 
 def clamp_zoom(zoom: float) -> float:

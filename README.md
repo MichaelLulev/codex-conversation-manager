@@ -76,8 +76,9 @@ The desktop shell starts the local backend internally and stops it when the wind
 ~/.cache/codex-conversation-manager/desktop.log
 ```
 
-Desktop zoom:
+Desktop shortcuts:
 
+- `Ctrl+R` or `F5` reloads the GUI page
 - `Ctrl++` zooms in
 - `Ctrl+-` zooms out
 - `Ctrl+0` resets to 100%
