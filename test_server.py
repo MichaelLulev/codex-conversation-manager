@@ -150,6 +150,49 @@ class SyntheticForkTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
 
 
+class PatchDiffTests(unittest.TestCase):
+    def test_patch_apply_message_includes_saved_update_diff(self):
+        message = server.patch_apply_message(
+            {
+                "type": "patch_apply_end",
+                "status": "completed",
+                "success": True,
+                "changes": {
+                    "/tmp/example.py": {
+                        "type": "update",
+                        "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n",
+                    }
+                },
+            },
+            None,
+        )
+
+        self.assertIn("**Diff**", message.text)
+        self.assertIn("```diff", message.text)
+        self.assertIn("diff --git a/tmp/example.py b/tmp/example.py", message.text)
+        self.assertIn("-old", message.text)
+        self.assertIn("+new", message.text)
+
+    def test_patch_changes_diff_synthesizes_add_and_delete_diffs(self):
+        diff = server.patch_changes_diff(
+            {
+                "/tmp/new.txt": {"type": "add", "content": "one\ntwo\n"},
+                "/tmp/old.txt": {"type": "delete", "content": "gone\n"},
+            }
+        )
+
+        self.assertIsNotNone(diff)
+        assert diff is not None
+        self.assertIn("new file mode 100644", diff)
+        self.assertIn("--- /dev/null", diff)
+        self.assertIn("+++ b/tmp/new.txt", diff)
+        self.assertIn("+one", diff)
+        self.assertIn("deleted file mode 100644", diff)
+        self.assertIn("--- a/tmp/old.txt", diff)
+        self.assertIn("+++ /dev/null", diff)
+        self.assertIn("-gone", diff)
+
+
 def create_state_db(home: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(home / "state_5.sqlite")
     conn.execute(

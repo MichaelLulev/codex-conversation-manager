@@ -45,7 +45,7 @@ const MESSAGE_FILTER_DESCRIPTIONS = {
   rolledBack: "Messages from turns removed with Esc Esc rollback/undo. Codex still keeps them in the raw transcript.",
   important: "Errors, aborted turns, and rollback markers.",
   compaction: "Context-compaction events and replacement summaries.",
-  patch: "Patch summaries and changed-file metadata.",
+  patch: "Patch summaries, changed-file metadata, and recovered diffs.",
   search: "Saved web-search call and completion metadata.",
   image: "Image-generation metadata, prompts, and saved image paths.",
   response: "Response status, model, token usage, and error/incomplete details.",

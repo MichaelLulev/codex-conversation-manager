@@ -67,6 +67,7 @@ MAIN_THREAD_SELECT_COLUMNS = """
     git_branch, git_origin_url, agent_nickname, agent_role, memory_mode,
     reasoning_effort, agent_path, created_at_ms, updated_at_ms, thread_source
 """
+EventBlock = tuple[str, Any] | tuple[str, Any, str]
 
 
 @dataclass
@@ -3047,17 +3048,20 @@ def event_message(
 def format_event_text(
     title: str,
     fields: list[tuple[str, Any]],
-    blocks: list[tuple[str, Any]],
+    blocks: list[EventBlock],
 ) -> str:
     lines = [f"**{title}**"]
     for label, value in fields:
         if value is None or value == "":
             continue
         lines.append(f"{label}: {format_inline_value(value)}")
-    for label, value in blocks:
+    for block in blocks:
+        label, value = block[0], block[1]
         if value is None or value == "":
             continue
         block_text, language = format_event_value(value)
+        if len(block) > 2:
+            language = block[2]
         lines.extend(["", f"**{label}**", f"```{language}", escape_code_fence(block_text), "```"])
     return "\n".join(lines).strip()
 
@@ -3069,11 +3073,16 @@ def patch_apply_message(payload: dict[str, Any], timestamp: int | None) -> Messa
         ("Status", payload.get("status")),
         ("Success", payload.get("success")),
     ]
-    blocks = [
+    blocks: list[EventBlock] = [
         ("Changed Files", summarize_patch_changes(payload.get("changes"))),
+    ]
+    diff = patch_changes_diff(payload.get("changes"))
+    if diff:
+        blocks.append(("Diff", diff, "diff"))
+    blocks.extend([
         ("Stdout", payload.get("stdout")),
         ("Stderr", payload.get("stderr")),
-    ]
+    ])
     return event_message("Patch Applied", fields, blocks, timestamp, "rollout event_msg", "patch")
 
 
@@ -3095,6 +3104,94 @@ def summarize_patch_changes(value: Any) -> Any:
         else:
             changes.append({"path": path, "change": change})
     return changes
+
+
+def patch_changes_diff(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+
+    sections: list[str] = []
+    for path, change in value.items():
+        if not isinstance(change, dict):
+            continue
+        path_text = str(path)
+        change_type = change.get("type")
+        if change_type == "update":
+            unified_diff = change.get("unified_diff")
+            if isinstance(unified_diff, str) and unified_diff.strip():
+                sections.append(update_file_diff(path_text, change, unified_diff))
+        elif change_type == "add":
+            content = change.get("content")
+            if isinstance(content, str):
+                sections.append(added_file_diff(path_text, content))
+        elif change_type == "delete":
+            content = change.get("content")
+            if isinstance(content, str):
+                sections.append(deleted_file_diff(path_text, content))
+
+    diff = "\n\n".join(section.rstrip() for section in sections if section.strip())
+    return diff or None
+
+
+def update_file_diff(path: str, change: dict[str, Any], unified_diff: str) -> str:
+    new_path = path
+    old_path = change.get("move_path")
+    if not isinstance(old_path, str) or not old_path:
+        old_path = path
+
+    stripped_diff = unified_diff.strip("\n")
+    if stripped_diff.startswith("diff --git ") or stripped_diff.startswith("--- "):
+        return stripped_diff
+
+    old_label = diff_file_label(old_path)
+    new_label = diff_file_label(new_path)
+    return "\n".join(
+        [
+            f"diff --git a/{old_label} b/{new_label}",
+            f"--- a/{old_label}",
+            f"+++ b/{new_label}",
+            stripped_diff,
+        ]
+    )
+
+
+def added_file_diff(path: str, content: str) -> str:
+    label = diff_file_label(path)
+    lines = content.splitlines()
+    hunk_size = len(lines)
+    diff_lines = [
+        f"diff --git a/{label} b/{label}",
+        "new file mode 100644",
+        "--- /dev/null",
+        f"+++ b/{label}",
+        f"@@ -0,0 +1,{hunk_size} @@",
+        *[f"+{line}" for line in lines],
+    ]
+    if content and not content.endswith(("\n", "\r")):
+        diff_lines.append(r"\ No newline at end of file")
+    return "\n".join(diff_lines)
+
+
+def deleted_file_diff(path: str, content: str) -> str:
+    label = diff_file_label(path)
+    lines = content.splitlines()
+    hunk_size = len(lines)
+    diff_lines = [
+        f"diff --git a/{label} b/{label}",
+        "deleted file mode 100644",
+        f"--- a/{label}",
+        "+++ /dev/null",
+        f"@@ -1,{hunk_size} +0,0 @@",
+        *[f"-{line}" for line in lines],
+    ]
+    if content and not content.endswith(("\n", "\r")):
+        diff_lines.append(r"\ No newline at end of file")
+    return "\n".join(diff_lines)
+
+
+def diff_file_label(path: str) -> str:
+    normalized = path.replace("\\", "/").lstrip("/")
+    return normalized or path
 
 
 def exec_command_end_message(payload: dict[str, Any], timestamp: int | None) -> Message:

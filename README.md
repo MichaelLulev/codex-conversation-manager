@@ -37,7 +37,7 @@ Do not publish your `~/.codex` directory, exported conversations, screenshots, P
 - Search the conversation list by metadata or full conversation text.
 - Search inside a selected conversation, including code blocks with horizontal scrolling to matches.
 - Filter visible transcript content, including tool calls, thinking traces, events, metadata, and assistant final/interim messages.
-- Render Markdown, code blocks, tables, Hebrew/English mixed text, links, and tool output.
+- Render Markdown, code blocks, tables, Hebrew/English mixed text, links, tool output, and recovered patch diffs.
 - Export the currently filtered conversation as Markdown, plain text, or JSON.
 - Ask Codex about the current conversation or selected text through the local `codex` CLI.
 - Create Codex-compatible forks from selected messages, before messages, before compactions, or before rollbacks.
