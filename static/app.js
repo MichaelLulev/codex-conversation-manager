@@ -3907,34 +3907,31 @@ function renderDiffCodeLines(code, codeText) {
   for (const line of lines) {
     const lineClass = diffLineClass(line);
     const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    let oldNumber = "";
-    let newNumber = "";
+    let lineNumber = "";
     if (hunk) {
       oldLineNumber = Number(hunk[1]);
       newLineNumber = Number(hunk[2]);
     } else if (oldLineNumber !== null && newLineNumber !== null) {
       if (lineClass === "diff-line-add") {
-        newNumber = String(newLineNumber);
+        lineNumber = String(newLineNumber);
         newLineNumber += 1;
       } else if (lineClass === "diff-line-del") {
-        oldNumber = String(oldLineNumber);
+        lineNumber = String(oldLineNumber);
         oldLineNumber += 1;
       } else if (lineClass === "diff-line-context") {
-        oldNumber = String(oldLineNumber);
-        newNumber = String(newLineNumber);
+        lineNumber = String(newLineNumber);
         oldLineNumber += 1;
         newLineNumber += 1;
       }
     }
-    code.appendChild(renderDiffLine(line, lineClass, oldNumber, newNumber));
+    code.appendChild(renderDiffLine(line, lineClass, lineNumber));
   }
 }
 
-function renderDiffLine(line, lineClass, oldNumber, newNumber) {
+function renderDiffLine(line, lineClass, lineNumber) {
   const span = document.createElement("span");
   span.className = `diff-line ${lineClass}`;
-  span.dataset.oldLine = oldNumber;
-  span.dataset.newLine = newNumber;
+  span.dataset.line = lineNumber;
   const text = document.createElement("span");
   text.className = "diff-line-text";
   text.textContent = line || " ";

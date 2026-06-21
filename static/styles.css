@@ -1503,35 +1503,26 @@ button:disabled {
 
 .diff-line {
   display: grid;
-  grid-template-columns: 5ch 5ch max-content;
+  grid-template-columns: 6ch max-content;
   column-gap: 0;
   min-height: 1.45em;
   padding: 0 4px 0 0;
   margin: 0 -4px;
 }
 
-.diff-line::before,
-.diff-line::after {
+.diff-line::before {
+  content: attr(data-line);
+  grid-column: 1;
   min-width: 0;
   padding: 0 6px;
+  border-right: 1px solid rgba(184, 200, 198, 0.18);
   color: rgba(184, 200, 198, 0.74);
   text-align: right;
   user-select: none;
 }
 
-.diff-line::before {
-  content: attr(data-old-line);
-  grid-column: 1;
-}
-
-.diff-line::after {
-  content: attr(data-new-line);
-  grid-column: 2;
-  border-right: 1px solid rgba(184, 200, 198, 0.18);
-}
-
 .diff-line-text {
-  grid-column: 3;
+  grid-column: 2;
   padding-left: 8px;
 }
 
