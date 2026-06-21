@@ -3882,9 +3882,42 @@ function renderCodeBlock(codeText, language) {
   if (language) {
     code.dataset.language = language;
   }
-  code.textContent = codeText;
+  if (isDiffLanguage(language)) {
+    code.className = "diff-code";
+    renderDiffCodeLines(code, codeText);
+  } else {
+    code.textContent = codeText;
+  }
   pre.appendChild(code);
   return pre;
+}
+
+function isDiffLanguage(language) {
+  const normalized = String(language || "").toLowerCase();
+  return normalized === "diff" || normalized === "patch";
+}
+
+function renderDiffCodeLines(code, codeText) {
+  const lines = String(codeText).replace(/\r\n/g, "\n").split("\n");
+  for (const line of lines) {
+    const span = document.createElement("span");
+    span.className = `diff-line ${diffLineClass(line)}`;
+    span.textContent = line || " ";
+    code.appendChild(span);
+  }
+}
+
+function diffLineClass(line) {
+  if (/^diff --git /.test(line)) return "diff-line-header";
+  if (/^(index |new file mode |deleted file mode |similarity index |rename from |rename to |old mode |new mode )/.test(line)) {
+    return "diff-line-meta";
+  }
+  if (/^@@ /.test(line)) return "diff-line-hunk";
+  if (/^(\+\+\+|---) /.test(line)) return "diff-line-file";
+  if (/^\+/.test(line)) return "diff-line-add";
+  if (/^-/.test(line)) return "diff-line-del";
+  if (/^\\ No newline/.test(line)) return "diff-line-note";
+  return "diff-line-context";
 }
 
 function parseMarkdownTable(lines, startIndex) {

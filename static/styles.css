@@ -1497,6 +1497,41 @@ button:disabled {
   white-space: pre;
 }
 
+.message-body pre code.diff-code {
+  min-width: max-content;
+}
+
+.diff-line {
+  display: block;
+  min-height: 1.45em;
+  padding: 0 4px;
+  margin: 0 -4px;
+}
+
+.diff-line-header,
+.diff-line-file {
+  color: #9bdde0;
+}
+
+.diff-line-meta,
+.diff-line-note {
+  color: #b8c8c6;
+}
+
+.diff-line-hunk {
+  color: #ffd37a;
+}
+
+.diff-line-add {
+  background: rgba(57, 166, 91, 0.18);
+  color: #9bf1b2;
+}
+
+.diff-line-del {
+  background: rgba(207, 75, 75, 0.18);
+  color: #ffb1a8;
+}
+
 .md-table-wrap {
   max-width: 100%;
   margin: var(--space-sm) 0;
