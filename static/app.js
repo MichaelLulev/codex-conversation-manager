@@ -3898,13 +3898,48 @@ function isDiffLanguage(language) {
 }
 
 function renderDiffCodeLines(code, codeText) {
-  const lines = String(codeText).replace(/\r\n/g, "\n").split("\n");
+  const normalized = String(codeText).replace(/\r\n/g, "\n");
+  const lines = normalized.endsWith("\n")
+    ? normalized.slice(0, -1).split("\n")
+    : normalized.split("\n");
+  let oldLineNumber = null;
+  let newLineNumber = null;
   for (const line of lines) {
-    const span = document.createElement("span");
-    span.className = `diff-line ${diffLineClass(line)}`;
-    span.textContent = line || " ";
-    code.appendChild(span);
+    const lineClass = diffLineClass(line);
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    let oldNumber = "";
+    let newNumber = "";
+    if (hunk) {
+      oldLineNumber = Number(hunk[1]);
+      newLineNumber = Number(hunk[2]);
+    } else if (oldLineNumber !== null && newLineNumber !== null) {
+      if (lineClass === "diff-line-add") {
+        newNumber = String(newLineNumber);
+        newLineNumber += 1;
+      } else if (lineClass === "diff-line-del") {
+        oldNumber = String(oldLineNumber);
+        oldLineNumber += 1;
+      } else if (lineClass === "diff-line-context") {
+        oldNumber = String(oldLineNumber);
+        newNumber = String(newLineNumber);
+        oldLineNumber += 1;
+        newLineNumber += 1;
+      }
+    }
+    code.appendChild(renderDiffLine(line, lineClass, oldNumber, newNumber));
   }
+}
+
+function renderDiffLine(line, lineClass, oldNumber, newNumber) {
+  const span = document.createElement("span");
+  span.className = `diff-line ${lineClass}`;
+  span.dataset.oldLine = oldNumber;
+  span.dataset.newLine = newNumber;
+  const text = document.createElement("span");
+  text.className = "diff-line-text";
+  text.textContent = line || " ";
+  span.appendChild(text);
+  return span;
 }
 
 function diffLineClass(line) {
