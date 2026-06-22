@@ -29,6 +29,7 @@ const MAIN_FILTER_LABELS = {
 const MESSAGE_RENDER_BATCH_SIZE = 100;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
+const MAX_INTRALINE_DIFF_CELLS = 120000;
 const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
@@ -3902,6 +3903,7 @@ function renderDiffCodeLines(code, codeText) {
   const lines = normalized.endsWith("\n")
     ? normalized.slice(0, -1).split("\n")
     : normalized.split("\n");
+  const entries = [];
   let oldLineNumber = null;
   let newLineNumber = null;
   for (const line of lines) {
@@ -3924,19 +3926,169 @@ function renderDiffCodeLines(code, codeText) {
         newLineNumber += 1;
       }
     }
-    code.appendChild(renderDiffLine(line, lineClass, lineNumber));
+    entries.push({ line, lineClass, lineNumber, ranges: [] });
+  }
+  annotateIntralineDiffs(entries);
+  for (const entry of entries) {
+    code.appendChild(renderDiffLine(entry.line, entry.lineClass, entry.lineNumber, entry.ranges));
   }
 }
 
-function renderDiffLine(line, lineClass, lineNumber) {
+function annotateIntralineDiffs(entries) {
+  let index = 0;
+  while (index < entries.length) {
+    if (entries[index].lineClass !== "diff-line-del") {
+      index += 1;
+      continue;
+    }
+    const deleteStart = index;
+    while (index < entries.length && entries[index].lineClass === "diff-line-del") {
+      index += 1;
+    }
+    const addStart = index;
+    while (index < entries.length && entries[index].lineClass === "diff-line-add") {
+      index += 1;
+    }
+    const pairCount = Math.min(addStart - deleteStart, index - addStart);
+    for (let offset = 0; offset < pairCount; offset += 1) {
+      const deleted = entries[deleteStart + offset];
+      const added = entries[addStart + offset];
+      const ranges = intralineDiffRanges(deleted.line.slice(1), added.line.slice(1));
+      deleted.ranges = offsetRanges(ranges.oldRanges, 1);
+      added.ranges = offsetRanges(ranges.newRanges, 1);
+    }
+  }
+}
+
+function intralineDiffRanges(oldText, newText) {
+  if (!oldText && !newText) {
+    return { oldRanges: [], newRanges: [] };
+  }
+  if (oldText.length * newText.length > MAX_INTRALINE_DIFF_CELLS) {
+    return prefixSuffixDiffRanges(oldText, newText);
+  }
+
+  const oldLength = oldText.length;
+  const newLength = newText.length;
+  const table = Array.from(
+    { length: oldLength + 1 },
+    () => new Uint16Array(newLength + 1)
+  );
+  for (let oldIndex = oldLength - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = newLength - 1; newIndex >= 0; newIndex -= 1) {
+      table[oldIndex][newIndex] = oldText[oldIndex] === newText[newIndex]
+        ? table[oldIndex + 1][newIndex + 1] + 1
+        : Math.max(table[oldIndex + 1][newIndex], table[oldIndex][newIndex + 1]);
+    }
+  }
+
+  const oldUnchanged = new Array(oldLength).fill(false);
+  const newUnchanged = new Array(newLength).fill(false);
+  let oldIndex = 0;
+  let newIndex = 0;
+  while (oldIndex < oldLength && newIndex < newLength) {
+    if (oldText[oldIndex] === newText[newIndex]) {
+      oldUnchanged[oldIndex] = true;
+      newUnchanged[newIndex] = true;
+      oldIndex += 1;
+      newIndex += 1;
+    } else if (table[oldIndex + 1][newIndex] >= table[oldIndex][newIndex + 1]) {
+      oldIndex += 1;
+    } else {
+      newIndex += 1;
+    }
+  }
+
+  return {
+    oldRanges: changedRanges(oldUnchanged),
+    newRanges: changedRanges(newUnchanged)
+  };
+}
+
+function prefixSuffixDiffRanges(oldText, newText) {
+  let prefixLength = 0;
+  while (
+    prefixLength < oldText.length
+    && prefixLength < newText.length
+    && oldText[prefixLength] === newText[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < oldText.length - prefixLength
+    && suffixLength < newText.length - prefixLength
+    && oldText[oldText.length - suffixLength - 1] === newText[newText.length - suffixLength - 1]
+  ) {
+    suffixLength += 1;
+  }
+
+  return {
+    oldRanges: prefixLength < oldText.length - suffixLength
+      ? [[prefixLength, oldText.length - suffixLength]]
+      : [],
+    newRanges: prefixLength < newText.length - suffixLength
+      ? [[prefixLength, newText.length - suffixLength]]
+      : []
+  };
+}
+
+function changedRanges(unchanged) {
+  const ranges = [];
+  let index = 0;
+  while (index < unchanged.length) {
+    while (index < unchanged.length && unchanged[index]) {
+      index += 1;
+    }
+    const start = index;
+    while (index < unchanged.length && !unchanged[index]) {
+      index += 1;
+    }
+    if (start < index) {
+      ranges.push([start, index]);
+    }
+  }
+  return ranges;
+}
+
+function offsetRanges(ranges, offset) {
+  return ranges.map(([start, end]) => [start + offset, end + offset]);
+}
+
+function renderDiffLine(line, lineClass, lineNumber, ranges = []) {
   const span = document.createElement("span");
   span.className = `diff-line ${lineClass}`;
   span.dataset.line = lineNumber;
   const text = document.createElement("span");
   text.className = "diff-line-text";
-  text.textContent = line || " ";
+  appendDiffLineText(text, line || " ", ranges);
   span.appendChild(text);
   return span;
+}
+
+function appendDiffLineText(parent, text, ranges) {
+  if (!ranges.length) {
+    parent.textContent = text;
+    return;
+  }
+
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (start > cursor) {
+      parent.appendChild(document.createTextNode(text.slice(cursor, start)));
+    }
+    if (end > start) {
+      const mark = document.createElement("span");
+      mark.className = "diff-inline-change";
+      mark.textContent = text.slice(start, end);
+      parent.appendChild(mark);
+    }
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < text.length) {
+    parent.appendChild(document.createTextNode(text.slice(cursor)));
+  }
 }
 
 function diffLineClass(line) {

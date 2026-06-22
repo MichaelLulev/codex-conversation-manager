@@ -1550,6 +1550,21 @@ button:disabled {
   color: #ffb1a8;
 }
 
+.diff-inline-change {
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+.diff-line-add .diff-inline-change {
+  background: rgba(116, 255, 153, 0.28);
+  color: #d7ffe0;
+}
+
+.diff-line-del .diff-inline-change {
+  background: rgba(255, 139, 126, 0.28);
+  color: #ffe1dc;
+}
+
 .md-table-wrap {
   max-width: 100%;
   margin: var(--space-sm) 0;
