@@ -1550,6 +1550,10 @@ button:disabled {
   color: #ffb1a8;
 }
 
+.diff-line-change {
+  color: #d9e5e2;
+}
+
 .diff-inline-change {
   border-radius: 3px;
   padding: 0 1px;
@@ -1563,6 +1567,24 @@ button:disabled {
 .diff-line-del .diff-inline-change {
   background: rgba(255, 139, 126, 0.28);
   color: #ffe1dc;
+}
+
+.diff-word-add,
+.diff-word-del {
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+.diff-word-add {
+  background: rgba(116, 255, 153, 0.28);
+  color: #d7ffe0;
+}
+
+.diff-word-del {
+  background: rgba(255, 139, 126, 0.28);
+  color: #ffe1dc;
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
 }
 
 .md-table-wrap {

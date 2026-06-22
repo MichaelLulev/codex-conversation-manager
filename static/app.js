@@ -30,6 +30,7 @@ const MESSAGE_RENDER_BATCH_SIZE = 100;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
 const MAX_INTRALINE_DIFF_CELLS = 120000;
+const MAX_COMBINED_DIFF_TOKEN_CELLS = 80000;
 const MAX_PAIR_SIMILARITY_CELLS = 20000;
 const MIN_INTRALINE_PAIR_SCORE = 0.62;
 const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
@@ -3932,6 +3933,13 @@ function renderDiffCodeLines(code, codeText) {
   }
   annotateIntralineDiffs(entries);
   for (const entry of entries) {
+    if (entry.skip) {
+      continue;
+    }
+    if (entry.combined) {
+      code.appendChild(renderCombinedDiffLine(entry.combined));
+      continue;
+    }
     code.appendChild(renderDiffLine(entry.line, entry.lineClass, entry.lineNumber, entry.ranges));
   }
 }
@@ -3956,9 +3964,21 @@ function annotateIntralineDiffs(entries) {
       entries.slice(addStart, index)
     );
     for (const [deleted, added] of pairs) {
-      const ranges = intralineDiffRanges(deleted.line.slice(1), added.line.slice(1));
-      deleted.ranges = offsetRanges(ranges.oldRanges, 1);
-      added.ranges = offsetRanges(ranges.newRanges, 1);
+      const oldText = deleted.line.slice(1);
+      const newText = added.line.slice(1);
+      const combinedParts = combinedDiffParts(oldText, newText);
+      if (combinedParts) {
+        deleted.skip = true;
+        added.combined = {
+          oldLineNumber: deleted.lineNumber,
+          newLineNumber: added.lineNumber,
+          parts: combinedParts
+        };
+      } else {
+        const ranges = intralineDiffRanges(oldText, newText);
+        deleted.ranges = offsetRanges(ranges.oldRanges, 1);
+        added.ranges = offsetRanges(ranges.newRanges, 1);
+      }
     }
   }
 }
@@ -4051,7 +4071,78 @@ function tokenSimilarity(oldText, newText) {
 }
 
 function diffTokens(value) {
-  return String(value).match(/[A-Za-z0-9_$]+|[^\sA-Za-z0-9_$]+/g) || [];
+  return String(value).match(/[\p{L}\p{N}_$]+|[^\s\p{L}\p{N}_$]+/gu) || [];
+}
+
+function combinedDiffParts(oldText, newText) {
+  if (!oldText && !newText) {
+    return [];
+  }
+  const oldTokens = diffTextTokens(oldText);
+  const newTokens = diffTextTokens(newText);
+  if (oldTokens.length * newTokens.length > MAX_COMBINED_DIFF_TOKEN_CELLS) {
+    return null;
+  }
+
+  const table = commonTokenSubsequenceTable(oldTokens, newTokens);
+  const parts = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+  while (oldIndex < oldTokens.length && newIndex < newTokens.length) {
+    if (oldTokens[oldIndex] === newTokens[newIndex]) {
+      appendCombinedDiffPart(parts, "equal", oldTokens[oldIndex]);
+      oldIndex += 1;
+      newIndex += 1;
+    } else if (table[oldIndex + 1][newIndex] >= table[oldIndex][newIndex + 1]) {
+      appendCombinedDiffPart(parts, "delete", oldTokens[oldIndex]);
+      oldIndex += 1;
+    } else {
+      appendCombinedDiffPart(parts, "add", newTokens[newIndex]);
+      newIndex += 1;
+    }
+  }
+
+  while (oldIndex < oldTokens.length) {
+    appendCombinedDiffPart(parts, "delete", oldTokens[oldIndex]);
+    oldIndex += 1;
+  }
+  while (newIndex < newTokens.length) {
+    appendCombinedDiffPart(parts, "add", newTokens[newIndex]);
+    newIndex += 1;
+  }
+
+  return parts;
+}
+
+function diffTextTokens(value) {
+  return String(value).match(/\s+|[\p{L}\p{N}_$]+|[^\s\p{L}\p{N}_$]+/gu) || [];
+}
+
+function commonTokenSubsequenceTable(oldTokens, newTokens) {
+  const table = Array.from(
+    { length: oldTokens.length + 1 },
+    () => new Uint16Array(newTokens.length + 1)
+  );
+  for (let oldIndex = oldTokens.length - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = newTokens.length - 1; newIndex >= 0; newIndex -= 1) {
+      table[oldIndex][newIndex] = oldTokens[oldIndex] === newTokens[newIndex]
+        ? table[oldIndex + 1][newIndex + 1] + 1
+        : Math.max(table[oldIndex + 1][newIndex], table[oldIndex][newIndex + 1]);
+    }
+  }
+  return table;
+}
+
+function appendCombinedDiffPart(parts, type, text) {
+  if (!text) {
+    return;
+  }
+  const last = parts[parts.length - 1];
+  if (last?.type === type) {
+    last.text += text;
+  } else {
+    parts.push({ type, text });
+  }
 }
 
 function intralineDiffRanges(oldText, newText) {
@@ -4211,7 +4302,7 @@ function wordTokenContainingRange(text, start, end) {
   if (start >= end) {
     return null;
   }
-  const matcher = /[A-Za-z0-9_$]+/g;
+  const matcher = /[\p{L}\p{N}_$]+/gu;
   let match;
   while ((match = matcher.exec(text))) {
     const tokenStart = match.index;
@@ -4243,6 +4334,41 @@ function changedRanges(unchanged) {
 
 function offsetRanges(ranges, offset) {
   return ranges.map(([start, end]) => [start + offset, end + offset]);
+}
+
+function renderCombinedDiffLine(change) {
+  const span = document.createElement("span");
+  span.className = "diff-line diff-line-change";
+  span.dataset.line = combinedDiffLineNumber(change.oldLineNumber, change.newLineNumber);
+  if (change.oldLineNumber && change.newLineNumber) {
+    span.title = `Old line ${change.oldLineNumber}, new line ${change.newLineNumber}`;
+  }
+
+  const text = document.createElement("span");
+  text.className = "diff-line-text";
+  appendCombinedDiffText(text, change.parts);
+  span.appendChild(text);
+  return span;
+}
+
+function combinedDiffLineNumber(oldLineNumber, newLineNumber) {
+  if (oldLineNumber && newLineNumber && oldLineNumber !== newLineNumber) {
+    return `${oldLineNumber}/${newLineNumber}`;
+  }
+  return newLineNumber || oldLineNumber || "";
+}
+
+function appendCombinedDiffText(parent, parts) {
+  for (const part of parts) {
+    if (part.type === "equal") {
+      parent.appendChild(document.createTextNode(part.text));
+      continue;
+    }
+    const mark = document.createElement("span");
+    mark.className = part.type === "delete" ? "diff-word-del" : "diff-word-add";
+    mark.textContent = part.text;
+    parent.appendChild(mark);
+  }
 }
 
 function renderDiffLine(line, lineClass, lineNumber, ranges = []) {
