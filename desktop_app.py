@@ -57,7 +57,9 @@ class LocalAppServer:
 
     def start(self) -> None:
         if self.process is not None:
-            return
+            if self.process.poll() is None:
+                return
+            self.process = None
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         self.process = subprocess.Popen(
@@ -103,6 +105,10 @@ class LocalAppServer:
                 self.process.kill()
                 self.process.wait(timeout=2)
         self.process = None
+
+    def restart(self) -> None:
+        self.stop()
+        self.start()
 
 
 def find_available_port(host: str, port: int) -> int:
@@ -154,14 +160,21 @@ class DesktopApp:
 
     def on_key_press(self, _widget: object, event: object) -> bool:
         control = bool(event.state & self.Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(event.state & self.Gdk.ModifierType.SHIFT_MASK)
         if event.keyval == self.Gdk.KEY_F5:
-            self.reload()
+            if control:
+                self.reset_server_and_reload()
+            else:
+                self.reload()
             return True
         if not control:
             return False
 
         if event.keyval in {self.Gdk.KEY_r, self.Gdk.KEY_R}:
-            self.reload()
+            if shift:
+                self.reset_server_and_reload()
+            else:
+                self.reload()
             return True
         if event.keyval in {
             self.Gdk.KEY_plus,
@@ -189,6 +202,34 @@ class DesktopApp:
 
     def reload(self) -> None:
         self.webview.reload()
+
+    def reset_server_and_reload(self) -> None:
+        self.window.set_title(f"{APP_NAME} - resetting server")
+        self.flush_gui_events()
+        try:
+            self.app_server.restart()
+        except Exception as exc:
+            self.show_error("Server reset failed", str(exc))
+            self.set_zoom(self.zoom)
+            return
+        self.webview.load_uri(f"{self.app_server.url}?desktop={int(time.time())}")
+        self.set_zoom(self.zoom)
+
+    def flush_gui_events(self) -> None:
+        while self.Gtk.events_pending():
+            self.Gtk.main_iteration_do(False)
+
+    def show_error(self, title: str, message: str) -> None:
+        dialog = self.Gtk.MessageDialog(
+            transient_for=self.window,
+            flags=self.Gtk.DialogFlags.MODAL,
+            message_type=self.Gtk.MessageType.ERROR,
+            buttons=self.Gtk.ButtonsType.CLOSE,
+            text=title,
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
 
 
 def clamp_zoom(zoom: float) -> float:

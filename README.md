@@ -79,6 +79,7 @@ The desktop shell starts the local backend internally and stops it when the wind
 Desktop shortcuts:
 
 - `Ctrl+R` or `F5` reloads the GUI page
+- `Ctrl+Shift+R` or `Ctrl+F5` restarts the local backend server and reloads the GUI page
 - `Ctrl++` zooms in
 - `Ctrl+-` zooms out
 - `Ctrl+0` resets to 100%
