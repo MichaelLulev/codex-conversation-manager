@@ -4003,6 +4003,11 @@ function renderDiffCodeLines(code, codeText) {
     if (entry.skip) {
       continue;
     }
+    if (entry.lineClass === "diff-file-gap" || entry.lineClass === "diff-file-label") {
+      code.appendChild(renderDiffLine(entry.text, entry.lineClass, entry.lineNumber, entry.ranges));
+      previousPosition = null;
+      continue;
+    }
     if (entry.combined) {
       previousPosition = appendDiffEntryWithGap(
         code,
@@ -4081,6 +4086,15 @@ function appendDiffFileLabel(entries, filePath, previousFileLabel) {
   const label = cleanDiffPath(filePath);
   if (!label || label === "/dev/null" || label === previousFileLabel) {
     return previousFileLabel;
+  }
+  if (previousFileLabel) {
+    entries.push({
+      line: "",
+      text: "",
+      lineClass: "diff-file-gap",
+      lineNumber: "",
+      ranges: []
+    });
   }
   entries.push({
     line: label,

@@ -1606,8 +1606,12 @@ button:disabled {
 }
 
 .diff-gap {
-  min-height: 0.85em;
+  min-height: 1.1em;
   color: rgba(184, 200, 198, 0.54);
+}
+
+.diff-file-gap {
+  min-height: 1.3em;
 }
 
 .diff-inline-change {
