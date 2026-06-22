@@ -1634,8 +1634,6 @@ button:disabled {
 .diff-word-del {
   background: rgba(255, 139, 126, 0.28);
   color: #ffe1dc;
-  text-decoration: line-through;
-  text-decoration-thickness: 1px;
 }
 
 .md-table-wrap {
