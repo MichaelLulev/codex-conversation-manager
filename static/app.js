@@ -30,6 +30,8 @@ const MESSAGE_RENDER_BATCH_SIZE = 100;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
 const MAX_INTRALINE_DIFF_CELLS = 120000;
+const MAX_PAIR_SIMILARITY_CELLS = 20000;
+const MIN_INTRALINE_PAIR_SCORE = 0.62;
 const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
@@ -3949,15 +3951,107 @@ function annotateIntralineDiffs(entries) {
     while (index < entries.length && entries[index].lineClass === "diff-line-add") {
       index += 1;
     }
-    const pairCount = Math.min(addStart - deleteStart, index - addStart);
-    for (let offset = 0; offset < pairCount; offset += 1) {
-      const deleted = entries[deleteStart + offset];
-      const added = entries[addStart + offset];
+    const pairs = similarDiffLinePairs(
+      entries.slice(deleteStart, addStart),
+      entries.slice(addStart, index)
+    );
+    for (const [deleted, added] of pairs) {
       const ranges = intralineDiffRanges(deleted.line.slice(1), added.line.slice(1));
       deleted.ranges = offsetRanges(ranges.oldRanges, 1);
       added.ranges = offsetRanges(ranges.newRanges, 1);
     }
   }
+}
+
+function similarDiffLinePairs(deletedLines, addedLines) {
+  const candidates = [];
+  for (const deleted of deletedLines) {
+    for (const added of addedLines) {
+      const score = diffLineSimilarity(deleted.line.slice(1), added.line.slice(1));
+      if (score >= MIN_INTRALINE_PAIR_SCORE) {
+        candidates.push({ deleted, added, score });
+      }
+    }
+  }
+  candidates.sort((left, right) => right.score - left.score);
+
+  const usedDeleted = new Set();
+  const usedAdded = new Set();
+  const pairs = [];
+  for (const candidate of candidates) {
+    if (usedDeleted.has(candidate.deleted) || usedAdded.has(candidate.added)) {
+      continue;
+    }
+    usedDeleted.add(candidate.deleted);
+    usedAdded.add(candidate.added);
+    pairs.push([candidate.deleted, candidate.added]);
+  }
+  return pairs;
+}
+
+function diffLineSimilarity(oldText, newText) {
+  const oldTrimmed = oldText.trim();
+  const newTrimmed = newText.trim();
+  if (!oldTrimmed || !newTrimmed) {
+    return oldTrimmed === newTrimmed ? 1 : 0;
+  }
+  if (oldTrimmed === newTrimmed) {
+    return 1;
+  }
+  if (
+    Math.min(oldTrimmed.length, newTrimmed.length) >= 6
+    && (oldTrimmed.includes(newTrimmed) || newTrimmed.includes(oldTrimmed))
+  ) {
+    return 0.95;
+  }
+
+  const tokenScore = tokenSimilarity(oldTrimmed, newTrimmed);
+  if (tokenScore >= MIN_INTRALINE_PAIR_SCORE) {
+    return tokenScore;
+  }
+
+  const edgeScore = commonPrefixSuffixLength(oldTrimmed, newTrimmed)
+    / Math.min(oldTrimmed.length, newTrimmed.length);
+  if (edgeScore >= MIN_INTRALINE_PAIR_SCORE) {
+    return edgeScore;
+  }
+
+  if (oldTrimmed.length * newTrimmed.length > MAX_PAIR_SIMILARITY_CELLS) {
+    return Math.max(tokenScore, edgeScore);
+  }
+
+  const charScore = commonSubsequenceRatio(oldTrimmed, newTrimmed);
+  return Math.max(charScore, tokenScore, edgeScore);
+}
+
+function commonSubsequenceRatio(oldText, newText) {
+  const commonLength = commonSubsequenceLength(oldText, newText);
+  return commonLength / Math.min(oldText.length, newText.length);
+}
+
+function tokenSimilarity(oldText, newText) {
+  const oldTokens = diffTokens(oldText);
+  const newTokens = diffTokens(newText);
+  if (!oldTokens.length || !newTokens.length) {
+    return 0;
+  }
+  const counts = new Map();
+  for (const token of oldTokens) {
+    counts.set(token, (counts.get(token) || 0) + 1);
+  }
+  let shared = 0;
+  for (const token of newTokens) {
+    const count = counts.get(token) || 0;
+    if (count > 0) {
+      shared += 1;
+      counts.set(token, count - 1);
+    }
+  }
+  return (2 * shared) / (oldTokens.length + newTokens.length);
+}
+
+function diffTokens(value) {
+  return String(value).match(/[A-Za-z0-9_$]+|[^\sA-Za-z0-9_$]+/g) || [];
 }
 
 function intralineDiffRanges(oldText, newText) {
@@ -3970,16 +4064,9 @@ function intralineDiffRanges(oldText, newText) {
 
   const oldLength = oldText.length;
   const newLength = newText.length;
-  const table = Array.from(
-    { length: oldLength + 1 },
-    () => new Uint16Array(newLength + 1)
-  );
-  for (let oldIndex = oldLength - 1; oldIndex >= 0; oldIndex -= 1) {
-    for (let newIndex = newLength - 1; newIndex >= 0; newIndex -= 1) {
-      table[oldIndex][newIndex] = oldText[oldIndex] === newText[newIndex]
-        ? table[oldIndex + 1][newIndex + 1] + 1
-        : Math.max(table[oldIndex + 1][newIndex], table[oldIndex][newIndex + 1]);
-    }
+  const table = commonSubsequenceTable(oldText, newText);
+  if (!table) {
+    return prefixSuffixDiffRanges(oldText, newText);
   }
 
   const oldUnchanged = new Array(oldLength).fill(false);
@@ -3999,10 +4086,62 @@ function intralineDiffRanges(oldText, newText) {
     }
   }
 
-  return {
+  const lcsRanges = {
     oldRanges: changedRanges(oldUnchanged),
     newRanges: changedRanges(newUnchanged)
   };
+  const prefixSuffixRanges = prefixSuffixDiffRanges(oldText, newText);
+  const selectedRanges = diffRangeCount(prefixSuffixRanges) <= diffRangeCount(lcsRanges)
+    ? prefixSuffixRanges
+    : lcsRanges;
+  return expandLeadingWordReplacementRanges(oldText, newText, selectedRanges);
+}
+
+function commonSubsequenceLength(oldText, newText) {
+  if (oldText.length * newText.length > MAX_INTRALINE_DIFF_CELLS) {
+    return commonPrefixSuffixLength(oldText, newText);
+  }
+  const table = commonSubsequenceTable(oldText, newText);
+  return table ? table[0][0] : commonPrefixSuffixLength(oldText, newText);
+}
+
+function commonSubsequenceTable(oldText, newText) {
+  const oldLength = oldText.length;
+  const newLength = newText.length;
+  if (oldLength * newLength > MAX_INTRALINE_DIFF_CELLS) {
+    return null;
+  }
+  const table = Array.from({ length: oldLength + 1 }, () => new Uint16Array(newLength + 1));
+  for (let oldIndex = oldLength - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = newLength - 1; newIndex >= 0; newIndex -= 1) {
+      table[oldIndex][newIndex] = oldText[oldIndex] === newText[newIndex]
+        ? table[oldIndex + 1][newIndex + 1] + 1
+        : Math.max(table[oldIndex + 1][newIndex], table[oldIndex][newIndex + 1]);
+    }
+  }
+  return table;
+}
+
+function commonPrefixSuffixLength(oldText, newText) {
+  let prefixLength = 0;
+  while (
+    prefixLength < oldText.length
+    && prefixLength < newText.length
+    && oldText[prefixLength] === newText[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  while (
+    suffixLength < oldText.length - prefixLength
+    && suffixLength < newText.length - prefixLength
+    && oldText[oldText.length - suffixLength - 1] === newText[newText.length - suffixLength - 1]
+  ) {
+    suffixLength += 1;
+  }
+
+  return prefixLength + suffixLength;
 }
 
 function prefixSuffixDiffRanges(oldText, newText) {
@@ -4032,6 +4171,56 @@ function prefixSuffixDiffRanges(oldText, newText) {
       ? [[prefixLength, newText.length - suffixLength]]
       : []
   };
+}
+
+function diffRangeCount(result) {
+  return result.oldRanges.length + result.newRanges.length;
+}
+
+function expandLeadingWordReplacementRanges(oldText, newText, ranges) {
+  if (ranges.oldRanges.length !== 1 || ranges.newRanges.length !== 1) {
+    return ranges;
+  }
+  const [oldStart, oldEnd] = ranges.oldRanges[0];
+  const [newStart, newEnd] = ranges.newRanges[0];
+  if (oldEnd - oldStart <= 2 && newEnd - newStart <= 2) {
+    return ranges;
+  }
+
+  const oldToken = wordTokenContainingRange(oldText, oldStart, oldEnd);
+  const newToken = wordTokenContainingRange(newText, newStart, newEnd);
+  if (!oldToken || !newToken) {
+    return ranges;
+  }
+
+  if (
+    oldStart === oldToken.start
+    && newStart === newToken.start
+    && oldEnd < oldToken.end
+    && newEnd < newToken.end
+  ) {
+    return {
+      oldRanges: [[oldToken.start, oldToken.end]],
+      newRanges: [[newToken.start, newToken.end]]
+    };
+  }
+  return ranges;
+}
+
+function wordTokenContainingRange(text, start, end) {
+  if (start >= end) {
+    return null;
+  }
+  const matcher = /[A-Za-z0-9_$]+/g;
+  let match;
+  while ((match = matcher.exec(text))) {
+    const tokenStart = match.index;
+    const tokenEnd = tokenStart + match[0].length;
+    if (start >= tokenStart && end <= tokenEnd) {
+      return { start: tokenStart, end: tokenEnd };
+    }
+  }
+  return null;
 }
 
 function changedRanges(unchanged) {
