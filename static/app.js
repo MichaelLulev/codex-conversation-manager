@@ -1230,7 +1230,7 @@ function buildMessageUnits(detail, branchGroups, renderRequestId) {
           units.push(rollbackGroupUnit(group));
           renderedMessages += group.length;
         }
-      } else if (message.role === "tool") {
+      } else if (message.role === "tool" && !shouldUseDiffOnlyView(message)) {
         pendingToolRun.push({ message, index });
         renderedMessages += 1;
       } else {
@@ -2514,7 +2514,7 @@ async function applyConversationSearchOnMainThread(requestId, query, lowerQuery)
     if (!isMessageSearchVisible(message)) {
       continue;
     }
-    const lowerText = cachedLowerSearchText(message);
+    const lowerText = cachedLowerSearchText(message, messageViewText(message));
     const count = countSearchOccurrences(lowerText, lowerQuery);
     if (count > 0) {
       matchGroups.push({ messageIndex, count });
@@ -2599,7 +2599,7 @@ async function rebuildSearchWorkerIndex() {
     }
     records.push({
       messageIndex,
-      text: message.text || ""
+      text: messageViewText(message)
     });
     if (records.length >= 80) {
       worker.postMessage({ type: "append", revision, records });
@@ -2654,10 +2654,12 @@ function handleSearchWorkerMessage(event) {
 }
 
 function isMessageVisibleByFilter(message) {
+  return isPrimaryMessageVisibleByFilter(message)
+    || (messageContainsDiff(message) && state.messageFilters.diff !== false);
+}
+
+function isPrimaryMessageVisibleByFilter(message) {
   const key = messageFilterKey(message);
-  if (messageContainsDiff(message) && state.messageFilters.diff !== false) {
-    return true;
-  }
   if (message?.role === "assistant") {
     if (key !== "assistant" && state.messageFilters[key] === false) {
       return false;
@@ -2675,8 +2677,20 @@ function isMessageSearchVisible(message) {
   return isMessageVisibleByFilter(message);
 }
 
-function cachedLowerSearchText(message) {
-  const textValue = message?.text || "";
+function messageViewText(message) {
+  if (shouldUseDiffOnlyView(message)) {
+    return diffOnlyMarkdown(message?.text || "");
+  }
+  return message?.text || "";
+}
+
+function shouldUseDiffOnlyView(message) {
+  return messageContainsDiff(message)
+    && state.messageFilters.diff !== false
+    && !isPrimaryMessageVisibleByFilter(message);
+}
+
+function cachedLowerSearchText(message, textValue = message?.text || "") {
   const cached = SEARCH_TEXT_CACHE.get(message);
   if (cached && cached.text === textValue) {
     return cached.lowerText;
@@ -2898,8 +2912,9 @@ function renderMessage(message, index = 0, options = {}) {
   wrapper.className = `message ${message.role}${message.rolled_back ? " rolled-back" : ""}`;
   wrapper.dataset.filterKey = messageFilterKeys(message).join(" ");
   wrapper.dataset.messageIndex = String(index);
+  const bodyRenderMode = shouldUseDiffOnlyView(message) ? "diffs" : "full";
   const collapseRolledBack = message.rolled_back && !options.insideRollbackGroup;
-  const isCollapsible = COLLAPSED_MESSAGE_ROLES.has(message.role) || collapseRolledBack;
+  const isCollapsible = bodyRenderMode !== "diffs" && (COLLAPSED_MESSAGE_ROLES.has(message.role) || collapseRolledBack);
   const shouldLazyRenderBody = isCollapsible;
   const isExpanded = isCollapsible && state.expandedMessages.has(index);
   if (isCollapsible && !isExpanded) {
@@ -2957,6 +2972,7 @@ function renderMessage(message, index = 0, options = {}) {
     if (shouldLazyRenderBody) {
       wrapper.dataset.bodyId = bodyId;
       wrapper.__messageText = message.text || "";
+      wrapper.__messageRenderMode = bodyRenderMode;
     }
     roleElement.addEventListener("click", () => {
       body = body || ensureLazyMessageBody(wrapper);
@@ -2977,11 +2993,11 @@ function renderMessage(message, index = 0, options = {}) {
       body.id = bodyId;
       body.dataset.rendered = "false";
       body.__messageText = message.text || "";
+      body.__messageRenderMode = bodyRenderMode;
       ensureMessageBodyRendered(body);
       body.hidden = !isExpanded;
     } else {
-      setAutoDirection(body, message.text || "");
-      body.appendChild(renderFormattedText(message.text || ""));
+      renderMessageBodyContent(body, message.text || "", bodyRenderMode);
     }
   }
 
@@ -3639,6 +3655,7 @@ function ensureLazyMessageBody(wrapper) {
   body.hidden = true;
   body.dataset.rendered = "false";
   body.__messageText = wrapper.__messageText || "";
+  body.__messageRenderMode = wrapper.__messageRenderMode || "full";
   wrapper.appendChild(body);
   return body;
 }
@@ -3669,9 +3686,19 @@ function ensureMessageBodyRendered(body) {
     return;
   }
   const value = body.__messageText || "";
-  setAutoDirection(body, value);
-  body.replaceChildren(renderFormattedText(value));
+  renderMessageBodyContent(body, value, body.__messageRenderMode || "full");
   body.dataset.rendered = "true";
+}
+
+function renderMessageBodyContent(body, value, renderMode = "full") {
+  const textValue = String(value || "");
+  const visibleValue = renderMode === "diffs" ? diffOnlyMarkdown(textValue) : textValue;
+  setAutoDirection(body, visibleValue);
+  body.replaceChildren(
+    renderMode === "diffs"
+      ? renderDiffOnlyText(textValue)
+      : renderFormattedText(textValue)
+  );
 }
 
 function collapsedMessageHeading(value) {
@@ -3875,6 +3902,63 @@ function renderLongPlainText(value) {
   wrapper.className = "long-message-text";
   wrapper.textContent = String(value);
   return wrapper;
+}
+
+function renderDiffOnlyText(value) {
+  const fragment = document.createDocumentFragment();
+  for (const block of extractDiffCodeBlocks(value)) {
+    fragment.appendChild(renderDiffBlock(block.code, block.language));
+  }
+  if (!fragment.childNodes.length) {
+    fragment.appendChild(document.createTextNode(""));
+  }
+  return fragment;
+}
+
+function diffOnlyMarkdown(value) {
+  return extractDiffCodeBlocks(value)
+    .map((block) => markdownCodeBlock(block.code, block.language))
+    .join("\n\n");
+}
+
+function extractDiffCodeBlocks(value) {
+  const lines = String(value || "").replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  let index = 0;
+  while (index < lines.length) {
+    const fence = lines[index].match(/^(`{3,})([A-Za-z0-9_.+-]*)\s*$/);
+    if (!fence) {
+      index += 1;
+      continue;
+    }
+    const language = fence[2] || "";
+    const codeLines = [];
+    const closeFence = new RegExp(`^\`{${fence[1].length},}\\s*$`);
+    index += 1;
+    while (index < lines.length && !closeFence.test(lines[index])) {
+      codeLines.push(lines[index]);
+      index += 1;
+    }
+    if (index < lines.length) {
+      index += 1;
+    }
+    if (isDiffLanguage(language)) {
+      blocks.push({ code: codeLines.join("\n"), language });
+    }
+  }
+  return blocks;
+}
+
+function markdownCodeBlock(value, language = "") {
+  const textValue = String(value || "");
+  const fence = markdownCodeFence(textValue);
+  return `${fence}${language || ""}\n${textValue}\n${fence}`;
+}
+
+function markdownCodeFence(value) {
+  const runs = String(value || "").match(/`+/g) || [];
+  const longestRun = runs.reduce((max, run) => Math.max(max, run.length), 0);
+  return "`".repeat(Math.max(3, longestRun + 1));
 }
 
 function appendFormattedLines(parent, lines, options = {}) {
@@ -5399,6 +5483,7 @@ function currentFilteredExportThread(options = {}) {
 
 function exportMessageObject(message, options = {}) {
   const exported = { ...message };
+  exported.text = messageViewText(message);
   delete exported.__finalAssistantReply;
   if (message?.role === "assistant") {
     exported.assistant_stage = assistantStage(message);

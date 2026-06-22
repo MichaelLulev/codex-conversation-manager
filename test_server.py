@@ -235,6 +235,42 @@ class PatchDiffTests(unittest.TestCase):
 
         self.assertEqual(server.message_filter_keys(message), {"assistant"})
 
+    def test_diff_only_markdown_extracts_only_diff_fences(self):
+        text = "\n".join(
+            [
+                "**Patch Applied**",
+                "Changed Files:",
+                "```json",
+                '{"path": "example.py"}',
+                "```",
+                "",
+                "```diff",
+                "-old",
+                "+new",
+                "```",
+                "",
+                "Stdout: ok",
+            ]
+        )
+
+        self.assertEqual(server.diff_only_markdown(text), "```diff\n-old\n+new\n```")
+
+    def test_message_text_for_diff_filter_uses_only_diff_text(self):
+        message = server.Message(
+            role="event",
+            text="Metadata should be hidden.\n\n```diff\n-old\n+new\n```",
+            timestamp=None,
+            time=None,
+            source="test",
+            phase="patch",
+        )
+
+        self.assertEqual(
+            server.message_text_for_filters(message, {"diff"}),
+            "```diff\n-old\n+new\n```",
+        )
+        self.assertEqual(server.message_text_for_filters(message, {"patch"}), message.text)
+
 
 def create_state_db(home: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(home / "state_5.sqlite")

@@ -1142,9 +1142,10 @@ class SideConversationReader:
         match_groups: list[dict[str, int]] = []
         total_matches = 0
         for index, message in enumerate(messages):
-            if filters is not None and message_filter_keys(message).isdisjoint(filters):
+            search_text = message_text_for_filters(message, filters)
+            if search_text is None:
                 continue
-            count = count_occurrences(message.text.lower(), lower_query)
+            count = count_occurrences(search_text.lower(), lower_query)
             if count > 0:
                 match_groups.append({"messageIndex": index, "count": count})
                 total_matches += count
@@ -3688,8 +3689,52 @@ def message_filter_keys(message: Message) -> set[str]:
     return keys
 
 
+def message_text_for_filters(message: Message, filters: set[str] | None) -> str | None:
+    if filters is None:
+        return message.text
+    if message_filter_keys(message).isdisjoint(filters):
+        return None
+    if should_use_diff_only_text(message, filters):
+        return diff_only_markdown(message.text)
+    return message.text
+
+
+def should_use_diff_only_text(message: Message, filters: set[str]) -> bool:
+    return "diff" in filters and message_filter_key(message) not in filters and message_contains_diff(message)
+
+
 def message_contains_diff(message: Message) -> bool:
     return bool(DIFF_BLOCK_RE.search(message.text or ""))
+
+
+def diff_only_markdown(value: str) -> str:
+    return "\n\n".join(
+        markdown_code_block(block_text, language)
+        for block_text, language in extract_diff_code_blocks(value)
+    )
+
+
+def extract_diff_code_blocks(value: str) -> list[tuple[str, str]]:
+    lines = str(value or "").replace("\r\n", "\n").split("\n")
+    blocks: list[tuple[str, str]] = []
+    index = 0
+    while index < len(lines):
+        fence = re.match(r"^(`{3,})([A-Za-z0-9_.+-]*)\s*$", lines[index])
+        if not fence:
+            index += 1
+            continue
+        language = fence.group(2) or ""
+        code_lines: list[str] = []
+        close_fence = re.compile(rf"^`{{{len(fence.group(1))},}}\s*$")
+        index += 1
+        while index < len(lines) and not close_fence.match(lines[index]):
+            code_lines.append(lines[index])
+            index += 1
+        if index < len(lines):
+            index += 1
+        if language.lower() in {"diff", "patch"}:
+            blocks.append(("\n".join(code_lines), language))
+    return blocks
 
 
 def normalize_search_query(value: str) -> str:
