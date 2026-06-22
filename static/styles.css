@@ -1605,6 +1605,24 @@ button:disabled {
   color: #d9e5e2;
 }
 
+.diff-gap {
+  min-height: 0.85em;
+  color: rgba(184, 200, 198, 0.54);
+}
+
+.diff-gap .diff-line-text {
+  position: relative;
+}
+
+.diff-gap .diff-line-text::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 8px;
+  width: 12ch;
+  border-top: 1px solid rgba(184, 200, 198, 0.16);
+}
+
 .diff-inline-change {
   border-radius: 3px;
   padding: 0 1px;

@@ -3998,19 +3998,83 @@ function renderDiffCodeLines(code, codeText) {
     });
   }
   annotateIntralineDiffs(entries);
+  let previousPosition = null;
   for (const entry of entries) {
     if (entry.skip) {
       continue;
     }
     if (entry.combined) {
-      code.appendChild(renderCombinedDiffLine(entry.combined));
+      previousPosition = appendDiffEntryWithGap(
+        code,
+        renderCombinedDiffLine(entry.combined),
+        combinedDiffPosition(entry.combined),
+        previousPosition
+      );
       continue;
     }
     if (!shouldRenderCleanDiffEntry(entry)) {
       continue;
     }
-    code.appendChild(renderDiffLine(entry.text, entry.lineClass, entry.lineNumber, entry.ranges));
+    previousPosition = appendDiffEntryWithGap(
+      code,
+      renderDiffLine(entry.text, entry.lineClass, entry.lineNumber, entry.ranges),
+      diffEntryPosition(entry),
+      previousPosition
+    );
   }
+}
+
+function appendDiffEntryWithGap(code, element, position, previousPosition) {
+  if (shouldInsertDiffGap(previousPosition, position)) {
+    code.appendChild(renderDiffGap());
+  }
+  code.appendChild(element);
+  return position || previousPosition;
+}
+
+function shouldInsertDiffGap(previousPosition, position) {
+  if (!previousPosition || !position) {
+    return false;
+  }
+  const oldGap = lineGap(previousPosition.oldLine, position.oldLine);
+  const newGap = lineGap(previousPosition.newLine, position.newLine);
+  return oldGap > 1 || newGap > 1;
+}
+
+function lineGap(previousLine, currentLine) {
+  if (!Number.isInteger(previousLine) || !Number.isInteger(currentLine)) {
+    return 0;
+  }
+  return currentLine - previousLine;
+}
+
+function diffEntryPosition(entry) {
+  const lineNumber = Number(entry.lineNumber);
+  if (!Number.isInteger(lineNumber)) {
+    return null;
+  }
+  if (entry.lineClass === "diff-line-del") {
+    return { oldLine: lineNumber, newLine: null };
+  }
+  if (entry.lineClass === "diff-line-add") {
+    return { oldLine: null, newLine: lineNumber };
+  }
+  if (entry.lineClass === "diff-line-context") {
+    return { oldLine: lineNumber, newLine: lineNumber };
+  }
+  return null;
+}
+
+function combinedDiffPosition(change) {
+  return {
+    oldLine: numericDiffLine(change.oldLineNumber),
+    newLine: numericDiffLine(change.newLineNumber)
+  };
+}
+
+function numericDiffLine(value) {
+  const line = Number(value);
+  return Number.isInteger(line) ? line : null;
 }
 
 function appendDiffFileLabel(entries, filePath, previousFileLabel) {
@@ -4485,6 +4549,17 @@ function appendCombinedDiffText(parent, parts) {
     mark.textContent = part.text;
     parent.appendChild(mark);
   }
+}
+
+function renderDiffGap() {
+  const span = document.createElement("span");
+  span.className = "diff-line diff-gap";
+  span.dataset.line = "";
+  const text = document.createElement("span");
+  text.className = "diff-line-text";
+  text.textContent = "";
+  span.appendChild(text);
+  return span;
 }
 
 function renderDiffLine(line, lineClass, lineNumber, ranges = []) {
