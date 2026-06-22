@@ -212,6 +212,29 @@ class PatchDiffTests(unittest.TestCase):
         self.assertIn("+++ /dev/null", diff)
         self.assertIn("-gone", diff)
 
+    def test_diff_filter_key_is_additive(self):
+        message = server.Message(
+            role="assistant",
+            text="Here is the change:\n\n```diff\n-old\n+new\n```",
+            timestamp=None,
+            time=None,
+            source="test",
+        )
+
+        self.assertEqual(server.message_filter_key(message), "assistant")
+        self.assertEqual(server.message_filter_keys(message), {"assistant", "diff"})
+
+    def test_diff_filter_key_ignores_plain_plus_minus_text(self):
+        message = server.Message(
+            role="assistant",
+            text="Use + to add and - to subtract.",
+            timestamp=None,
+            time=None,
+            source="test",
+        )
+
+        self.assertEqual(server.message_filter_keys(message), {"assistant"})
+
 
 def create_state_db(home: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(home / "state_5.sqlite")

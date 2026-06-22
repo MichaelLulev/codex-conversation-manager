@@ -40,6 +40,7 @@ const SEARCH_WORKER_URL = "/static/search-worker.js";
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
 const SEARCH_TEXT_CACHE = new WeakMap();
 const MESSAGE_FILTER_STORAGE_KEY = "codex-reader-message-filters";
+const DIFF_BLOCK_PATTERN = /^`{3,}(diff|patch)\s*$/im;
 const MESSAGE_FILTER_DESCRIPTIONS = {
   user: "Your prompts and messages.",
   assistant: "The final assistant message in each reply.",
@@ -49,7 +50,8 @@ const MESSAGE_FILTER_DESCRIPTIONS = {
   rolledBack: "Messages from turns removed with Esc Esc rollback/undo. Codex still keeps them in the raw transcript.",
   important: "Errors, aborted turns, and rollback markers.",
   compaction: "Context-compaction events and replacement summaries.",
-  patch: "Patch summaries, changed-file metadata, and recovered diffs.",
+  patch: "Patch summaries and changed-file metadata.",
+  diff: "Messages containing rendered diff blocks. Use None, then Diffs, to show only diffs.",
   search: "Saved web-search call and completion metadata.",
   image: "Image-generation metadata, prompts, and saved image paths.",
   response: "Response status, model, token usage, and error/incomplete details.",
@@ -70,6 +72,7 @@ const MESSAGE_FILTERS = [
   { key: "important", label: "Important events", defaultEnabled: true },
   { key: "compaction", label: "Compactions", defaultEnabled: true },
   { key: "patch", label: "Patches", defaultEnabled: false },
+  { key: "diff", label: "Diffs", defaultEnabled: false },
   { key: "search", label: "Search events", defaultEnabled: false },
   { key: "image", label: "Images", defaultEnabled: false },
   { key: "response", label: "Response stats", defaultEnabled: false },
@@ -2652,6 +2655,9 @@ function handleSearchWorkerMessage(event) {
 
 function isMessageVisibleByFilter(message) {
   const key = messageFilterKey(message);
+  if (messageContainsDiff(message) && state.messageFilters.diff !== false) {
+    return true;
+  }
   if (message?.role === "assistant") {
     if (key !== "assistant" && state.messageFilters[key] === false) {
       return false;
@@ -2890,7 +2896,7 @@ function scrollElementHorizontallyIntoView(element) {
 function renderMessage(message, index = 0, options = {}) {
   const wrapper = document.createElement("section");
   wrapper.className = `message ${message.role}${message.rolled_back ? " rolled-back" : ""}`;
-  wrapper.dataset.filterKey = messageFilterKey(message);
+  wrapper.dataset.filterKey = messageFilterKeys(message).join(" ");
   wrapper.dataset.messageIndex = String(index);
   const collapseRolledBack = message.rolled_back && !options.insideRollbackGroup;
   const isCollapsible = COLLAPSED_MESSAGE_ROLES.has(message.role) || collapseRolledBack;
@@ -3593,6 +3599,18 @@ function messageFilterKey(message) {
   if (phase === "turn") return "turn";
   if (phase === "usage") return "usage";
   return "otherEvent";
+}
+
+function messageFilterKeys(message) {
+  const keys = [messageFilterKey(message)];
+  if (messageContainsDiff(message)) {
+    keys.push("diff");
+  }
+  return [...new Set(keys)];
+}
+
+function messageContainsDiff(message) {
+  return DIFF_BLOCK_PATTERN.test(String(message?.text || ""));
 }
 
 function updateMessageCount(visible, total) {

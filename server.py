@@ -43,6 +43,7 @@ SQLITE_OPEN_ATTEMPTS = 5
 SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
 DUPLICATE_MESSAGE_WINDOW_SECONDS = 0.05
+DIFF_BLOCK_RE = re.compile(r"^`{3,}(?:diff|patch)\s*$", re.IGNORECASE | re.MULTILINE)
 ASK_CODEX_MAX_QUESTION_CHARS = 8000
 ASK_CODEX_MAX_HISTORY_CHARS = 20000
 ASK_CODEX_TIMEOUT_SECONDS = 300
@@ -1141,7 +1142,7 @@ class SideConversationReader:
         match_groups: list[dict[str, int]] = []
         total_matches = 0
         for index, message in enumerate(messages):
-            if filters is not None and message_filter_key(message) not in filters:
+            if filters is not None and message_filter_keys(message).isdisjoint(filters):
                 continue
             count = count_occurrences(message.text.lower(), lower_query)
             if count > 0:
@@ -3678,6 +3679,17 @@ def message_filter_key(message: Message) -> str:
     }:
         return phase
     return "otherEvent"
+
+
+def message_filter_keys(message: Message) -> set[str]:
+    keys = {message_filter_key(message)}
+    if message_contains_diff(message):
+        keys.add("diff")
+    return keys
+
+
+def message_contains_diff(message: Message) -> bool:
+    return bool(DIFF_BLOCK_RE.search(message.text or ""))
 
 
 def normalize_search_query(value: str) -> str:
