@@ -3879,6 +3879,10 @@ function isBlockStart(line, lines = [], index = 0) {
 }
 
 function renderCodeBlock(codeText, language) {
+  if (isDiffLanguage(language)) {
+    return renderDiffBlock(codeText, language);
+  }
+
   const pre = document.createElement("pre");
   pre.dir = "ltr";
   const code = document.createElement("code");
@@ -3886,12 +3890,7 @@ function renderCodeBlock(codeText, language) {
   if (language) {
     code.dataset.language = language;
   }
-  if (isDiffLanguage(language)) {
-    code.className = "diff-code";
-    renderDiffCodeLines(code, codeText);
-  } else {
-    code.textContent = codeText;
-  }
+  code.textContent = codeText;
   pre.appendChild(code);
   return pre;
 }
@@ -3899,6 +3898,49 @@ function renderCodeBlock(codeText, language) {
 function isDiffLanguage(language) {
   const normalized = String(language || "").toLowerCase();
   return normalized === "diff" || normalized === "patch";
+}
+
+function renderDiffBlock(codeText, language) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "diff-view";
+
+  const pre = document.createElement("pre");
+  pre.dir = "ltr";
+  const code = document.createElement("code");
+  code.dir = "ltr";
+  code.className = "diff-code";
+  if (language) {
+    code.dataset.language = language;
+  }
+  renderDiffCodeLines(code, codeText);
+  pre.appendChild(code);
+  wrapper.appendChild(pre);
+
+  const raw = renderRawDiffDetails(codeText);
+  if (raw) {
+    wrapper.appendChild(raw);
+  }
+  return wrapper;
+}
+
+function renderRawDiffDetails(codeText) {
+  const normalized = String(codeText || "");
+  if (!normalized.trim()) {
+    return null;
+  }
+
+  const details = document.createElement("details");
+  details.className = "diff-raw";
+  const summary = document.createElement("summary");
+  summary.textContent = "Raw diff";
+  const pre = document.createElement("pre");
+  pre.dir = "ltr";
+  const code = document.createElement("code");
+  code.dir = "ltr";
+  code.textContent = normalized;
+  pre.appendChild(code);
+  details.append(summary, pre);
+  return details;
 }
 
 function renderDiffCodeLines(code, codeText) {
@@ -3909,8 +3951,25 @@ function renderDiffCodeLines(code, codeText) {
   const entries = [];
   let oldLineNumber = null;
   let newLineNumber = null;
+  let previousFileLabel = "";
+  let pendingOldFilePath = "";
   for (const line of lines) {
     const lineClass = diffLineClass(line);
+    if (lineClass === "diff-line-file") {
+      if (line.startsWith("--- ")) {
+        pendingOldFilePath = cleanDiffPath(line.slice(4));
+      } else if (line.startsWith("+++ ")) {
+        const newFilePath = cleanDiffPath(line.slice(4));
+        const filePath = newFilePath === "/dev/null" ? pendingOldFilePath : newFilePath;
+        previousFileLabel = appendDiffFileLabel(entries, filePath, previousFileLabel);
+      }
+    } else if (lineClass === "diff-line-header") {
+      previousFileLabel = appendDiffFileLabel(
+        entries,
+        diffHeaderFilePath(line),
+        previousFileLabel
+      );
+    }
     const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     let lineNumber = "";
     if (hunk) {
@@ -3929,7 +3988,13 @@ function renderDiffCodeLines(code, codeText) {
         newLineNumber += 1;
       }
     }
-    entries.push({ line, lineClass, lineNumber, ranges: [] });
+    entries.push({
+      line,
+      text: cleanDiffLineText(line, lineClass),
+      lineClass,
+      lineNumber,
+      ranges: []
+    });
   }
   annotateIntralineDiffs(entries);
   for (const entry of entries) {
@@ -3940,8 +4005,62 @@ function renderDiffCodeLines(code, codeText) {
       code.appendChild(renderCombinedDiffLine(entry.combined));
       continue;
     }
-    code.appendChild(renderDiffLine(entry.line, entry.lineClass, entry.lineNumber, entry.ranges));
+    if (!shouldRenderCleanDiffEntry(entry)) {
+      continue;
+    }
+    code.appendChild(renderDiffLine(entry.text, entry.lineClass, entry.lineNumber, entry.ranges));
   }
+}
+
+function appendDiffFileLabel(entries, filePath, previousFileLabel) {
+  const label = cleanDiffPath(filePath);
+  if (!label || label === "/dev/null" || label === previousFileLabel) {
+    return previousFileLabel;
+  }
+  entries.push({
+    line: label,
+    text: label,
+    lineClass: "diff-file-label",
+    lineNumber: "",
+    ranges: []
+  });
+  return label;
+}
+
+function diffHeaderFilePath(line) {
+  const match = line.match(/^diff --git\s+a\/(.+)\s+b\/(.+)$/);
+  return match ? match[2] : "";
+}
+
+function cleanDiffPath(value) {
+  const path = String(value || "").trim().split(/\t/)[0];
+  if ((path.startsWith("a/") || path.startsWith("b/")) && path.length > 2) {
+    return path.slice(2);
+  }
+  return path;
+}
+
+function cleanDiffLineText(line, lineClass) {
+  if (
+    (lineClass === "diff-line-add" || lineClass === "diff-line-del")
+    && (line.startsWith("+") || line.startsWith("-"))
+  ) {
+    return line.slice(1);
+  }
+  if (lineClass === "diff-line-context" && line.startsWith(" ")) {
+    return line.slice(1);
+  }
+  return line;
+}
+
+function shouldRenderCleanDiffEntry(entry) {
+  return ![
+    "diff-line-header",
+    "diff-line-meta",
+    "diff-line-note",
+    "diff-line-hunk",
+    "diff-line-file"
+  ].includes(entry.lineClass);
 }
 
 function annotateIntralineDiffs(entries) {
@@ -3964,8 +4083,8 @@ function annotateIntralineDiffs(entries) {
       entries.slice(addStart, index)
     );
     for (const [deleted, added] of pairs) {
-      const oldText = deleted.line.slice(1);
-      const newText = added.line.slice(1);
+      const oldText = deleted.text;
+      const newText = added.text;
       const combinedParts = combinedDiffParts(oldText, newText);
       if (combinedParts) {
         deleted.skip = true;
@@ -3976,8 +4095,8 @@ function annotateIntralineDiffs(entries) {
         };
       } else {
         const ranges = intralineDiffRanges(oldText, newText);
-        deleted.ranges = offsetRanges(ranges.oldRanges, 1);
-        added.ranges = offsetRanges(ranges.newRanges, 1);
+        deleted.ranges = ranges.oldRanges;
+        added.ranges = ranges.newRanges;
       }
     }
   }
@@ -3987,7 +4106,7 @@ function similarDiffLinePairs(deletedLines, addedLines) {
   const candidates = [];
   for (const deleted of deletedLines) {
     for (const added of addedLines) {
-      const score = diffLineSimilarity(deleted.line.slice(1), added.line.slice(1));
+      const score = diffLineSimilarity(deleted.text, added.text);
       if (score >= MIN_INTRALINE_PAIR_SCORE) {
         candidates.push({ deleted, added, score });
       }
@@ -4330,10 +4449,6 @@ function changedRanges(unchanged) {
     }
   }
   return ranges;
-}
-
-function offsetRanges(ranges, offset) {
-  return ranges.map(([start, end]) => [start + offset, end + offset]);
 }
 
 function renderCombinedDiffLine(change) {

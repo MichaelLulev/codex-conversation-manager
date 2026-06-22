@@ -1501,9 +1501,54 @@ button:disabled {
   min-width: max-content;
 }
 
+.diff-view {
+  margin: var(--space-sm) 0;
+}
+
+.message-body .diff-view > pre {
+  margin: 0;
+}
+
+.diff-raw {
+  margin-top: var(--space-xs);
+}
+
+.diff-raw > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 2px 8px;
+  border: 1px solid rgba(83, 98, 103, 0.2);
+  border-radius: 4px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.diff-raw > summary::-webkit-details-marker {
+  display: none;
+}
+
+.diff-raw > summary::before {
+  content: "+";
+  width: 1ch;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.diff-raw[open] > summary::before {
+  content: "-";
+}
+
+.message-body .diff-raw > pre {
+  max-height: min(360px, 48vh);
+  margin: var(--space-xs) 0 0;
+}
+
 .diff-line {
   display: grid;
-  grid-template-columns: 6ch max-content;
+  grid-template-columns: minmax(6ch, max-content) max-content;
   column-gap: 0;
   min-height: 1.45em;
   padding: 0 4px 0 0;
@@ -1538,6 +1583,12 @@ button:disabled {
 
 .diff-line-hunk {
   color: #ffd37a;
+}
+
+.diff-file-label {
+  background: rgba(155, 221, 224, 0.1);
+  color: #9bdde0;
+  font-weight: 700;
 }
 
 .diff-line-add {
