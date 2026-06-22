@@ -3748,16 +3748,17 @@ function renderFormattedText(value, options = {}) {
       continue;
     }
 
-    const fence = line.match(/^```([A-Za-z0-9_.+-]*)\s*$/);
+    const fence = line.match(/^(`{3,})([A-Za-z0-9_.+-]*)\s*$/);
     if (fence) {
       const codeLines = [];
+      const closeFence = new RegExp(`^\`{${fence[1].length},}\\s*$`);
       index += 1;
-      while (index < lines.length && !lines[index].startsWith("```")) {
+      while (index < lines.length && !closeFence.test(lines[index])) {
         codeLines.push(lines[index]);
         index += 1;
       }
       if (index < lines.length) index += 1;
-      fragment.appendChild(renderCodeBlock(codeLines.join("\n"), fence[1]));
+      fragment.appendChild(renderCodeBlock(codeLines.join("\n"), fence[2]));
       continue;
     }
 
@@ -3869,7 +3870,7 @@ function appendFormattedLines(parent, lines, options = {}) {
 }
 
 function isBlockStart(line, lines = [], index = 0) {
-  return /^```/.test(line)
+  return /^`{3,}[A-Za-z0-9_.+-]*\s*$/.test(line)
     || /^(#{1,4})\s+/.test(line)
     || /^\s*[-*+]\s+/.test(line)
     || /^\s*\d+[.)]\s+/.test(line)

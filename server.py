@@ -2354,7 +2354,7 @@ def user_message_text(payload: dict[str, Any]) -> str | None:
     ):
         value = payload.get(key)
         if value:
-            sections.append(f"**{label}**\n```json\n{escape_code_fence(safe_json(value))}\n```")
+            sections.append(f"**{label}**\n{markdown_code_block(safe_json(value), 'json')}")
     if sections:
         return f"{text}\n\n" + "\n\n".join(sections)
     return text
@@ -2366,7 +2366,7 @@ def append_memory_citation(text: str, citation: Any) -> str:
     return (
         f"{text}\n\n"
         "**Memory Citation**\n"
-        f"```json\n{escape_code_fence(safe_json(citation))}\n```"
+        f"{markdown_code_block(safe_json(citation), 'json')}"
     )
 
 
@@ -3062,7 +3062,7 @@ def format_event_text(
         block_text, language = format_event_value(value)
         if len(block) > 2:
             language = block[2]
-        lines.extend(["", f"**{label}**", f"```{language}", escape_code_fence(block_text), "```"])
+        lines.extend(["", f"**{label}**", *markdown_code_block_lines(block_text, language)])
     return "\n".join(lines).strip()
 
 
@@ -3428,7 +3428,7 @@ def format_tool_text(
         lines.append(f"{label}: {value}")
     for label, value in blocks:
         block_text, language = format_tool_value(value)
-        lines.extend(["", f"**{label}**", f"```{language}", escape_code_fence(block_text), "```"])
+        lines.extend(["", f"**{label}**", *markdown_code_block_lines(block_text, language)])
     return "\n".join(lines).strip()
 
 
@@ -3442,7 +3442,7 @@ def format_tool_output_text(title: str, fields: list[tuple[str, Any]], value: An
     metadata_lines, output_text, language = split_tool_output(value)
     if metadata_lines:
         lines.extend(["", "**Run Info**", *metadata_lines])
-    lines.extend(["", "**Output**", f"```{language}", escape_code_fence(output_text), "```"])
+    lines.extend(["", "**Output**", *markdown_code_block_lines(output_text, language)])
     return "\n".join(lines).strip()
 
 
@@ -3523,8 +3523,19 @@ def format_tool_value(value: Any) -> tuple[str, str]:
     return str(value), "text"
 
 
-def escape_code_fence(value: str) -> str:
-    return value.replace("```", "``\\`")
+def markdown_code_block(value: str, language: str = "text") -> str:
+    return "\n".join(markdown_code_block_lines(value, language))
+
+
+def markdown_code_block_lines(value: str, language: str = "text") -> list[str]:
+    fence = markdown_code_fence(value)
+    suffix = language or ""
+    return [f"{fence}{suffix}", value, fence]
+
+
+def markdown_code_fence(value: str) -> str:
+    longest_run = max((len(match.group(0)) for match in re.finditer(r"`+", value)), default=0)
+    return "`" * max(3, longest_run + 1)
 
 
 def response_completed_message(event: dict[str, Any], timestamp: int) -> Message | None:
@@ -3960,7 +3971,7 @@ def response_content_text(content: Any) -> str:
     if attachments:
         parts.append(
             "**Content Attachments**\n"
-            f"```json\n{escape_code_fence(safe_json(attachments))}\n```"
+            f"{markdown_code_block(safe_json(attachments), 'json')}"
         )
     return "\n\n".join(part for part in parts if part.strip()).strip()
 

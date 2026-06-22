@@ -173,6 +173,26 @@ class PatchDiffTests(unittest.TestCase):
         self.assertIn("-old", message.text)
         self.assertIn("+new", message.text)
 
+    def test_patch_apply_message_preserves_nested_code_fences(self):
+        message = server.patch_apply_message(
+            {
+                "type": "patch_apply_end",
+                "status": "completed",
+                "success": True,
+                "changes": {
+                    "/tmp/workflows.md": {
+                        "type": "update",
+                        "unified_diff": "@@ -1,3 +1,3 @@\n ```bash\n-old\n+new\n ```\n",
+                    }
+                },
+            },
+            None,
+        )
+
+        self.assertIn("````diff", message.text)
+        self.assertIn("```bash", message.text)
+        self.assertNotIn("``\\`bash", message.text)
+
     def test_patch_changes_diff_synthesizes_add_and_delete_diffs(self):
         diff = server.patch_changes_diff(
             {
