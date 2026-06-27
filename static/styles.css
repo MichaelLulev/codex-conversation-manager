@@ -18,7 +18,10 @@
   --user: #e3f5f2;
   --assistant: #fff8ed;
   --thread-panel-width: 380px;
+  --thread-panel-min-width: 260px;
   --thread-panel-rail-width: 44px;
+  --thread-panel-resizer-width: 8px;
+  --reader-panel-min-width: 640px;
   --space: 8px;
   --space-sm: 8px;
   --space-xs: 8px;
@@ -186,7 +189,16 @@ button:disabled {
   min-height: 0;
   overflow: hidden;
   display: grid;
-  grid-template-columns: minmax(260px, var(--thread-panel-width)) 8px minmax(0, 1fr);
+  grid-template-columns:
+    minmax(
+      var(--thread-panel-min-width),
+      min(
+        var(--thread-panel-width),
+        calc(100vw - var(--reader-panel-min-width) - var(--thread-panel-resizer-width))
+      )
+    )
+    var(--thread-panel-resizer-width)
+    minmax(0, 1fr);
   position: relative;
 }
 
@@ -234,7 +246,7 @@ button:disabled {
 }
 
 .thread-panel-resizer {
-  min-width: 8px;
+  min-width: var(--thread-panel-resizer-width);
   min-height: 0;
   cursor: col-resize;
   touch-action: none;
@@ -1943,7 +1955,7 @@ button:disabled {
   color: white;
 }
 
-@media (max-width: 860px) {
+@media (max-width: 908px) {
   .topbar {
     align-items: flex-start;
     flex-direction: column;

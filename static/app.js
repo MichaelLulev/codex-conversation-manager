@@ -45,9 +45,12 @@ const THREAD_PANEL_COLLAPSED_STORAGE_KEY = "codex-reader-thread-panel-collapsed"
 const THREAD_PANEL_DEFAULT_WIDTH = 380;
 const THREAD_PANEL_MIN_WIDTH = 260;
 const THREAD_PANEL_MAX_WIDTH = 640;
-const THREAD_PANEL_MIN_READER_WIDTH = 420;
+const THREAD_PANEL_RESIZER_WIDTH = 8;
+const THREAD_PANEL_MIN_READER_WIDTH = 640;
 const THREAD_PANEL_KEYBOARD_STEP = 24;
-const THREAD_PANEL_STACKED_BREAKPOINT = 860;
+const THREAD_PANEL_STACKED_BREAKPOINT = THREAD_PANEL_MIN_WIDTH
+  + THREAD_PANEL_RESIZER_WIDTH
+  + THREAD_PANEL_MIN_READER_WIDTH;
 const DIFF_BLOCK_PATTERN = /^`{3,}(diff|patch)\s*$/im;
 const MESSAGE_FILTER_DESCRIPTIONS = {
   user: "Your prompts and messages.",
@@ -591,7 +594,7 @@ function threadPanelMaxWidth() {
   }
   return Math.max(
     THREAD_PANEL_MIN_WIDTH,
-    Math.min(THREAD_PANEL_MAX_WIDTH, viewportWidth - THREAD_PANEL_MIN_READER_WIDTH)
+    Math.min(THREAD_PANEL_MAX_WIDTH, viewportWidth - THREAD_PANEL_MIN_READER_WIDTH - THREAD_PANEL_RESIZER_WIDTH)
   );
 }
 
@@ -605,7 +608,6 @@ function clampThreadPanelWidth(value) {
 
 function applyThreadPanelLayout() {
   const width = clampThreadPanelWidth(state.threadPanel.width);
-  state.threadPanel.width = width;
   document.documentElement.style.setProperty("--thread-panel-width", `${Math.round(width)}px`);
   els.layout.classList.toggle("thread-panel-collapsed", state.threadPanel.collapsed);
   els.threadPanelToggle.textContent = state.threadPanel.collapsed ? ">" : "<";
@@ -647,7 +649,7 @@ function installThreadPanelControls() {
   els.threadPanelResizer.addEventListener("pointerdown", startThreadPanelResize);
   els.threadPanelResizer.addEventListener("keydown", handleThreadPanelResizerKeydown);
   window.addEventListener("resize", () => {
-    setThreadPanelWidth(state.threadPanel.width, { save: false });
+    applyThreadPanelLayout();
   });
 }
 
