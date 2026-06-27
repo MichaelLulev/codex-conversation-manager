@@ -471,7 +471,9 @@ function clearMessagesFrameSyncTimers() {
   state.messagesFrameSyncPending = false;
 }
 
-function syncMessagesFrameViewport() {
+function syncMessagesFrameViewport(options = {}) {
+  const syncDocument = options.syncDocument !== false;
+  const materialize = options.materialize !== false;
   const frame = els.messagesFrame;
   const root = els.messages;
   const doc = els.messagesDocument;
@@ -498,7 +500,10 @@ function syncMessagesFrameViewport() {
     frame.setAttribute("height", String(height));
     changed = true;
   }
-  for (const element of [frame, doc.documentElement, doc.body, root]) {
+  const sizedElements = syncDocument
+    ? [frame, doc.documentElement, doc.body, root]
+    : [frame];
+  for (const element of sizedElements) {
     if (element.style.width !== widthPx) {
       element.style.width = widthPx;
       changed = true;
@@ -508,7 +513,7 @@ function syncMessagesFrameViewport() {
       changed = true;
     }
   }
-  if (changed) {
+  if (changed && materialize) {
     // Force WebKitGTK to materialize the iframe viewport before the next paint.
     void frame.offsetWidth;
     void root.offsetWidth;
@@ -1895,6 +1900,7 @@ function toggleRelatedSection(section, list, toggle) {
 
 function syncConversationChromeResize() {
   syncAskCodexLayout();
+  syncMessagesFrameViewport({ syncDocument: false, materialize: false });
   scheduleMessagesFrameSync({ frames: 3, delays: [80, 240], force: true, afterPaint: true });
 }
 
@@ -1907,6 +1913,27 @@ function syncAskCodexLayout() {
   content.style.maxHeight = "";
   content.style.minHeight = "";
   return false;
+}
+
+function installControlledDetailsToggle(details, onToggle) {
+  const summary = details?.querySelector("summary");
+  if (!details || !summary) {
+    return;
+  }
+  let suppressNativeToggle = false;
+  summary.addEventListener("click", (event) => {
+    event.preventDefault();
+    suppressNativeToggle = true;
+    details.open = !details.open;
+    onToggle();
+  });
+  details.addEventListener("toggle", () => {
+    if (suppressNativeToggle) {
+      suppressNativeToggle = false;
+      return;
+    }
+    onToggle();
+  });
 }
 
 function renderCompactionItem(checkpoint, summary) {
@@ -5985,10 +6012,10 @@ async function init() {
     scheduleConversationSearch({ immediate: true });
     els.conversationSearchInput.focus();
   });
-  els.messageFilters.addEventListener("toggle", () => {
+  installControlledDetailsToggle(els.messageFilters, () => {
     syncConversationChromeResize();
   });
-  els.askCodexPanel.addEventListener("toggle", () => {
+  installControlledDetailsToggle(els.askCodexPanel, () => {
     window.setTimeout(() => updateSelectedTranscriptText(), 0);
     syncConversationChromeResize();
   });
