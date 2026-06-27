@@ -1517,6 +1517,10 @@ button:disabled {
   unicode-bidi: plaintext;
 }
 
+.message-body-lazy {
+  white-space: pre-wrap;
+}
+
 .message-body > *:first-child {
   margin-top: 0;
 }

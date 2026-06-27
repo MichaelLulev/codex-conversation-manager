@@ -3382,7 +3382,7 @@ function renderMessage(message, index = 0, options = {}) {
       body.__messageText = message.text || "";
       body.__messageRenderMode = bodyRenderMode;
       body.classList.add("message-body-lazy");
-      body.style.minHeight = `${estimatedLazyMessageBodyHeight(message.text || "")}px`;
+      renderLazyMessageBodyPreview(body, message.text || "");
       registerLazyMessageBody(body);
     } else {
       renderMessageBodyContent(body, message.text || "", bodyRenderMode);
@@ -4087,16 +4087,14 @@ function setCollapsedMessageExpanded(wrapper, body, toggle, expanded) {
   }
 }
 
-function estimatedLazyMessageBodyHeight(value) {
+function renderLazyMessageBodyPreview(body, value) {
   const textValue = String(value || "");
   if (!textValue) {
-    return 40;
+    body.textContent = "";
+    return;
   }
-  const sample = textValue.slice(0, 12000);
-  const explicitLines = (sample.match(/\n/g) || []).length + 1;
-  const wrappedLines = Math.ceil(Math.min(textValue.length, 24000) / 92);
-  const estimatedLines = Math.max(1, Math.min(28, explicitLines + wrappedLines));
-  return Math.max(44, Math.min(560, 18 + (estimatedLines * 22)));
+  setAutoDirection(body, textValue);
+  body.textContent = textValue;
 }
 
 function ensureMessageBodyRendered(body) {
