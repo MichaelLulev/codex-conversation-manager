@@ -114,6 +114,7 @@ const state = {
   threadSearchTimer: null,
   messagesFrameResizeObserver: null,
   messagesFrameSyncTimers: [],
+  messagesFrameSyncPending: false,
   messagesFrameScrollbarWidth: null,
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
@@ -366,7 +367,7 @@ function setupMessagesFrame() {
   }
   installMessagesSelectionTracking();
   installMessagesFrameResizeSync();
-  scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800] });
+  scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800], force: true });
 }
 
 function installMessagesSelectionTracking() {
@@ -408,19 +409,41 @@ function installMessagesFrameResizeSync() {
   window.addEventListener("blur", () => syncMessagesFrameViewport());
 }
 
-function scheduleMessagesFrameSync({ frames = 2, delays = [] } = {}) {
+function scheduleMessagesFrameSync({ frames = 2, delays = [], force = false } = {}) {
+  if (state.messagesFrameSyncPending && !force) {
+    return;
+  }
   clearMessagesFrameSyncTimers();
-  const runFrame = (remaining) => {
-    syncMessagesFrameViewport();
-    if (remaining > 0) {
-      const id = window.requestAnimationFrame(() => runFrame(remaining - 1));
-      state.messagesFrameSyncTimers.push({ type: "frame", id });
+  state.messagesFrameSyncPending = true;
+  let pendingCallbacks = 0;
+  const finishCallback = () => {
+    pendingCallbacks -= 1;
+    if (pendingCallbacks <= 0) {
+      state.messagesFrameSyncPending = false;
+      state.messagesFrameSyncTimers = [];
     }
   };
-  const frameId = window.requestAnimationFrame(() => runFrame(frames));
-  state.messagesFrameSyncTimers.push({ type: "frame", id: frameId });
+  const queueFrame = (remaining) => {
+    pendingCallbacks += 1;
+    const id = window.requestAnimationFrame(() => {
+      syncMessagesFrameViewport();
+      if (remaining > 0) {
+        queueFrame(remaining - 1);
+      }
+      finishCallback();
+    });
+    state.messagesFrameSyncTimers.push({ type: "frame", id });
+  };
+  const runFrame = (remaining) => {
+    queueFrame(remaining);
+  };
+  runFrame(frames);
   for (const delay of delays) {
-    const id = window.setTimeout(() => syncMessagesFrameViewport(), delay);
+    pendingCallbacks += 1;
+    const id = window.setTimeout(() => {
+      syncMessagesFrameViewport();
+      finishCallback();
+    }, delay);
     state.messagesFrameSyncTimers.push({ type: "timeout", id });
   }
 }
@@ -434,6 +457,7 @@ function clearMessagesFrameSyncTimers() {
     }
   }
   state.messagesFrameSyncTimers = [];
+  state.messagesFrameSyncPending = false;
 }
 
 function syncMessagesFrameViewport() {
@@ -606,7 +630,7 @@ function clampThreadPanelWidth(value) {
   return Math.max(THREAD_PANEL_MIN_WIDTH, Math.min(threadPanelMaxWidth(), width));
 }
 
-function applyThreadPanelLayout() {
+function applyThreadPanelLayout(options = {}) {
   const width = clampThreadPanelWidth(state.threadPanel.width);
   document.documentElement.style.setProperty("--thread-panel-width", `${Math.round(width)}px`);
   els.layout.classList.toggle("thread-panel-collapsed", state.threadPanel.collapsed);
@@ -618,7 +642,13 @@ function applyThreadPanelLayout() {
   els.threadPanelResizer.setAttribute("aria-valuemin", String(THREAD_PANEL_MIN_WIDTH));
   els.threadPanelResizer.setAttribute("aria-valuemax", String(threadPanelMaxWidth()));
   els.threadPanelResizer.setAttribute("aria-valuenow", String(Math.round(width)));
-  scheduleMessagesFrameSync({ frames: 3, delays: [80, 240] });
+  if (options.sync !== false) {
+    scheduleMessagesFrameSync({
+      frames: options.frames ?? 2,
+      delays: options.delays ?? (state.threadPanel.dragging ? [] : [80, 240]),
+      force: options.force === true
+    });
+  }
 }
 
 function setThreadPanelWidth(width, options = {}) {
@@ -626,13 +656,13 @@ function setThreadPanelWidth(width, options = {}) {
   if (options.save !== false) {
     saveThreadPanelWidth();
   }
-  applyThreadPanelLayout();
+  applyThreadPanelLayout(options);
 }
 
 function setThreadPanelCollapsed(collapsed) {
   state.threadPanel.collapsed = Boolean(collapsed);
   saveThreadPanelCollapsed();
-  applyThreadPanelLayout();
+  applyThreadPanelLayout({ force: true });
   if (state.threadPanel.collapsed && els.threadPanel.contains(document.activeElement)) {
     els.threadPanelToggle.focus();
   }
@@ -661,12 +691,12 @@ function startThreadPanelResize(event) {
   state.threadPanel.dragging = true;
   els.threadPanelResizer.classList.add("dragging");
   document.body.classList.add("resizing-thread-panel");
-  updateThreadPanelWidthFromPointer(event, { save: false });
+  updateThreadPanelWidthFromPointer(event, { save: false, sync: false });
 
   const pointerId = event.pointerId;
   const onMove = (moveEvent) => {
     if (moveEvent.pointerId === pointerId) {
-      updateThreadPanelWidthFromPointer(moveEvent, { save: false });
+      updateThreadPanelWidthFromPointer(moveEvent, { save: false, sync: false });
     }
   };
   const onEnd = (endEvent) => {
@@ -677,6 +707,7 @@ function startThreadPanelResize(event) {
     els.threadPanelResizer.classList.remove("dragging");
     document.body.classList.remove("resizing-thread-panel");
     saveThreadPanelWidth();
+    applyThreadPanelLayout({ force: true, frames: 3, delays: [80] });
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onEnd);
     window.removeEventListener("pointercancel", onEnd);
@@ -1366,7 +1397,7 @@ async function renderMessages(detail, branchGroups, renderRequestId) {
   }
   await renderMessageUnits(units, renderRequestId);
   updateMessageCount(renderedMessages, detail.messages.length);
-  scheduleMessagesFrameSync({ frames: 4, delays: [80, 240, 700] });
+  scheduleMessagesFrameSync({ frames: 4, delays: [80, 240, 700], force: true });
   scheduleConversationSearch({ immediate: true });
   scrollToPendingBranch();
 }
@@ -1830,7 +1861,7 @@ function toggleRelatedSection(section, list, toggle) {
 function syncConversationChromeResize() {
   syncAskCodexLayout();
   syncMessagesFrameViewport();
-  scheduleMessagesFrameSync({ frames: 4, delays: [40, 120, 300] });
+  scheduleMessagesFrameSync({ frames: 4, delays: [40, 120, 300], force: true });
 }
 
 function syncAskCodexLayout() {
