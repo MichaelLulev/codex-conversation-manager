@@ -27,6 +27,7 @@ const MAIN_FILTER_LABELS = {
 };
 
 const VIRTUAL_TRANSCRIPT_OVERSCAN_VIEWPORTS = 2.5;
+const VIRTUAL_TRANSCRIPT_DRAG_OVERSCAN_VIEWPORTS = 0.5;
 const VIRTUAL_TRANSCRIPT_MIN_OVERSCAN_PX = 1200;
 const VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT = 148;
 const VIRTUAL_TRANSCRIPT_GAP_PX = 8;
@@ -397,7 +398,7 @@ function emptyVirtualTranscriptState() {
     bottomSpacer: null,
     renderFrame: null,
     renderTimer: null,
-    pendingRenderPreview: false,
+    pendingRenderClamp: false,
     renderMode: "full",
     measureFrame: null,
     resizeObserver: null,
@@ -495,7 +496,7 @@ function handleVirtualTranscriptScroll() {
   const transcript = state.virtualTranscript;
   if (transcript.scrollbarDragActive) {
     transcript.renderAfterScrollbarDrag = true;
-    scheduleVirtualTranscriptRender({ preview: true });
+    scheduleVirtualTranscriptRender({ clamp: true });
     return;
   }
   scheduleVirtualTranscriptRender({ delay: VIRTUAL_TRANSCRIPT_SCROLL_RENDER_IDLE_MS });
@@ -560,7 +561,7 @@ function finishVirtualTranscriptScrollbarDrag() {
 
 function cancelVirtualTranscriptScheduledRender() {
   const transcript = state.virtualTranscript;
-  transcript.pendingRenderPreview = false;
+  transcript.pendingRenderClamp = false;
   if (transcript.renderFrame !== null) {
     window.cancelAnimationFrame(transcript.renderFrame);
     transcript.renderFrame = null;
@@ -2130,19 +2131,19 @@ function scheduleVirtualTranscriptRender(options = {}) {
   }
   if (options.force) {
     cancelVirtualTranscriptScheduledRender();
-    renderVirtualTranscriptWindow({ force: true, preview: options.preview === true });
+    renderVirtualTranscriptWindow({ force: true, clamp: options.clamp === true });
     return;
   }
-  if (options.preview === true) {
-    transcript.pendingRenderPreview = true;
+  if (options.clamp === true) {
+    transcript.pendingRenderClamp = true;
     if (transcript.renderFrame !== null) {
       return;
     }
     transcript.renderFrame = window.requestAnimationFrame(() => {
-      const preview = transcript.pendingRenderPreview;
-      transcript.pendingRenderPreview = false;
+      const clamp = transcript.pendingRenderClamp;
+      transcript.pendingRenderClamp = false;
       transcript.renderFrame = null;
-      renderVirtualTranscriptWindow({ preview });
+      renderVirtualTranscriptWindow({ clamp });
     });
     return;
   }
@@ -2170,7 +2171,7 @@ function scheduleVirtualTranscriptRender(options = {}) {
   }
   transcript.renderFrame = window.requestAnimationFrame(() => {
     transcript.renderFrame = null;
-    renderVirtualTranscriptWindow({ preview: false });
+    renderVirtualTranscriptWindow({ clamp: false });
   });
 }
 
@@ -2186,8 +2187,12 @@ function renderVirtualTranscriptWindow(options = {}) {
     transcript.renderMode = "full";
     return;
   }
+  const clamped = options.clamp === true;
+  const releaseAnchor = !clamped && transcript.renderMode === "clamp"
+    ? captureVirtualScrollAnchor()
+    : null;
   const range = virtualRangeForViewport();
-  const renderMode = options.preview === true ? "preview" : "full";
+  const renderMode = clamped ? "clamp" : "full";
   if (
     !options.force
     && range.start === transcript.range.start
@@ -2202,129 +2207,34 @@ function renderVirtualTranscriptWindow(options = {}) {
   const fragment = document.createDocumentFragment();
   for (let index = range.start; index < range.end; index += 1) {
     const unit = transcript.units[index];
-    const element = options.preview === true
-      ? renderVirtualPreviewUnit(unit, index)
-      : renderUnit(unit);
+    const element = renderUnit(unit);
     element.dataset.virtualUnitIndex = String(index);
     element.dataset.virtualUnitId = unit.id;
+    if (clamped) {
+      element.classList.add("virtual-unit-clamped");
+      element.style.height = `${Math.max(40, Math.round(virtualUnitHeight(index)))}px`;
+      element.style.overflow = "hidden";
+    }
     fragment.appendChild(element);
   }
   transcript.windowElement.replaceChildren(fragment);
   transcript.range = range;
   transcript.renderMode = renderMode;
   updateVirtualTranscriptSpacers(range.start, range.end);
-  if (options.preview === true) {
+  if (clamped) {
     return;
   }
   restoreActiveConversationSearchHighlight();
   observeRenderedVirtualUnits();
-  scheduleVirtualTranscriptMeasure({ resolve: true });
-}
-
-function renderVirtualPreviewUnit(unit, index) {
-  const doc = els.messagesDocument || document;
-  const wrapper = doc.createElement("section");
-  wrapper.className = `virtual-preview-unit ${virtualPreviewUnitClass(unit)}`;
-  wrapper.style.height = `${Math.max(40, Math.round(virtualUnitHeight(index)))}px`;
-
-  const header = doc.createElement("div");
-  header.className = "virtual-preview-header";
-
-  const title = doc.createElement("span");
-  title.className = "virtual-preview-title";
-  title.textContent = virtualPreviewTitle(unit);
-
-  const meta = doc.createElement("span");
-  meta.className = "virtual-preview-meta";
-  meta.textContent = virtualPreviewMeta(unit);
-  header.append(title, meta);
-
-  const body = doc.createElement("div");
-  body.className = "virtual-preview-body";
-  const preview = virtualPreviewText(unit);
-  setAutoDirection(body, preview);
-  body.textContent = preview;
-
-  wrapper.append(header, body);
-  return wrapper;
-}
-
-function virtualPreviewUnitClass(unit) {
-  if (unit.type === "message") {
-    return unit.message?.role || "message";
-  }
-  if (unit.type === "toolRun") return "tool";
-  if (unit.type === "rollbackGroup") return "rolled-back";
-  if (unit.type === "branch") return "branch";
-  if (unit.type === "jumpMarker") return "event";
-  return "message";
-}
-
-function virtualPreviewTitle(unit) {
-  if (unit.type === "message") {
-    return exportRoleLabel(unit.message || {});
-  }
-  if (unit.type === "toolRun") {
-    return "Tools";
-  }
-  if (unit.type === "rollbackGroup") {
-    return "Rollback";
-  }
-  if (unit.type === "branch") {
-    return branchMarkerHeading(unit.branches || []);
-  }
-  if (unit.type === "jumpMarker") {
-    return "Filtered target";
-  }
-  return "Message";
-}
-
-function virtualPreviewMeta(unit) {
-  if (unit.type === "message") {
-    const message = unit.message || {};
-    return [message.time, message.phase].filter(Boolean).join(" | ");
-  }
-  if (unit.type === "toolRun") {
-    return toolRunMeta(unit.run || []);
-  }
-  if (unit.type === "rollbackGroup") {
-    return rollbackGroupMeta(unit.group || []);
-  }
-  if (unit.type === "branch") {
-    return `${(unit.branches || []).length} ${(unit.branches || []).length === 1 ? "link" : "links"}`;
-  }
-  if (unit.type === "jumpMarker") {
-    return `${(unit.markers || []).length} ${(unit.markers || []).length === 1 ? "marker" : "markers"}`;
-  }
-  return "";
-}
-
-function virtualPreviewText(unit) {
-  if (unit.type === "message") {
-    return collapsedMessageHeading(messageViewText(unit.message || {})) || compactInlineText(messageViewText(unit.message || {}), 220);
-  }
-  if (unit.type === "toolRun") {
-    return toolRunPreview(unit.run || []);
-  }
-  if (unit.type === "rollbackGroup") {
-    return rollbackGroupPreview(unit.group || []);
-  }
-  if (unit.type === "branch") {
-    return (unit.branches || [])
-      .map((branch) => branch.item?.preview || branch.item?.id || "")
-      .filter(Boolean)
-      .join(" | ");
-  }
-  if (unit.type === "jumpMarker") {
-    return (unit.markers || []).map((marker) => marker.label).filter(Boolean).join(" | ");
-  }
-  return "";
+  scheduleVirtualTranscriptMeasure({ resolve: true, anchor: releaseAnchor });
 }
 
 function virtualRangeForViewport() {
   const transcript = state.virtualTranscript;
   const viewportHeight = Math.max(1, els.messages.clientHeight || 1);
-  const overscan = Math.max(VIRTUAL_TRANSCRIPT_MIN_OVERSCAN_PX, viewportHeight * VIRTUAL_TRANSCRIPT_OVERSCAN_VIEWPORTS);
+  const overscan = transcript.scrollbarDragActive
+    ? Math.max(80, viewportHeight * VIRTUAL_TRANSCRIPT_DRAG_OVERSCAN_VIEWPORTS)
+    : Math.max(VIRTUAL_TRANSCRIPT_MIN_OVERSCAN_PX, viewportHeight * VIRTUAL_TRANSCRIPT_OVERSCAN_VIEWPORTS);
   const startOffset = Math.max(0, els.messages.scrollTop - overscan);
   const endOffset = Math.min(transcript.totalHeight, els.messages.scrollTop + viewportHeight + overscan);
   const start = Math.max(0, virtualUnitIndexAtOffset(startOffset) - 1);
@@ -2348,6 +2258,37 @@ function virtualUnitIndexAtOffset(offset) {
     }
   }
   return Math.max(0, Math.min(offsets.length - 2, low));
+}
+
+function captureVirtualScrollAnchor() {
+  const transcript = state.virtualTranscript;
+  if (!els.messages || transcript.units.length === 0) {
+    return null;
+  }
+  const index = virtualUnitIndexAtOffset(els.messages.scrollTop);
+  const unit = transcript.units[index];
+  if (!unit) {
+    return null;
+  }
+  const offset = transcript.offsets[index] || 0;
+  return {
+    unitId: unit.id,
+    index,
+    delta: Math.max(0, els.messages.scrollTop - offset)
+  };
+}
+
+function restoreVirtualScrollAnchor(anchor) {
+  const transcript = state.virtualTranscript;
+  if (!anchor || !els.messages || transcript.units.length === 0) {
+    return;
+  }
+  const index = transcript.unitIdToIndex.get(anchor.unitId) ?? anchor.index;
+  if (!Number.isInteger(index) || index < 0 || index >= transcript.units.length) {
+    return;
+  }
+  const targetTop = Math.max(0, (transcript.offsets[index] || 0) + (anchor.delta || 0));
+  els.messages.scrollTop = targetTop;
 }
 
 function updateVirtualTranscriptSpacers(start, end) {
@@ -2406,6 +2347,7 @@ function measureRenderedVirtualUnits(options = {}) {
   if (!transcript.windowElement) {
     return;
   }
+  const anchor = options.anchor || captureVirtualScrollAnchor();
   let changed = false;
   let measuredTotal = 0;
   let measuredCount = 0;
@@ -2432,11 +2374,14 @@ function measureRenderedVirtualUnits(options = {}) {
   if (changed) {
     rebuildVirtualTranscriptOffsets();
     updateVirtualTranscriptSpacers(transcript.range.start, transcript.range.end);
+    restoreVirtualScrollAnchor(anchor);
     scheduleVirtualTranscriptRender();
     if (options.resolve) {
       schedulePendingScrollResolution(0);
       return;
     }
+  } else if (options.anchor) {
+    restoreVirtualScrollAnchor(options.anchor);
   }
   if (options.resolve) {
     resolvePendingScrollTarget();
