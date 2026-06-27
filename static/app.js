@@ -122,6 +122,7 @@ const state = {
   messagesFrameScrollbarWidth: null,
   lazyMessageBodies: new Set(),
   lazyMessageBodyRenderFrame: null,
+  lazyMessageBodyRenderTimer: null,
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
   toolRunByMessageIndex: new Map(),
@@ -393,7 +394,11 @@ function disconnectLazyMessageBodyRenderer() {
   if (state.lazyMessageBodyRenderFrame !== null) {
     window.cancelAnimationFrame(state.lazyMessageBodyRenderFrame);
   }
+  if (state.lazyMessageBodyRenderTimer !== null) {
+    window.clearTimeout(state.lazyMessageBodyRenderTimer);
+  }
   state.lazyMessageBodyRenderFrame = null;
+  state.lazyMessageBodyRenderTimer = null;
   state.lazyMessageBodies.clear();
 }
 
@@ -401,7 +406,8 @@ function installLazyMessageBodyRenderer() {
   if (!els.messages) {
     return;
   }
-  els.messages.addEventListener("scroll", () => scheduleLazyMessageBodyRender(), { passive: true });
+  els.messages.addEventListener("scroll", () => scheduleLazyMessageBodyRender({ delay: 650 }), { passive: true });
+  els.messages.addEventListener("scrollend", () => scheduleLazyMessageBodyRender({ force: true }), { passive: true });
 }
 
 function registerLazyMessageBody(body) {
@@ -411,8 +417,24 @@ function registerLazyMessageBody(body) {
   state.lazyMessageBodies.add(body);
 }
 
-function scheduleLazyMessageBodyRender() {
-  if (state.lazyMessageBodyRenderFrame !== null || state.lazyMessageBodies.size === 0) {
+function scheduleLazyMessageBodyRender(options = {}) {
+  const delay = options.delay || 0;
+  const force = options.force === true;
+  if (state.lazyMessageBodies.size === 0) {
+    return;
+  }
+  if (state.lazyMessageBodyRenderTimer !== null) {
+    window.clearTimeout(state.lazyMessageBodyRenderTimer);
+    state.lazyMessageBodyRenderTimer = null;
+  }
+  if (delay > 0 && !force) {
+    state.lazyMessageBodyRenderTimer = window.setTimeout(() => {
+      state.lazyMessageBodyRenderTimer = null;
+      scheduleLazyMessageBodyRender({ force: true });
+    }, delay);
+    return;
+  }
+  if (state.lazyMessageBodyRenderFrame !== null) {
     return;
   }
   state.lazyMessageBodyRenderFrame = window.requestAnimationFrame(() => {
