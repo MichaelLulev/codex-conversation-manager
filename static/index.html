@@ -31,11 +31,14 @@
         </div>
       </header>
 
-      <main class="layout">
-        <aside class="thread-panel">
-          <div class="mode-tabs" aria-label="Conversation type">
-            <button id="main-mode-button" type="button" class="active">Main</button>
-            <button id="side-mode-button" type="button">Side</button>
+      <main class="layout" id="layout">
+        <aside class="thread-panel" id="thread-panel">
+          <div class="thread-panel-head">
+            <div class="mode-tabs" aria-label="Conversation type">
+              <button id="main-mode-button" type="button" class="active">Main</button>
+              <button id="side-mode-button" type="button">Side</button>
+            </div>
+            <button id="thread-panel-toggle" class="thread-panel-toggle" type="button" aria-expanded="true" aria-label="Collapse conversations list" title="Collapse conversations list">&lt;</button>
           </div>
           <div class="search-row">
             <input id="search-input" type="search" placeholder="Search main conversations" autocomplete="off" spellcheck="false" autocorrect="off" autocapitalize="none">
@@ -57,6 +60,7 @@
           <div class="thread-stats" id="thread-stats">Loading...</div>
           <div class="thread-list" id="thread-list" aria-hidden="true"></div>
         </aside>
+        <div id="thread-panel-resizer" class="thread-panel-resizer" role="separator" aria-orientation="vertical" aria-label="Resize conversations list" tabindex="0"></div>
 
         <section class="reader-panel">
           <div id="empty-state" class="empty-state">

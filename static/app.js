@@ -40,6 +40,14 @@ const SEARCH_WORKER_URL = "/static/search-worker.js";
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
 const SEARCH_TEXT_CACHE = new WeakMap();
 const MESSAGE_FILTER_STORAGE_KEY = "codex-reader-message-filters";
+const THREAD_PANEL_WIDTH_STORAGE_KEY = "codex-reader-thread-panel-width";
+const THREAD_PANEL_COLLAPSED_STORAGE_KEY = "codex-reader-thread-panel-collapsed";
+const THREAD_PANEL_DEFAULT_WIDTH = 380;
+const THREAD_PANEL_MIN_WIDTH = 260;
+const THREAD_PANEL_MAX_WIDTH = 640;
+const THREAD_PANEL_MIN_READER_WIDTH = 420;
+const THREAD_PANEL_KEYBOARD_STEP = 24;
+const THREAD_PANEL_STACKED_BREAKPOINT = 860;
 const DIFF_BLOCK_PATTERN = /^`{3,}(diff|patch)\s*$/im;
 const MESSAGE_FILTER_DESCRIPTIONS = {
   user: "Your prompts and messages.",
@@ -138,10 +146,19 @@ const state = {
     activeMarks: []
   },
   messageFilters: loadMessageFilters(),
+  threadPanel: {
+    width: loadThreadPanelWidth(),
+    collapsed: loadThreadPanelCollapsed(),
+    dragging: false
+  },
   filter: ""
 };
 
 const els = {
+  layout: document.getElementById("layout"),
+  threadPanel: document.getElementById("thread-panel"),
+  threadPanelToggle: document.getElementById("thread-panel-toggle"),
+  threadPanelResizer: document.getElementById("thread-panel-resizer"),
   addressLine: document.getElementById("address-line"),
   sourceLine: document.getElementById("source-line"),
   refreshButton: document.getElementById("refresh-button"),
@@ -530,6 +547,165 @@ function saveMessageFilters() {
     localStorage.setItem(MESSAGE_FILTER_STORAGE_KEY, JSON.stringify(state.messageFilters));
   } catch {
     // Ignore private browsing or storage quota failures.
+  }
+}
+
+function loadThreadPanelWidth() {
+  try {
+    const storedValue = localStorage.getItem(THREAD_PANEL_WIDTH_STORAGE_KEY);
+    const stored = storedValue === null ? NaN : Number(storedValue);
+    return clampThreadPanelWidth(Number.isFinite(stored) ? stored : THREAD_PANEL_DEFAULT_WIDTH);
+  } catch {
+    return THREAD_PANEL_DEFAULT_WIDTH;
+  }
+}
+
+function saveThreadPanelWidth() {
+  try {
+    localStorage.setItem(THREAD_PANEL_WIDTH_STORAGE_KEY, String(Math.round(state.threadPanel.width)));
+  } catch {
+    // Ignore private browsing or storage quota failures.
+  }
+}
+
+function loadThreadPanelCollapsed() {
+  try {
+    return localStorage.getItem(THREAD_PANEL_COLLAPSED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function saveThreadPanelCollapsed() {
+  try {
+    localStorage.setItem(THREAD_PANEL_COLLAPSED_STORAGE_KEY, state.threadPanel.collapsed ? "1" : "0");
+  } catch {
+    // Ignore private browsing or storage quota failures.
+  }
+}
+
+function threadPanelMaxWidth() {
+  const viewportWidth = window.innerWidth || (THREAD_PANEL_DEFAULT_WIDTH + THREAD_PANEL_MIN_READER_WIDTH);
+  if (viewportWidth <= THREAD_PANEL_STACKED_BREAKPOINT) {
+    return THREAD_PANEL_MAX_WIDTH;
+  }
+  return Math.max(
+    THREAD_PANEL_MIN_WIDTH,
+    Math.min(THREAD_PANEL_MAX_WIDTH, viewportWidth - THREAD_PANEL_MIN_READER_WIDTH)
+  );
+}
+
+function clampThreadPanelWidth(value) {
+  const width = Number(value);
+  if (!Number.isFinite(width)) {
+    return THREAD_PANEL_DEFAULT_WIDTH;
+  }
+  return Math.max(THREAD_PANEL_MIN_WIDTH, Math.min(threadPanelMaxWidth(), width));
+}
+
+function applyThreadPanelLayout() {
+  const width = clampThreadPanelWidth(state.threadPanel.width);
+  state.threadPanel.width = width;
+  document.documentElement.style.setProperty("--thread-panel-width", `${Math.round(width)}px`);
+  els.layout.classList.toggle("thread-panel-collapsed", state.threadPanel.collapsed);
+  els.threadPanelToggle.textContent = state.threadPanel.collapsed ? ">" : "<";
+  const action = state.threadPanel.collapsed ? "Expand conversations list" : "Collapse conversations list";
+  els.threadPanelToggle.setAttribute("aria-expanded", String(!state.threadPanel.collapsed));
+  els.threadPanelToggle.setAttribute("aria-label", action);
+  els.threadPanelToggle.title = action;
+  els.threadPanelResizer.setAttribute("aria-valuemin", String(THREAD_PANEL_MIN_WIDTH));
+  els.threadPanelResizer.setAttribute("aria-valuemax", String(threadPanelMaxWidth()));
+  els.threadPanelResizer.setAttribute("aria-valuenow", String(Math.round(width)));
+  scheduleMessagesFrameSync({ frames: 3, delays: [80, 240] });
+}
+
+function setThreadPanelWidth(width, options = {}) {
+  state.threadPanel.width = clampThreadPanelWidth(width);
+  if (options.save !== false) {
+    saveThreadPanelWidth();
+  }
+  applyThreadPanelLayout();
+}
+
+function setThreadPanelCollapsed(collapsed) {
+  state.threadPanel.collapsed = Boolean(collapsed);
+  saveThreadPanelCollapsed();
+  applyThreadPanelLayout();
+  if (state.threadPanel.collapsed && els.threadPanel.contains(document.activeElement)) {
+    els.threadPanelToggle.focus();
+  }
+  if (!state.threadPanel.collapsed) {
+    window.setTimeout(() => scrollSelectedThreadIntoView({ behavior: "auto" }), 80);
+  }
+}
+
+function installThreadPanelControls() {
+  applyThreadPanelLayout();
+  els.threadPanelToggle.addEventListener("click", () => {
+    setThreadPanelCollapsed(!state.threadPanel.collapsed);
+  });
+  els.threadPanelResizer.addEventListener("pointerdown", startThreadPanelResize);
+  els.threadPanelResizer.addEventListener("keydown", handleThreadPanelResizerKeydown);
+  window.addEventListener("resize", () => {
+    setThreadPanelWidth(state.threadPanel.width, { save: false });
+  });
+}
+
+function startThreadPanelResize(event) {
+  if (event.button !== 0 || state.threadPanel.collapsed) {
+    return;
+  }
+  event.preventDefault();
+  state.threadPanel.dragging = true;
+  els.threadPanelResizer.classList.add("dragging");
+  document.body.classList.add("resizing-thread-panel");
+  updateThreadPanelWidthFromPointer(event, { save: false });
+
+  const pointerId = event.pointerId;
+  const onMove = (moveEvent) => {
+    if (moveEvent.pointerId === pointerId) {
+      updateThreadPanelWidthFromPointer(moveEvent, { save: false });
+    }
+  };
+  const onEnd = (endEvent) => {
+    if (endEvent.pointerId !== pointerId) {
+      return;
+    }
+    state.threadPanel.dragging = false;
+    els.threadPanelResizer.classList.remove("dragging");
+    document.body.classList.remove("resizing-thread-panel");
+    saveThreadPanelWidth();
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onEnd);
+    window.removeEventListener("pointercancel", onEnd);
+  };
+
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onEnd);
+  window.addEventListener("pointercancel", onEnd);
+}
+
+function updateThreadPanelWidthFromPointer(event, options = {}) {
+  const rect = els.layout.getBoundingClientRect();
+  setThreadPanelWidth(event.clientX - rect.left, options);
+}
+
+function handleThreadPanelResizerKeydown(event) {
+  if (state.threadPanel.collapsed) {
+    return;
+  }
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    setThreadPanelWidth(state.threadPanel.width - THREAD_PANEL_KEYBOARD_STEP);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    setThreadPanelWidth(state.threadPanel.width + THREAD_PANEL_KEYBOARD_STEP);
+  } else if (event.key === "Home") {
+    event.preventDefault();
+    setThreadPanelWidth(THREAD_PANEL_MIN_WIDTH);
+  } else if (event.key === "End") {
+    event.preventDefault();
+    setThreadPanelWidth(threadPanelMaxWidth());
   }
 }
 
@@ -5673,6 +5849,7 @@ function showConversationError(error) {
 
 async function init() {
   setupConfirmModal();
+  installThreadPanelControls();
   els.refreshButton.addEventListener("click", async () => {
     try {
       await loadStatus();
