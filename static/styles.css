@@ -1547,6 +1547,12 @@ button:disabled {
   unicode-bidi: plaintext;
 }
 
+.message-body.fast-drag-message-body {
+  display: block;
+  color: #344246;
+  white-space: normal;
+}
+
 .message-body > *:first-child {
   margin-top: 0;
 }

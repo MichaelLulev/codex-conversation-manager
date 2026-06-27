@@ -34,6 +34,8 @@ const VIRTUAL_TRANSCRIPT_GAP_PX = 8;
 const VIRTUAL_TRANSCRIPT_MEASURE_TOLERANCE_PX = 1;
 const VIRTUAL_TRANSCRIPT_RESOLVE_DELAY_MS = 80;
 const VIRTUAL_TRANSCRIPT_SCROLL_RENDER_IDLE_MS = 220;
+const VIRTUAL_TRANSCRIPT_FAST_DRAG_TEXT_CHARS = 700;
+const VIRTUAL_TRANSCRIPT_FAST_DRAG_SCAN_CHARS = 2400;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
 const MAX_INTRALINE_DIFF_CELLS = 120000;
@@ -1926,15 +1928,15 @@ async function renderMessageUnits(units, renderRequestId) {
   }
 }
 
-function renderUnit(unit) {
+function renderUnit(unit, options = {}) {
   if (unit.type === "message") {
-    return renderMessage(unit.message, unit.index);
+    return renderMessage(unit.message, unit.index, options);
   }
   if (unit.type === "toolRun") {
-    return renderToolRun(unit.run);
+    return renderToolRun(unit.run, options);
   }
   if (unit.type === "rollbackGroup") {
-    return renderRollbackGroup(unit.group);
+    return renderRollbackGroup(unit.group, options);
   }
   if (unit.type === "jumpMarker") {
     return renderJumpMarker(unit.markers);
@@ -2207,7 +2209,7 @@ function renderVirtualTranscriptWindow(options = {}) {
   const fragment = document.createDocumentFragment();
   for (let index = range.start; index < range.end; index += 1) {
     const unit = transcript.units[index];
-    const element = renderUnit(unit);
+    const element = renderUnit(unit, { fastDrag: clamped });
     element.dataset.virtualUnitIndex = String(index);
     element.dataset.virtualUnitId = unit.id;
     if (clamped) {
@@ -4021,6 +4023,7 @@ function scrollElementHorizontallyIntoView(element) {
 }
 
 function renderMessage(message, index = 0, options = {}) {
+  const fastDrag = options.fastDrag === true;
   const wrapper = document.createElement("section");
   wrapper.className = `message ${message.role}${message.rolled_back ? " rolled-back" : ""}`;
   wrapper.dataset.filterKey = messageFilterKeys(message).join(" ");
@@ -4074,9 +4077,10 @@ function renderMessage(message, index = 0, options = {}) {
   source.className = "message-source";
   source.textContent = `${text(message.time)} | ${text(message.source)}${phase}${rollback}`;
 
-  const actions = renderMessageActions(message, index);
   header.append(roleElement, source);
-  header.appendChild(actions);
+  if (!fastDrag) {
+    header.appendChild(renderMessageActions(message, index));
+  }
 
   let body = null;
   if (isCollapsible) {
@@ -4105,8 +4109,14 @@ function renderMessage(message, index = 0, options = {}) {
       body.dataset.rendered = "false";
       body.__messageText = message.text || "";
       body.__messageRenderMode = bodyRenderMode;
-      ensureMessageBodyRendered(body);
+      if (fastDrag) {
+        renderFastDragMessageBody(body, message);
+      } else {
+        ensureMessageBodyRendered(body);
+      }
       body.hidden = !isExpanded;
+    } else if (fastDrag) {
+      renderFastDragMessageBody(body, message);
     } else {
       renderMessageBodyContent(body, message.text || "", bodyRenderMode);
     }
@@ -4118,6 +4128,24 @@ function renderMessage(message, index = 0, options = {}) {
     wrapper.append(header);
   }
   return wrapper;
+}
+
+function renderFastDragMessageBody(body, message) {
+  const textValue = fastDragMessageBodyText(message);
+  body.classList.add("fast-drag-message-body");
+  setAutoDirection(body, textValue);
+  body.textContent = textValue;
+}
+
+function fastDragMessageBodyText(message) {
+  const textValue = String(message?.text || "");
+  if (!textValue) {
+    return "";
+  }
+  const scanned = textValue.length > VIRTUAL_TRANSCRIPT_FAST_DRAG_SCAN_CHARS
+    ? textValue.slice(0, VIRTUAL_TRANSCRIPT_FAST_DRAG_SCAN_CHARS)
+    : textValue;
+  return compactInlineText(stripInlineMarkup(scanned), VIRTUAL_TRANSCRIPT_FAST_DRAG_TEXT_CHARS);
 }
 
 function renderMessageActions(message, index) {
@@ -4319,7 +4347,8 @@ async function createRollbackToMessage(message, index, button) {
   }
 }
 
-function renderToolRun(run) {
+function renderToolRun(run, options = {}) {
+  const fastDrag = options.fastDrag === true;
   const first = run[0];
   const last = run[run.length - 1];
   const runId = toolRunId(first.index, last.index);
@@ -4364,12 +4393,14 @@ function renderToolRun(run) {
   wrapper.appendChild(header);
 
   let body = null;
-  toggle.addEventListener("click", () => {
-    body = body || ensureToolRunBody(wrapper);
-    setToolRunExpanded(wrapper, body, toggle, wrapper.classList.contains("collapsed"));
-  });
+  if (!fastDrag) {
+    toggle.addEventListener("click", () => {
+      body = body || ensureToolRunBody(wrapper);
+      setToolRunExpanded(wrapper, body, toggle, wrapper.classList.contains("collapsed"));
+    });
+  }
 
-  if (isExpanded) {
+  if (isExpanded && !fastDrag) {
     body = ensureToolRunBody(wrapper);
     setToolRunExpanded(wrapper, body, toggle, true);
   }
@@ -4377,7 +4408,8 @@ function renderToolRun(run) {
   return wrapper;
 }
 
-function renderRollbackGroup(group) {
+function renderRollbackGroup(group, options = {}) {
+  const fastDrag = options.fastDrag === true;
   const first = group[0];
   const last = group[group.length - 1];
   const groupId = rollbackGroupId(first.index, last.index);
@@ -4421,19 +4453,23 @@ function renderRollbackGroup(group) {
   source.className = "message-source";
   source.textContent = rollbackGroupMeta(group);
   header.append(toggle, source);
-  const actions = renderRollbackGroupActions(group);
-  if (actions) {
-    header.appendChild(actions);
+  if (!fastDrag) {
+    const actions = renderRollbackGroupActions(group);
+    if (actions) {
+      header.appendChild(actions);
+    }
   }
   wrapper.appendChild(header);
 
   let body = null;
-  toggle.addEventListener("click", () => {
-    body = body || ensureRollbackGroupBody(wrapper);
-    setRollbackGroupExpanded(wrapper, body, toggle, wrapper.classList.contains("collapsed"));
-  });
+  if (!fastDrag) {
+    toggle.addEventListener("click", () => {
+      body = body || ensureRollbackGroupBody(wrapper);
+      setRollbackGroupExpanded(wrapper, body, toggle, wrapper.classList.contains("collapsed"));
+    });
+  }
 
-  if (isExpanded) {
+  if (isExpanded && !fastDrag) {
     body = ensureRollbackGroupBody(wrapper);
     setRollbackGroupExpanded(wrapper, body, toggle, true);
   }
