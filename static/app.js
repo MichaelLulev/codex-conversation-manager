@@ -26,7 +26,11 @@ const MAIN_FILTER_LABELS = {
   archived: "archived conversations"
 };
 
-const MESSAGE_RENDER_BATCH_SIZE = 100;
+const MESSAGE_RENDER_MIN_BATCH_UNITS = 40;
+const MESSAGE_RENDER_MAX_BATCH_UNITS = 220;
+const MESSAGE_RENDER_TIME_BUDGET_MS = 14;
+const EAGER_MESSAGE_BODY_UNITS = 90;
+const LAZY_MESSAGE_BODY_ROOT_MARGIN = "1600px 0px";
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
 const MAX_INTRALINE_DIFF_CELLS = 120000;
@@ -116,6 +120,8 @@ const state = {
   messagesFrameSyncTimers: [],
   messagesFrameSyncPending: false,
   messagesFrameScrollbarWidth: null,
+  lazyMessageBodies: new Set(),
+  lazyMessageBodyRenderFrame: null,
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
   toolRunByMessageIndex: new Map(),
@@ -322,6 +328,7 @@ function keepFocusInConfirmDialog(event) {
 }
 
 function setupMessagesFrame() {
+  disconnectLazyMessageBodyRenderer();
   const frame = els.messagesFrame;
   const doc = frame?.contentDocument || frame?.contentWindow?.document;
   if (!frame || !doc) {
@@ -365,6 +372,7 @@ function setupMessagesFrame() {
   if (!els.messages) {
     throw new Error("Conversation message root is unavailable");
   }
+  installLazyMessageBodyRenderer();
   installMessagesSelectionTracking();
   installMessagesFrameResizeSync();
   scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800], force: true });
@@ -379,6 +387,64 @@ function installMessagesSelectionTracking() {
   doc.addEventListener("selectionchange", update);
   doc.addEventListener("mouseup", update);
   doc.addEventListener("keyup", update);
+}
+
+function disconnectLazyMessageBodyRenderer() {
+  if (state.lazyMessageBodyRenderFrame !== null) {
+    window.cancelAnimationFrame(state.lazyMessageBodyRenderFrame);
+  }
+  state.lazyMessageBodyRenderFrame = null;
+  state.lazyMessageBodies.clear();
+}
+
+function installLazyMessageBodyRenderer() {
+  if (!els.messages) {
+    return;
+  }
+  els.messages.addEventListener("scroll", () => scheduleLazyMessageBodyRender(), { passive: true });
+}
+
+function registerLazyMessageBody(body) {
+  if (!body || body.dataset.rendered !== "false") {
+    return;
+  }
+  state.lazyMessageBodies.add(body);
+}
+
+function scheduleLazyMessageBodyRender() {
+  if (state.lazyMessageBodyRenderFrame !== null || state.lazyMessageBodies.size === 0) {
+    return;
+  }
+  state.lazyMessageBodyRenderFrame = window.requestAnimationFrame(() => {
+    state.lazyMessageBodyRenderFrame = null;
+    renderVisibleLazyMessageBodies();
+  });
+}
+
+function renderVisibleLazyMessageBodies() {
+  if (!els.messages || state.lazyMessageBodies.size === 0) {
+    return;
+  }
+  const messagesRect = els.messages.getBoundingClientRect();
+  const viewportTop = messagesRect.top - parseInt(LAZY_MESSAGE_BODY_ROOT_MARGIN, 10);
+  const viewportBottom = messagesRect.bottom + parseInt(LAZY_MESSAGE_BODY_ROOT_MARGIN, 10);
+  let rendered = 0;
+  for (const body of Array.from(state.lazyMessageBodies)) {
+    if (!body.isConnected || body.dataset.rendered !== "false") {
+      state.lazyMessageBodies.delete(body);
+      continue;
+    }
+    const rect = body.getBoundingClientRect();
+    if (rect.bottom < viewportTop || rect.top > viewportBottom) {
+      continue;
+    }
+    ensureMessageBodyRendered(body);
+    rendered += 1;
+    if (rendered >= 24) {
+      scheduleLazyMessageBodyRender();
+      break;
+    }
+  }
 }
 
 function installMessagesFrameResizeSync() {
@@ -1329,6 +1395,7 @@ async function selectThread(threadId, options = {}) {
 function clearConversation() {
   cancelDetailRequest();
   cancelMessageRender();
+  disconnectLazyMessageBodyRenderer();
   state.selectedId = null;
   state.currentThread = null;
   state.expandedMessages = new Set();
@@ -1701,18 +1768,25 @@ function branchUnit(branches) {
 }
 
 async function renderMessageUnits(units, renderRequestId) {
-  let batchCount = 0;
+  let batchUnits = 0;
+  let renderedUnits = 0;
+  let batchStartedAt = performance.now();
   let fragment = document.createDocumentFragment();
   for (const unit of units) {
     if (renderRequestId !== state.renderRequestId) {
       return;
     }
-    fragment.appendChild(renderUnit(unit));
-    batchCount += unit.messageCount || 1;
-    if (batchCount >= MESSAGE_RENDER_BATCH_SIZE) {
+    fragment.appendChild(renderUnit(unit, { unitOrdinal: renderedUnits }));
+    renderedUnits += 1;
+    batchUnits += 1;
+    const elapsed = performance.now() - batchStartedAt;
+    const shouldYield = batchUnits >= MESSAGE_RENDER_MIN_BATCH_UNITS
+      && (batchUnits >= MESSAGE_RENDER_MAX_BATCH_UNITS || elapsed >= MESSAGE_RENDER_TIME_BUDGET_MS);
+    if (shouldYield) {
       els.messages.appendChild(fragment);
       fragment = document.createDocumentFragment();
-      batchCount = 0;
+      batchUnits = 0;
+      batchStartedAt = performance.now();
       resolvePendingScrollTarget();
       await nextFrame();
     }
@@ -1723,12 +1797,15 @@ async function renderMessageUnits(units, renderRequestId) {
   if (fragment.childNodes.length > 0) {
     els.messages.appendChild(fragment);
   }
+  scheduleLazyMessageBodyRender();
   resolvePendingScrollTarget({ final: true });
 }
 
-function renderUnit(unit) {
+function renderUnit(unit, options = {}) {
   if (unit.type === "message") {
-    return renderMessage(unit.message, unit.index);
+    return renderMessage(unit.message, unit.index, {
+      deferBody: options.unitOrdinal >= EAGER_MESSAGE_BODY_UNITS
+    });
   }
   if (unit.type === "toolRun") {
     return renderToolRun(unit.run);
@@ -3097,6 +3174,9 @@ function setActiveConversationMatch(index, { scroll = true, expandCollapsed = tr
       expandCollapsedMessage(wrapper);
     }
     const body = wrapper.querySelector(".message-body");
+    if (body && body.dataset.rendered === "false") {
+      ensureMessageBodyRendered(body);
+    }
     const mark = body && !body.hidden
       ? highlightNthSearchInElement(
         body,
@@ -3186,6 +3266,11 @@ function renderMessage(message, index = 0, options = {}) {
   const collapseRolledBack = message.rolled_back && !options.insideRollbackGroup;
   const isCollapsible = bodyRenderMode !== "diffs" && (COLLAPSED_MESSAGE_ROLES.has(message.role) || collapseRolledBack);
   const shouldLazyRenderBody = isCollapsible;
+  const shouldDeferVisibleBody = options.deferBody === true
+    && !isCollapsible
+    && !options.insideRollbackGroup
+    && bodyRenderMode === "full";
+  const shouldDeferActions = shouldDeferVisibleBody;
   const isExpanded = isCollapsible && state.expandedMessages.has(index);
   if (isCollapsible && !isExpanded) {
     wrapper.classList.add("collapsed");
@@ -3231,10 +3316,13 @@ function renderMessage(message, index = 0, options = {}) {
   source.className = "message-source";
   source.textContent = `${text(message.time)} | ${text(message.source)}${phase}${rollback}`;
 
-  const actions = renderMessageActions(message, index);
+  const actions = shouldDeferActions ? null : renderMessageActions(message, index);
   header.append(roleElement, source);
   if (actions) {
     header.appendChild(actions);
+  } else if (shouldDeferActions) {
+    wrapper.dataset.actionsRendered = "false";
+    wrapper.__message = message;
   }
 
   let body = null;
@@ -3266,6 +3354,14 @@ function renderMessage(message, index = 0, options = {}) {
       body.__messageRenderMode = bodyRenderMode;
       ensureMessageBodyRendered(body);
       body.hidden = !isExpanded;
+    } else if (shouldDeferVisibleBody) {
+      body.id = `message-body-${index}`;
+      body.dataset.rendered = "false";
+      body.__messageText = message.text || "";
+      body.__messageRenderMode = bodyRenderMode;
+      body.classList.add("message-body-lazy");
+      body.style.minHeight = `${estimatedLazyMessageBodyHeight(message.text || "")}px`;
+      registerLazyMessageBody(body);
     } else {
       renderMessageBodyContent(body, message.text || "", bodyRenderMode);
     }
@@ -3337,6 +3433,24 @@ function renderMessageActions(message, index) {
     actions.appendChild(rollback);
   }
   return actions;
+}
+
+function ensureDeferredMessageActions(wrapper) {
+  if (!wrapper || wrapper.dataset.actionsRendered !== "false") {
+    return;
+  }
+  const index = Number(wrapper.dataset.messageIndex);
+  const message = wrapper.__message;
+  if (!message || !Number.isInteger(index)) {
+    wrapper.dataset.actionsRendered = "true";
+    return;
+  }
+  const header = wrapper.querySelector(".message-header");
+  if (header) {
+    header.appendChild(renderMessageActions(message, index));
+  }
+  wrapper.dataset.actionsRendered = "true";
+  delete wrapper.__message;
 }
 
 function createRollbackUndoButton(rollback, label = "Undo as fork") {
@@ -3951,11 +4065,27 @@ function setCollapsedMessageExpanded(wrapper, body, toggle, expanded) {
   }
 }
 
+function estimatedLazyMessageBodyHeight(value) {
+  const textValue = String(value || "");
+  if (!textValue) {
+    return 40;
+  }
+  const sample = textValue.slice(0, 12000);
+  const explicitLines = (sample.match(/\n/g) || []).length + 1;
+  const wrappedLines = Math.ceil(Math.min(textValue.length, 24000) / 92);
+  const estimatedLines = Math.max(1, Math.min(28, explicitLines + wrappedLines));
+  return Math.max(44, Math.min(560, 18 + (estimatedLines * 22)));
+}
+
 function ensureMessageBodyRendered(body) {
   if (body.dataset.rendered !== "false") {
     return;
   }
+  state.lazyMessageBodies.delete(body);
+  ensureDeferredMessageActions(body.closest(".message"));
   const value = body.__messageText || "";
+  body.classList.remove("message-body-lazy");
+  body.style.minHeight = "";
   renderMessageBodyContent(body, value, body.__messageRenderMode || "full");
   body.dataset.rendered = "true";
 }
