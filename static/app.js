@@ -409,43 +409,54 @@ function installMessagesFrameResizeSync() {
   window.addEventListener("blur", () => syncMessagesFrameViewport());
 }
 
-function scheduleMessagesFrameSync({ frames = 2, delays = [], force = false } = {}) {
+function scheduleMessagesFrameSync({ frames = 2, delays = [], force = false, afterPaint = false } = {}) {
   if (state.messagesFrameSyncPending && !force) {
     return;
   }
   clearMessagesFrameSyncTimers();
   state.messagesFrameSyncPending = true;
-  let pendingCallbacks = 0;
-  const finishCallback = () => {
-    pendingCallbacks -= 1;
-    if (pendingCallbacks <= 0) {
-      state.messagesFrameSyncPending = false;
-      state.messagesFrameSyncTimers = [];
+
+  const runSync = () => {
+    let pendingCallbacks = 0;
+    const finishCallback = () => {
+      pendingCallbacks -= 1;
+      if (pendingCallbacks <= 0) {
+        state.messagesFrameSyncPending = false;
+        state.messagesFrameSyncTimers = [];
+      }
+    };
+    const queueFrame = (remaining) => {
+      pendingCallbacks += 1;
+      const id = window.requestAnimationFrame(() => {
+        syncMessagesFrameViewport();
+        if (remaining > 0) {
+          queueFrame(remaining - 1);
+        }
+        finishCallback();
+      });
+      state.messagesFrameSyncTimers.push({ type: "frame", id });
+    };
+    queueFrame(frames);
+    for (const delay of delays) {
+      pendingCallbacks += 1;
+      const id = window.setTimeout(() => {
+        syncMessagesFrameViewport();
+        finishCallback();
+      }, delay);
+      state.messagesFrameSyncTimers.push({ type: "timeout", id });
     }
   };
-  const queueFrame = (remaining) => {
-    pendingCallbacks += 1;
-    const id = window.requestAnimationFrame(() => {
-      syncMessagesFrameViewport();
-      if (remaining > 0) {
-        queueFrame(remaining - 1);
-      }
-      finishCallback();
+
+  if (afterPaint) {
+    const frameId = window.requestAnimationFrame(() => {
+      const timeoutId = window.setTimeout(runSync, 0);
+      state.messagesFrameSyncTimers.push({ type: "timeout", id: timeoutId });
     });
-    state.messagesFrameSyncTimers.push({ type: "frame", id });
-  };
-  const runFrame = (remaining) => {
-    queueFrame(remaining);
-  };
-  runFrame(frames);
-  for (const delay of delays) {
-    pendingCallbacks += 1;
-    const id = window.setTimeout(() => {
-      syncMessagesFrameViewport();
-      finishCallback();
-    }, delay);
-    state.messagesFrameSyncTimers.push({ type: "timeout", id });
+    state.messagesFrameSyncTimers.push({ type: "frame", id: frameId });
+    return;
   }
+
+  runSync();
 }
 
 function clearMessagesFrameSyncTimers() {
@@ -478,24 +489,31 @@ function syncMessagesFrameViewport() {
   }
   const widthPx = `${width}px`;
   const heightPx = `${height}px`;
+  let changed = false;
   if (frame.getAttribute("width") !== String(width)) {
     frame.setAttribute("width", String(width));
+    changed = true;
   }
   if (frame.getAttribute("height") !== String(height)) {
     frame.setAttribute("height", String(height));
+    changed = true;
   }
-  frame.style.width = widthPx;
-  frame.style.height = heightPx;
-  doc.documentElement.style.width = widthPx;
-  doc.documentElement.style.height = heightPx;
-  doc.body.style.width = widthPx;
-  doc.body.style.height = heightPx;
-  root.style.width = widthPx;
-  root.style.height = heightPx;
-  // Force WebKitGTK to materialize the iframe viewport before the next paint.
-  void frame.offsetWidth;
-  void root.offsetWidth;
-  return true;
+  for (const element of [frame, doc.documentElement, doc.body, root]) {
+    if (element.style.width !== widthPx) {
+      element.style.width = widthPx;
+      changed = true;
+    }
+    if (element.style.height !== heightPx) {
+      element.style.height = heightPx;
+      changed = true;
+    }
+  }
+  if (changed) {
+    // Force WebKitGTK to materialize the iframe viewport before the next paint.
+    void frame.offsetWidth;
+    void root.offsetWidth;
+  }
+  return changed;
 }
 
 function measureMessagesFrameScrollbarWidth(doc) {
@@ -1877,8 +1895,7 @@ function toggleRelatedSection(section, list, toggle) {
 
 function syncConversationChromeResize() {
   syncAskCodexLayout();
-  syncMessagesFrameViewport();
-  scheduleMessagesFrameSync({ frames: 4, delays: [40, 120, 300], force: true });
+  scheduleMessagesFrameSync({ frames: 3, delays: [80, 240], force: true, afterPaint: true });
 }
 
 function syncAskCodexLayout() {
@@ -5972,7 +5989,7 @@ async function init() {
     syncConversationChromeResize();
   });
   els.askCodexPanel.addEventListener("toggle", () => {
-    updateSelectedTranscriptText();
+    window.setTimeout(() => updateSelectedTranscriptText(), 0);
     syncConversationChromeResize();
   });
   els.askCodexQuestion.addEventListener("input", () => {
