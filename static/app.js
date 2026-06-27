@@ -32,6 +32,7 @@ const VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT = 148;
 const VIRTUAL_TRANSCRIPT_GAP_PX = 8;
 const VIRTUAL_TRANSCRIPT_MEASURE_TOLERANCE_PX = 1;
 const VIRTUAL_TRANSCRIPT_RESOLVE_DELAY_MS = 80;
+const VIRTUAL_TRANSCRIPT_SCROLL_RENDER_IDLE_MS = 220;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
 const MAX_INTRALINE_DIFF_CELLS = 120000;
@@ -121,6 +122,7 @@ const state = {
   messagesFrameSyncTimers: [],
   messagesFrameSyncPending: false,
   messagesFrameScrollbarWidth: null,
+  virtualTranscriptWindowDragListenersInstalled: false,
   virtualTranscript: emptyVirtualTranscriptState(),
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
@@ -394,9 +396,13 @@ function emptyVirtualTranscriptState() {
     windowElement: null,
     bottomSpacer: null,
     renderFrame: null,
+    renderTimer: null,
     measureFrame: null,
     resizeObserver: null,
-    resolveTimer: null
+    resolveTimer: null,
+    scrollbarDragActive: false,
+    renderAfterScrollbarDrag: false,
+    measureAfterScrollbarDrag: false
   };
 }
 
@@ -415,15 +421,23 @@ function disconnectVirtualTranscriptObservers() {
   }
   if (transcript.renderFrame !== null) {
     window.cancelAnimationFrame(transcript.renderFrame);
+    transcript.renderFrame = null;
+  }
+  if (transcript.renderTimer !== null) {
+    window.clearTimeout(transcript.renderTimer);
+    transcript.renderTimer = null;
   }
   if (transcript.measureFrame !== null) {
     window.cancelAnimationFrame(transcript.measureFrame);
+    transcript.measureFrame = null;
   }
   if (transcript.resolveTimer !== null) {
     window.clearTimeout(transcript.resolveTimer);
+    transcript.resolveTimer = null;
   }
   if (transcript.resizeObserver) {
     transcript.resizeObserver.disconnect();
+    transcript.resizeObserver = null;
   }
 }
 
@@ -452,8 +466,113 @@ function installVirtualTranscriptScroll() {
     return;
   }
   els.messages.addEventListener("scroll", () => {
-    scheduleVirtualTranscriptRender();
+    handleVirtualTranscriptScroll();
   }, { passive: true });
+  const doc = els.messagesDocument;
+  const frameWindow = doc?.defaultView;
+  doc?.addEventListener("pointerdown", handleVirtualTranscriptPointerDown, true);
+  doc?.addEventListener("mousedown", handleVirtualTranscriptPointerDown, true);
+  doc?.addEventListener("pointerup", finishVirtualTranscriptScrollbarDrag, true);
+  doc?.addEventListener("mouseup", finishVirtualTranscriptScrollbarDrag, true);
+  frameWindow?.addEventListener("pointerup", finishVirtualTranscriptScrollbarDrag, true);
+  frameWindow?.addEventListener("mouseup", finishVirtualTranscriptScrollbarDrag, true);
+  frameWindow?.addEventListener("blur", finishVirtualTranscriptScrollbarDrag);
+  installVirtualTranscriptWindowDragRelease();
+}
+
+function installVirtualTranscriptWindowDragRelease() {
+  if (state.virtualTranscriptWindowDragListenersInstalled) {
+    return;
+  }
+  state.virtualTranscriptWindowDragListenersInstalled = true;
+  window.addEventListener("pointerup", finishVirtualTranscriptScrollbarDrag, true);
+  window.addEventListener("mouseup", finishVirtualTranscriptScrollbarDrag, true);
+}
+
+function handleVirtualTranscriptScroll() {
+  const transcript = state.virtualTranscript;
+  if (transcript.scrollbarDragActive) {
+    transcript.renderAfterScrollbarDrag = true;
+    return;
+  }
+  scheduleVirtualTranscriptRender({ delay: VIRTUAL_TRANSCRIPT_SCROLL_RENDER_IDLE_MS });
+}
+
+function handleVirtualTranscriptPointerDown(event) {
+  if ((event.button !== undefined && event.button !== 0) || !isMessagesScrollbarPointerEvent(event)) {
+    return;
+  }
+  beginVirtualTranscriptScrollbarDrag();
+}
+
+function isMessagesScrollbarPointerEvent(event) {
+  const root = els.messages;
+  if (!root) {
+    return false;
+  }
+  const rect = root.getBoundingClientRect();
+  const x = event.clientX;
+  const y = event.clientY;
+  if (!Number.isFinite(x) || !Number.isFinite(y) || y < rect.top || y > rect.bottom) {
+    return false;
+  }
+  const scrollbarWidth = Math.max(
+    8,
+    root.offsetWidth - root.clientWidth,
+    state.messagesFrameScrollbarWidth || 0
+  );
+  const doc = els.messagesDocument;
+  const direction = doc?.defaultView?.getComputedStyle(root).direction;
+  if (direction === "rtl") {
+    return x >= rect.left - 2 && x <= rect.left + scrollbarWidth + 2;
+  }
+  return x >= rect.right - scrollbarWidth - 2 && x <= rect.right + 2;
+}
+
+function beginVirtualTranscriptScrollbarDrag() {
+  const transcript = state.virtualTranscript;
+  if (transcript.scrollbarDragActive) {
+    return;
+  }
+  transcript.scrollbarDragActive = true;
+  transcript.renderAfterScrollbarDrag = false;
+  transcript.measureAfterScrollbarDrag = true;
+  cancelVirtualTranscriptScheduledRender();
+  cancelVirtualTranscriptScheduledMeasure();
+}
+
+function finishVirtualTranscriptScrollbarDrag() {
+  const transcript = state.virtualTranscript;
+  if (!transcript.scrollbarDragActive) {
+    return;
+  }
+  const shouldRender = transcript.renderAfterScrollbarDrag || transcript.measureAfterScrollbarDrag;
+  transcript.scrollbarDragActive = false;
+  transcript.renderAfterScrollbarDrag = false;
+  transcript.measureAfterScrollbarDrag = false;
+  if (shouldRender) {
+    scheduleVirtualTranscriptRender({ force: true });
+  }
+}
+
+function cancelVirtualTranscriptScheduledRender() {
+  const transcript = state.virtualTranscript;
+  if (transcript.renderFrame !== null) {
+    window.cancelAnimationFrame(transcript.renderFrame);
+    transcript.renderFrame = null;
+  }
+  if (transcript.renderTimer !== null) {
+    window.clearTimeout(transcript.renderTimer);
+    transcript.renderTimer = null;
+  }
+}
+
+function cancelVirtualTranscriptScheduledMeasure() {
+  const transcript = state.virtualTranscript;
+  if (transcript.measureFrame !== null) {
+    window.cancelAnimationFrame(transcript.measureFrame);
+    transcript.measureFrame = null;
+  }
 }
 
 function installMessagesSelectionTracking() {
@@ -2006,7 +2125,27 @@ function scheduleVirtualTranscriptRender(options = {}) {
     return;
   }
   if (options.force) {
+    cancelVirtualTranscriptScheduledRender();
     renderVirtualTranscriptWindow({ force: true });
+    return;
+  }
+  if (transcript.scrollbarDragActive) {
+    transcript.renderAfterScrollbarDrag = true;
+    return;
+  }
+  const delay = options.delay || 0;
+  if (delay > 0) {
+    if (transcript.renderTimer !== null) {
+      window.clearTimeout(transcript.renderTimer);
+    }
+    transcript.renderTimer = window.setTimeout(() => {
+      transcript.renderTimer = null;
+      if (transcript.scrollbarDragActive) {
+        transcript.renderAfterScrollbarDrag = true;
+        return;
+      }
+      scheduleVirtualTranscriptRender({ force: true });
+    }, delay);
     return;
   }
   if (transcript.renderFrame !== null) {
@@ -2115,6 +2254,10 @@ function observeRenderedVirtualUnits() {
 
 function scheduleVirtualTranscriptMeasure(options = {}) {
   const transcript = state.virtualTranscript;
+  if (transcript.scrollbarDragActive && options.force !== true) {
+    transcript.measureAfterScrollbarDrag = true;
+    return;
+  }
   if (transcript.measureFrame !== null) {
     return;
   }
@@ -2126,6 +2269,10 @@ function scheduleVirtualTranscriptMeasure(options = {}) {
 
 function measureRenderedVirtualUnits(options = {}) {
   const transcript = state.virtualTranscript;
+  if (transcript.scrollbarDragActive && options.force !== true) {
+    transcript.measureAfterScrollbarDrag = true;
+    return;
+  }
   if (!transcript.windowElement) {
     return;
   }
