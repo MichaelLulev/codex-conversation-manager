@@ -31,6 +31,7 @@ const MESSAGE_RENDER_MAX_BATCH_UNITS = 220;
 const MESSAGE_RENDER_TIME_BUDGET_MS = 14;
 const EAGER_MESSAGE_BODY_UNITS = 90;
 const LAZY_MESSAGE_BODY_ROOT_MARGIN = "1600px 0px";
+const LAZY_MESSAGE_BODY_SCROLL_IDLE_MS = 3000;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
 const MAX_INTRALINE_DIFF_CELLS = 120000;
@@ -406,8 +407,7 @@ function installLazyMessageBodyRenderer() {
   if (!els.messages) {
     return;
   }
-  els.messages.addEventListener("scroll", () => scheduleLazyMessageBodyRender({ delay: 650 }), { passive: true });
-  els.messages.addEventListener("scrollend", () => scheduleLazyMessageBodyRender({ force: true }), { passive: true });
+  els.messages.addEventListener("scroll", () => scheduleLazyMessageBodyRender({ delay: LAZY_MESSAGE_BODY_SCROLL_IDLE_MS }), { passive: true });
 }
 
 function registerLazyMessageBody(body) {

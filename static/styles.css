@@ -1070,28 +1070,6 @@ button:disabled {
   display: none;
 }
 
-.branch-marker,
-.message,
-.tool-run,
-.rollback-group {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 128px;
-}
-
-.message.collapsed,
-.tool-run.collapsed,
-.rollback-group.collapsed {
-  contain-intrinsic-size: auto 46px;
-}
-
-.message.user {
-  contain-intrinsic-size: auto 96px;
-}
-
-.message.assistant {
-  contain-intrinsic-size: auto 144px;
-}
-
 .branch-marker {
   contain: layout paint style;
   min-width: 0;
