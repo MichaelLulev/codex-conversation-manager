@@ -397,6 +397,8 @@ function emptyVirtualTranscriptState() {
     bottomSpacer: null,
     renderFrame: null,
     renderTimer: null,
+    pendingRenderPreview: false,
+    renderMode: "full",
     measureFrame: null,
     resizeObserver: null,
     resolveTimer: null,
@@ -493,6 +495,7 @@ function handleVirtualTranscriptScroll() {
   const transcript = state.virtualTranscript;
   if (transcript.scrollbarDragActive) {
     transcript.renderAfterScrollbarDrag = true;
+    scheduleVirtualTranscriptRender({ preview: true });
     return;
   }
   scheduleVirtualTranscriptRender({ delay: VIRTUAL_TRANSCRIPT_SCROLL_RENDER_IDLE_MS });
@@ -557,6 +560,7 @@ function finishVirtualTranscriptScrollbarDrag() {
 
 function cancelVirtualTranscriptScheduledRender() {
   const transcript = state.virtualTranscript;
+  transcript.pendingRenderPreview = false;
   if (transcript.renderFrame !== null) {
     window.cancelAnimationFrame(transcript.renderFrame);
     transcript.renderFrame = null;
@@ -2126,7 +2130,20 @@ function scheduleVirtualTranscriptRender(options = {}) {
   }
   if (options.force) {
     cancelVirtualTranscriptScheduledRender();
-    renderVirtualTranscriptWindow({ force: true });
+    renderVirtualTranscriptWindow({ force: true, preview: options.preview === true });
+    return;
+  }
+  if (options.preview === true) {
+    transcript.pendingRenderPreview = true;
+    if (transcript.renderFrame !== null) {
+      return;
+    }
+    transcript.renderFrame = window.requestAnimationFrame(() => {
+      const preview = transcript.pendingRenderPreview;
+      transcript.pendingRenderPreview = false;
+      transcript.renderFrame = null;
+      renderVirtualTranscriptWindow({ preview });
+    });
     return;
   }
   if (transcript.scrollbarDragActive) {
@@ -2153,7 +2170,7 @@ function scheduleVirtualTranscriptRender(options = {}) {
   }
   transcript.renderFrame = window.requestAnimationFrame(() => {
     transcript.renderFrame = null;
-    renderVirtualTranscriptWindow();
+    renderVirtualTranscriptWindow({ preview: false });
   });
 }
 
@@ -2166,10 +2183,17 @@ function renderVirtualTranscriptWindow(options = {}) {
     transcript.windowElement.replaceChildren();
     updateVirtualTranscriptSpacers(0, 0);
     transcript.range = { start: 0, end: 0 };
+    transcript.renderMode = "full";
     return;
   }
   const range = virtualRangeForViewport();
-  if (!options.force && range.start === transcript.range.start && range.end === transcript.range.end) {
+  const renderMode = options.preview === true ? "preview" : "full";
+  if (
+    !options.force
+    && range.start === transcript.range.start
+    && range.end === transcript.range.end
+    && transcript.renderMode === renderMode
+  ) {
     updateVirtualTranscriptSpacers(range.start, range.end);
     return;
   }
@@ -2178,17 +2202,123 @@ function renderVirtualTranscriptWindow(options = {}) {
   const fragment = document.createDocumentFragment();
   for (let index = range.start; index < range.end; index += 1) {
     const unit = transcript.units[index];
-    const element = renderUnit(unit);
+    const element = options.preview === true
+      ? renderVirtualPreviewUnit(unit, index)
+      : renderUnit(unit);
     element.dataset.virtualUnitIndex = String(index);
     element.dataset.virtualUnitId = unit.id;
     fragment.appendChild(element);
   }
   transcript.windowElement.replaceChildren(fragment);
   transcript.range = range;
+  transcript.renderMode = renderMode;
   updateVirtualTranscriptSpacers(range.start, range.end);
+  if (options.preview === true) {
+    return;
+  }
   restoreActiveConversationSearchHighlight();
   observeRenderedVirtualUnits();
   scheduleVirtualTranscriptMeasure({ resolve: true });
+}
+
+function renderVirtualPreviewUnit(unit, index) {
+  const doc = els.messagesDocument || document;
+  const wrapper = doc.createElement("section");
+  wrapper.className = `virtual-preview-unit ${virtualPreviewUnitClass(unit)}`;
+  wrapper.style.height = `${Math.max(40, Math.round(virtualUnitHeight(index)))}px`;
+
+  const header = doc.createElement("div");
+  header.className = "virtual-preview-header";
+
+  const title = doc.createElement("span");
+  title.className = "virtual-preview-title";
+  title.textContent = virtualPreviewTitle(unit);
+
+  const meta = doc.createElement("span");
+  meta.className = "virtual-preview-meta";
+  meta.textContent = virtualPreviewMeta(unit);
+  header.append(title, meta);
+
+  const body = doc.createElement("div");
+  body.className = "virtual-preview-body";
+  const preview = virtualPreviewText(unit);
+  setAutoDirection(body, preview);
+  body.textContent = preview;
+
+  wrapper.append(header, body);
+  return wrapper;
+}
+
+function virtualPreviewUnitClass(unit) {
+  if (unit.type === "message") {
+    return unit.message?.role || "message";
+  }
+  if (unit.type === "toolRun") return "tool";
+  if (unit.type === "rollbackGroup") return "rolled-back";
+  if (unit.type === "branch") return "branch";
+  if (unit.type === "jumpMarker") return "event";
+  return "message";
+}
+
+function virtualPreviewTitle(unit) {
+  if (unit.type === "message") {
+    return exportRoleLabel(unit.message || {});
+  }
+  if (unit.type === "toolRun") {
+    return "Tools";
+  }
+  if (unit.type === "rollbackGroup") {
+    return "Rollback";
+  }
+  if (unit.type === "branch") {
+    return branchMarkerHeading(unit.branches || []);
+  }
+  if (unit.type === "jumpMarker") {
+    return "Filtered target";
+  }
+  return "Message";
+}
+
+function virtualPreviewMeta(unit) {
+  if (unit.type === "message") {
+    const message = unit.message || {};
+    return [message.time, message.phase].filter(Boolean).join(" | ");
+  }
+  if (unit.type === "toolRun") {
+    return toolRunMeta(unit.run || []);
+  }
+  if (unit.type === "rollbackGroup") {
+    return rollbackGroupMeta(unit.group || []);
+  }
+  if (unit.type === "branch") {
+    return `${(unit.branches || []).length} ${(unit.branches || []).length === 1 ? "link" : "links"}`;
+  }
+  if (unit.type === "jumpMarker") {
+    return `${(unit.markers || []).length} ${(unit.markers || []).length === 1 ? "marker" : "markers"}`;
+  }
+  return "";
+}
+
+function virtualPreviewText(unit) {
+  if (unit.type === "message") {
+    return collapsedMessageHeading(messageViewText(unit.message || {})) || compactInlineText(messageViewText(unit.message || {}), 220);
+  }
+  if (unit.type === "toolRun") {
+    return toolRunPreview(unit.run || []);
+  }
+  if (unit.type === "rollbackGroup") {
+    return rollbackGroupPreview(unit.group || []);
+  }
+  if (unit.type === "branch") {
+    return (unit.branches || [])
+      .map((branch) => branch.item?.preview || branch.item?.id || "")
+      .filter(Boolean)
+      .join(" | ");
+  }
+  if (unit.type === "jumpMarker") {
+    return (unit.markers || []).map((marker) => marker.label).filter(Boolean).join(" | ");
+  }
+  return "";
 }
 
 function virtualRangeForViewport() {

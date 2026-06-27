@@ -1065,6 +1065,82 @@ button:disabled {
   margin-top: 0;
 }
 
+.virtual-preview-unit {
+  contain: layout paint style;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: var(--space);
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.virtual-preview-unit.user {
+  border-color: #b6d9d4;
+  background: var(--user);
+}
+
+.virtual-preview-unit.assistant {
+  border-color: #e4d2b4;
+  background: var(--assistant);
+}
+
+.virtual-preview-unit.tool {
+  border-color: #cbd7d4;
+  background: #f8fbfa;
+}
+
+.virtual-preview-unit.event {
+  border-color: #d7dce0;
+  background: #fbfcfd;
+}
+
+.virtual-preview-unit.rolled-back {
+  border-style: dashed;
+  border-color: #d88c99;
+  background: #fff8f8;
+}
+
+.virtual-preview-header {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.virtual-preview-title {
+  min-width: 0;
+  flex: 0 1 auto;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-preview-meta {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-align: end;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-preview-body {
+  margin-top: var(--space-sm);
+  color: #344246;
+  overflow: hidden;
+  text-align: start;
+  text-overflow: ellipsis;
+  unicode-bidi: plaintext;
+}
+
 .message + .message,
 .message + .branch-marker,
 .message + .tool-run,
@@ -1087,7 +1163,8 @@ button:disabled {
 .virtual-transcript-window > .message,
 .virtual-transcript-window > .branch-marker,
 .virtual-transcript-window > .tool-run,
-.virtual-transcript-window > .rollback-group {
+.virtual-transcript-window > .rollback-group,
+.virtual-transcript-window > .virtual-preview-unit {
   margin-top: 0;
 }
 
