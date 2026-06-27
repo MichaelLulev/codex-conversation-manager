@@ -26,12 +26,12 @@ const MAIN_FILTER_LABELS = {
   archived: "archived conversations"
 };
 
-const MESSAGE_RENDER_MIN_BATCH_UNITS = 40;
-const MESSAGE_RENDER_MAX_BATCH_UNITS = 220;
-const MESSAGE_RENDER_TIME_BUDGET_MS = 14;
-const EAGER_MESSAGE_BODY_UNITS = 90;
-const LAZY_MESSAGE_BODY_ROOT_MARGIN = "1600px 0px";
-const LAZY_MESSAGE_BODY_SCROLL_IDLE_MS = 3000;
+const VIRTUAL_TRANSCRIPT_OVERSCAN_VIEWPORTS = 2.5;
+const VIRTUAL_TRANSCRIPT_MIN_OVERSCAN_PX = 1200;
+const VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT = 148;
+const VIRTUAL_TRANSCRIPT_GAP_PX = 8;
+const VIRTUAL_TRANSCRIPT_MEASURE_TOLERANCE_PX = 1;
+const VIRTUAL_TRANSCRIPT_RESOLVE_DELAY_MS = 80;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
 const MAX_INTRALINE_DIFF_CELLS = 120000;
@@ -121,9 +121,7 @@ const state = {
   messagesFrameSyncTimers: [],
   messagesFrameSyncPending: false,
   messagesFrameScrollbarWidth: null,
-  lazyMessageBodies: new Set(),
-  lazyMessageBodyRenderFrame: null,
-  lazyMessageBodyRenderTimer: null,
+  virtualTranscript: emptyVirtualTranscriptState(),
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
   toolRunByMessageIndex: new Map(),
@@ -330,7 +328,6 @@ function keepFocusInConfirmDialog(event) {
 }
 
 function setupMessagesFrame() {
-  disconnectLazyMessageBodyRenderer();
   const frame = els.messagesFrame;
   const doc = frame?.contentDocument || frame?.contentWindow?.document;
   if (!frame || !doc) {
@@ -374,10 +371,89 @@ function setupMessagesFrame() {
   if (!els.messages) {
     throw new Error("Conversation message root is unavailable");
   }
-  installLazyMessageBodyRenderer();
+  setupVirtualTranscriptDom();
+  installVirtualTranscriptScroll();
   installMessagesSelectionTracking();
   installMessagesFrameResizeSync();
   scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800], force: true });
+}
+
+function emptyVirtualTranscriptState() {
+  return {
+    units: [],
+    range: { start: 0, end: 0 },
+    heights: new Map(),
+    estimates: [],
+    offsets: [0],
+    totalHeight: 0,
+    averageHeight: VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT,
+    messageIndexToUnitIndex: new Map(),
+    anchorIdToUnitIndex: new Map(),
+    unitIdToIndex: new Map(),
+    topSpacer: null,
+    windowElement: null,
+    bottomSpacer: null,
+    renderFrame: null,
+    measureFrame: null,
+    resizeObserver: null,
+    resolveTimer: null
+  };
+}
+
+function resetVirtualTranscriptState({ clearDom = false } = {}) {
+  disconnectVirtualTranscriptObservers();
+  state.virtualTranscript = emptyVirtualTranscriptState();
+  if (clearDom && els.messages) {
+    els.messages.replaceChildren();
+  }
+}
+
+function disconnectVirtualTranscriptObservers() {
+  const transcript = state.virtualTranscript;
+  if (!transcript) {
+    return;
+  }
+  if (transcript.renderFrame !== null) {
+    window.cancelAnimationFrame(transcript.renderFrame);
+  }
+  if (transcript.measureFrame !== null) {
+    window.cancelAnimationFrame(transcript.measureFrame);
+  }
+  if (transcript.resolveTimer !== null) {
+    window.clearTimeout(transcript.resolveTimer);
+  }
+  if (transcript.resizeObserver) {
+    transcript.resizeObserver.disconnect();
+  }
+}
+
+function setupVirtualTranscriptDom() {
+  resetVirtualTranscriptState();
+  const doc = els.messagesDocument || document;
+  const topSpacer = doc.createElement("div");
+  topSpacer.className = "virtual-transcript-spacer";
+  topSpacer.setAttribute("aria-hidden", "true");
+
+  const windowElement = doc.createElement("div");
+  windowElement.className = "virtual-transcript-window";
+
+  const bottomSpacer = doc.createElement("div");
+  bottomSpacer.className = "virtual-transcript-spacer";
+  bottomSpacer.setAttribute("aria-hidden", "true");
+
+  els.messages.replaceChildren(topSpacer, windowElement, bottomSpacer);
+  state.virtualTranscript.topSpacer = topSpacer;
+  state.virtualTranscript.windowElement = windowElement;
+  state.virtualTranscript.bottomSpacer = bottomSpacer;
+}
+
+function installVirtualTranscriptScroll() {
+  if (!els.messages) {
+    return;
+  }
+  els.messages.addEventListener("scroll", () => {
+    scheduleVirtualTranscriptRender();
+  }, { passive: true });
 }
 
 function installMessagesSelectionTracking() {
@@ -389,84 +465,6 @@ function installMessagesSelectionTracking() {
   doc.addEventListener("selectionchange", update);
   doc.addEventListener("mouseup", update);
   doc.addEventListener("keyup", update);
-}
-
-function disconnectLazyMessageBodyRenderer() {
-  if (state.lazyMessageBodyRenderFrame !== null) {
-    window.cancelAnimationFrame(state.lazyMessageBodyRenderFrame);
-  }
-  if (state.lazyMessageBodyRenderTimer !== null) {
-    window.clearTimeout(state.lazyMessageBodyRenderTimer);
-  }
-  state.lazyMessageBodyRenderFrame = null;
-  state.lazyMessageBodyRenderTimer = null;
-  state.lazyMessageBodies.clear();
-}
-
-function installLazyMessageBodyRenderer() {
-  if (!els.messages) {
-    return;
-  }
-  els.messages.addEventListener("scroll", () => scheduleLazyMessageBodyRender({ delay: LAZY_MESSAGE_BODY_SCROLL_IDLE_MS }), { passive: true });
-}
-
-function registerLazyMessageBody(body) {
-  if (!body || body.dataset.rendered !== "false") {
-    return;
-  }
-  state.lazyMessageBodies.add(body);
-}
-
-function scheduleLazyMessageBodyRender(options = {}) {
-  const delay = options.delay || 0;
-  const force = options.force === true;
-  if (state.lazyMessageBodies.size === 0) {
-    return;
-  }
-  if (state.lazyMessageBodyRenderTimer !== null) {
-    window.clearTimeout(state.lazyMessageBodyRenderTimer);
-    state.lazyMessageBodyRenderTimer = null;
-  }
-  if (delay > 0 && !force) {
-    state.lazyMessageBodyRenderTimer = window.setTimeout(() => {
-      state.lazyMessageBodyRenderTimer = null;
-      scheduleLazyMessageBodyRender({ force: true });
-    }, delay);
-    return;
-  }
-  if (state.lazyMessageBodyRenderFrame !== null) {
-    return;
-  }
-  state.lazyMessageBodyRenderFrame = window.requestAnimationFrame(() => {
-    state.lazyMessageBodyRenderFrame = null;
-    renderVisibleLazyMessageBodies();
-  });
-}
-
-function renderVisibleLazyMessageBodies() {
-  if (!els.messages || state.lazyMessageBodies.size === 0) {
-    return;
-  }
-  const messagesRect = els.messages.getBoundingClientRect();
-  const viewportTop = messagesRect.top - parseInt(LAZY_MESSAGE_BODY_ROOT_MARGIN, 10);
-  const viewportBottom = messagesRect.bottom + parseInt(LAZY_MESSAGE_BODY_ROOT_MARGIN, 10);
-  let rendered = 0;
-  for (const body of Array.from(state.lazyMessageBodies)) {
-    if (!body.isConnected || body.dataset.rendered !== "false") {
-      state.lazyMessageBodies.delete(body);
-      continue;
-    }
-    const rect = body.getBoundingClientRect();
-    if (rect.bottom < viewportTop || rect.top > viewportBottom) {
-      continue;
-    }
-    ensureMessageBodyRendered(body);
-    rendered += 1;
-    if (rendered >= 24) {
-      scheduleLazyMessageBodyRender();
-      break;
-    }
-  }
 }
 
 function installMessagesFrameResizeSync() {
@@ -605,6 +603,9 @@ function syncMessagesFrameViewport(options = {}) {
     // Force WebKitGTK to materialize the iframe viewport before the next paint.
     void frame.offsetWidth;
     void root.offsetWidth;
+  }
+  if (changed) {
+    scheduleVirtualTranscriptRender();
   }
   return changed;
 }
@@ -901,6 +902,7 @@ function cancelDetailRequest() {
 function cancelMessageRender() {
   state.renderRequestId += 1;
   state.pendingScrollTarget = null;
+  resetVirtualTranscriptState({ clearDom: true });
 }
 
 function cancelScheduledConversationSearch() {
@@ -1417,7 +1419,6 @@ async function selectThread(threadId, options = {}) {
 function clearConversation() {
   cancelDetailRequest();
   cancelMessageRender();
-  disconnectLazyMessageBodyRenderer();
   state.selectedId = null;
   state.currentThread = null;
   state.expandedMessages = new Set();
@@ -1481,7 +1482,7 @@ async function renderConversation(detail) {
     return;
   }
   syncMessagesFrameViewport();
-  els.messages.replaceChildren();
+  setupVirtualTranscriptDom();
   const branchGroups = branchGroupsFor(detail);
   await renderMessages(detail, branchGroups, renderRequestId);
 }
@@ -1553,7 +1554,7 @@ function buildMessageUnits(detail, branchGroups, renderRequestId) {
 
   const startBranches = branchGroups.get("-1");
   if (startBranches && startBranches.length > 0) {
-    units.push(branchUnit(startBranches));
+    units.push(branchUnit(startBranches, -1));
   }
 
   for (const [index, message] of detail.messages.entries()) {
@@ -1580,7 +1581,7 @@ function buildMessageUnits(detail, branchGroups, renderRequestId) {
     const branches = branchGroups.get(String(index));
     if (branches && branches.length > 0) {
       flushToolRun();
-      units.push(branchUnit(branches));
+      units.push(branchUnit(branches, index));
     }
     const markers = jumpMarkers.get(String(index));
     if (markers && markers.length > 0) {
@@ -1779,55 +1780,31 @@ function rollbackLinkSummary(checkpointSummary, groupSummary) {
   return `${checkpointSummary} | ${groupSummary}`;
 }
 
-function branchUnit(branches) {
+function branchUnit(branches, anchorIndex = null) {
   return {
     type: "branch",
     branches,
-    startIndex: null,
-    endIndex: null,
+    startIndex: Number.isInteger(anchorIndex) ? anchorIndex : null,
+    endIndex: Number.isInteger(anchorIndex) ? anchorIndex : null,
     messageCount: 0
   };
 }
 
 async function renderMessageUnits(units, renderRequestId) {
-  let batchUnits = 0;
-  let renderedUnits = 0;
-  let batchStartedAt = performance.now();
-  let fragment = document.createDocumentFragment();
-  for (const unit of units) {
-    if (renderRequestId !== state.renderRequestId) {
-      return;
-    }
-    fragment.appendChild(renderUnit(unit, { unitOrdinal: renderedUnits }));
-    renderedUnits += 1;
-    batchUnits += 1;
-    const elapsed = performance.now() - batchStartedAt;
-    const shouldYield = batchUnits >= MESSAGE_RENDER_MIN_BATCH_UNITS
-      && (batchUnits >= MESSAGE_RENDER_MAX_BATCH_UNITS || elapsed >= MESSAGE_RENDER_TIME_BUDGET_MS);
-    if (shouldYield) {
-      els.messages.appendChild(fragment);
-      fragment = document.createDocumentFragment();
-      batchUnits = 0;
-      batchStartedAt = performance.now();
-      resolvePendingScrollTarget();
-      await nextFrame();
-    }
-  }
   if (renderRequestId !== state.renderRequestId) {
     return;
   }
-  if (fragment.childNodes.length > 0) {
-    els.messages.appendChild(fragment);
+  prepareVirtualTranscript(units);
+  renderVirtualTranscriptWindow({ force: true });
+  await nextFrame();
+  if (renderRequestId === state.renderRequestId) {
+    measureRenderedVirtualUnits({ resolve: true });
   }
-  scheduleLazyMessageBodyRender();
-  resolvePendingScrollTarget({ final: true });
 }
 
-function renderUnit(unit, options = {}) {
+function renderUnit(unit) {
   if (unit.type === "message") {
-    return renderMessage(unit.message, unit.index, {
-      deferBody: options.unitOrdinal >= EAGER_MESSAGE_BODY_UNITS
-    });
+    return renderMessage(unit.message, unit.index);
   }
   if (unit.type === "toolRun") {
     return renderToolRun(unit.run);
@@ -1841,6 +1818,389 @@ function renderUnit(unit, options = {}) {
   return renderBranchMarker(unit.branches);
 }
 
+function prepareVirtualTranscript(units) {
+  disconnectVirtualTranscriptObservers();
+  if (
+    !state.virtualTranscript.topSpacer
+    || !state.virtualTranscript.windowElement
+    || !state.virtualTranscript.bottomSpacer
+    || !state.virtualTranscript.windowElement.isConnected
+  ) {
+    setupVirtualTranscriptDom();
+  }
+  const transcript = state.virtualTranscript;
+  transcript.units = units.map((unit, index) => ({
+    ...unit,
+    id: virtualUnitId(unit, index)
+  }));
+  transcript.range = { start: 0, end: 0 };
+  transcript.heights = new Map();
+  transcript.estimates = transcript.units.map(estimateVirtualUnitHeight);
+  transcript.averageHeight = averageVirtualUnitHeight(transcript.estimates);
+  transcript.messageIndexToUnitIndex = new Map();
+  transcript.anchorIdToUnitIndex = new Map();
+  transcript.unitIdToIndex = new Map();
+  indexVirtualTranscriptUnits();
+  rebuildVirtualTranscriptOffsets();
+  updateVirtualTranscriptSpacers(0, 0);
+}
+
+function virtualUnitId(unit, index) {
+  if (unit.type === "message") {
+    return `message-${unit.index}`;
+  }
+  if (unit.type === "toolRun") {
+    return toolRunId(unit.startIndex, unit.endIndex);
+  }
+  if (unit.type === "rollbackGroup") {
+    return rollbackGroupId(unit.startIndex, unit.endIndex);
+  }
+  if (unit.type === "jumpMarker") {
+    return `jump-${unit.startIndex}-${unit.markers.map((marker) => marker.id).join("-")}`;
+  }
+  if (unit.type === "branch") {
+    return `branch-${unit.startIndex ?? "start"}-${unit.branches.map((branch) => branch.item?.id || "").join("-")}`;
+  }
+  return `${unit.type || "unit"}-${index}`;
+}
+
+function indexVirtualTranscriptUnits() {
+  const transcript = state.virtualTranscript;
+  transcript.unitIdToIndex.clear();
+  transcript.messageIndexToUnitIndex.clear();
+  transcript.anchorIdToUnitIndex.clear();
+  state.toolRunByMessageIndex = new Map();
+  for (const [unitIndex, unit] of transcript.units.entries()) {
+    transcript.unitIdToIndex.set(unit.id, unitIndex);
+    if (unit.type === "message") {
+      transcript.messageIndexToUnitIndex.set(unit.index, unitIndex);
+      continue;
+    }
+    if (unit.type === "toolRun") {
+      const runId = toolRunId(unit.startIndex, unit.endIndex);
+      for (const item of unit.run || []) {
+        transcript.messageIndexToUnitIndex.set(item.index, unitIndex);
+        state.toolRunByMessageIndex.set(item.index, runId);
+      }
+      continue;
+    }
+    if (unit.type === "rollbackGroup") {
+      const groupId = rollbackGroupId(unit.startIndex, unit.endIndex);
+      for (const item of unit.group || []) {
+        transcript.messageIndexToUnitIndex.set(item.index, unitIndex);
+        state.toolRunByMessageIndex.set(item.index, groupId);
+      }
+      continue;
+    }
+    if (unit.type === "jumpMarker") {
+      if (Number.isInteger(unit.startIndex)) {
+        transcript.messageIndexToUnitIndex.set(unit.startIndex, unitIndex);
+      }
+      for (const marker of unit.markers || []) {
+        if (marker.id) {
+          transcript.anchorIdToUnitIndex.set(marker.id, unitIndex);
+        }
+      }
+      continue;
+    }
+    if (unit.type === "branch") {
+      for (const branch of unit.branches || []) {
+        if (branch.item?.id) {
+          transcript.anchorIdToUnitIndex.set(branchMarkerId(branch.item.id), unitIndex);
+        }
+      }
+    }
+  }
+}
+
+function estimateVirtualUnitHeight(unit) {
+  if (unit.type === "message") {
+    return estimateVirtualMessageHeight(unit.message, unit.index);
+  }
+  if (unit.type === "toolRun") {
+    const runId = toolRunId(unit.startIndex, unit.endIndex);
+    if (!state.expandedToolRuns.has(runId)) {
+      return 52;
+    }
+    return 60 + estimateVirtualChildItemsHeight(unit.run || []);
+  }
+  if (unit.type === "rollbackGroup") {
+    const groupId = rollbackGroupId(unit.startIndex, unit.endIndex);
+    if (!state.expandedToolRuns.has(groupId)) {
+      return 58;
+    }
+    return 66 + estimateVirtualChildItemsHeight(unit.group || []);
+  }
+  if (unit.type === "branch") {
+    return 50 + ((unit.branches || []).length * 58);
+  }
+  if (unit.type === "jumpMarker") {
+    return 50 + ((unit.markers || []).length * 58);
+  }
+  return VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT;
+}
+
+function estimateVirtualChildItemsHeight(items) {
+  let total = 0;
+  for (const item of items) {
+    total += estimateVirtualMessageHeight(item.message, item.index);
+  }
+  if (items.length > 1) {
+    total += (items.length - 1) * VIRTUAL_TRANSCRIPT_GAP_PX;
+  }
+  return total;
+}
+
+function estimateVirtualMessageHeight(message, index = null) {
+  if (!message) {
+    return VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT;
+  }
+  const collapsed = COLLAPSED_MESSAGE_ROLES.has(message.role) || message.rolled_back;
+  if (collapsed && !state.expandedMessages.has(index)) {
+    return 48;
+  }
+  const textValue = messageViewText(message);
+  const lineCount = String(textValue || "").split(/\r\n|\r|\n/).length;
+  const wrappedLines = Math.ceil(String(textValue || "").length / 92);
+  const estimatedBodyLines = Math.max(lineCount, wrappedLines);
+  const bodyHeight = Math.min(900, Math.max(26, estimatedBodyLines * 22));
+  return 46 + bodyHeight + 18;
+}
+
+function averageVirtualUnitHeight(heights) {
+  if (!heights.length) {
+    return VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT;
+  }
+  const total = heights.reduce((sum, height) => sum + height, 0);
+  return Math.max(48, Math.round(total / heights.length));
+}
+
+function virtualUnitHeight(index) {
+  const transcript = state.virtualTranscript;
+  const unit = transcript.units[index];
+  if (!unit) {
+    return transcript.averageHeight || VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT;
+  }
+  return transcript.heights.get(unit.id) || transcript.estimates[index] || transcript.averageHeight || VIRTUAL_TRANSCRIPT_DEFAULT_UNIT_HEIGHT;
+}
+
+function rebuildVirtualTranscriptOffsets() {
+  const transcript = state.virtualTranscript;
+  const offsets = [0];
+  let total = 0;
+  for (let index = 0; index < transcript.units.length; index += 1) {
+    if (index > 0) {
+      total += VIRTUAL_TRANSCRIPT_GAP_PX;
+    }
+    offsets[index] = total;
+    total += virtualUnitHeight(index);
+  }
+  offsets[transcript.units.length] = total;
+  transcript.offsets = offsets;
+  transcript.totalHeight = total;
+}
+
+function scheduleVirtualTranscriptRender(options = {}) {
+  const transcript = state.virtualTranscript;
+  if (!els.messages || !transcript.windowElement || transcript.units.length === 0) {
+    return;
+  }
+  if (options.force) {
+    renderVirtualTranscriptWindow({ force: true });
+    return;
+  }
+  if (transcript.renderFrame !== null) {
+    return;
+  }
+  transcript.renderFrame = window.requestAnimationFrame(() => {
+    transcript.renderFrame = null;
+    renderVirtualTranscriptWindow();
+  });
+}
+
+function renderVirtualTranscriptWindow(options = {}) {
+  const transcript = state.virtualTranscript;
+  if (!els.messages || !transcript.windowElement) {
+    return;
+  }
+  if (transcript.units.length === 0) {
+    transcript.windowElement.replaceChildren();
+    updateVirtualTranscriptSpacers(0, 0);
+    transcript.range = { start: 0, end: 0 };
+    return;
+  }
+  const range = virtualRangeForViewport();
+  if (!options.force && range.start === transcript.range.start && range.end === transcript.range.end) {
+    updateVirtualTranscriptSpacers(range.start, range.end);
+    return;
+  }
+
+  clearVirtualTranscriptObserver();
+  const fragment = document.createDocumentFragment();
+  for (let index = range.start; index < range.end; index += 1) {
+    const unit = transcript.units[index];
+    const element = renderUnit(unit);
+    element.dataset.virtualUnitIndex = String(index);
+    element.dataset.virtualUnitId = unit.id;
+    fragment.appendChild(element);
+  }
+  transcript.windowElement.replaceChildren(fragment);
+  transcript.range = range;
+  updateVirtualTranscriptSpacers(range.start, range.end);
+  restoreActiveConversationSearchHighlight();
+  observeRenderedVirtualUnits();
+  scheduleVirtualTranscriptMeasure({ resolve: true });
+}
+
+function virtualRangeForViewport() {
+  const transcript = state.virtualTranscript;
+  const viewportHeight = Math.max(1, els.messages.clientHeight || 1);
+  const overscan = Math.max(VIRTUAL_TRANSCRIPT_MIN_OVERSCAN_PX, viewportHeight * VIRTUAL_TRANSCRIPT_OVERSCAN_VIEWPORTS);
+  const startOffset = Math.max(0, els.messages.scrollTop - overscan);
+  const endOffset = Math.min(transcript.totalHeight, els.messages.scrollTop + viewportHeight + overscan);
+  const start = Math.max(0, virtualUnitIndexAtOffset(startOffset) - 1);
+  const end = Math.min(transcript.units.length, virtualUnitIndexAtOffset(endOffset) + 2);
+  return { start, end: Math.max(start + 1, end) };
+}
+
+function virtualUnitIndexAtOffset(offset) {
+  const offsets = state.virtualTranscript.offsets;
+  let low = 0;
+  let high = Math.max(0, offsets.length - 2);
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const next = offsets[mid + 1] ?? Number.POSITIVE_INFINITY;
+    if (offset < offsets[mid]) {
+      high = mid - 1;
+    } else if (offset >= next) {
+      low = mid + 1;
+    } else {
+      return mid;
+    }
+  }
+  return Math.max(0, Math.min(offsets.length - 2, low));
+}
+
+function updateVirtualTranscriptSpacers(start, end) {
+  const transcript = state.virtualTranscript;
+  if (!transcript.topSpacer || !transcript.bottomSpacer) {
+    return;
+  }
+  const top = Math.max(0, transcript.offsets[start] || 0);
+  const bottom = Math.max(0, transcript.totalHeight - (transcript.offsets[end] || transcript.totalHeight));
+  transcript.topSpacer.style.height = `${Math.round(top)}px`;
+  transcript.bottomSpacer.style.height = `${Math.round(bottom)}px`;
+}
+
+function clearVirtualTranscriptObserver() {
+  const transcript = state.virtualTranscript;
+  if (transcript.resizeObserver) {
+    transcript.resizeObserver.disconnect();
+    transcript.resizeObserver = null;
+  }
+}
+
+function observeRenderedVirtualUnits() {
+  const transcript = state.virtualTranscript;
+  if (!("ResizeObserver" in window) || !transcript.windowElement) {
+    return;
+  }
+  transcript.resizeObserver = new ResizeObserver(() => {
+    scheduleVirtualTranscriptMeasure();
+  });
+  for (const element of transcript.windowElement.children) {
+    transcript.resizeObserver.observe(element);
+  }
+}
+
+function scheduleVirtualTranscriptMeasure(options = {}) {
+  const transcript = state.virtualTranscript;
+  if (transcript.measureFrame !== null) {
+    return;
+  }
+  transcript.measureFrame = window.requestAnimationFrame(() => {
+    transcript.measureFrame = null;
+    measureRenderedVirtualUnits(options);
+  });
+}
+
+function measureRenderedVirtualUnits(options = {}) {
+  const transcript = state.virtualTranscript;
+  if (!transcript.windowElement) {
+    return;
+  }
+  let changed = false;
+  let measuredTotal = 0;
+  let measuredCount = 0;
+  for (const element of transcript.windowElement.children) {
+    const unitId = element.dataset.virtualUnitId;
+    if (!unitId) {
+      continue;
+    }
+    const height = Math.ceil(element.getBoundingClientRect().height);
+    if (height <= 0) {
+      continue;
+    }
+    measuredTotal += height;
+    measuredCount += 1;
+    const previous = transcript.heights.get(unitId);
+    if (!previous || Math.abs(previous - height) > VIRTUAL_TRANSCRIPT_MEASURE_TOLERANCE_PX) {
+      transcript.heights.set(unitId, height);
+      changed = true;
+    }
+  }
+  if (measuredCount > 0) {
+    transcript.averageHeight = Math.max(48, Math.round(measuredTotal / measuredCount));
+  }
+  if (changed) {
+    rebuildVirtualTranscriptOffsets();
+    updateVirtualTranscriptSpacers(transcript.range.start, transcript.range.end);
+    scheduleVirtualTranscriptRender();
+    if (options.resolve) {
+      schedulePendingScrollResolution(0);
+      return;
+    }
+  }
+  if (options.resolve) {
+    resolvePendingScrollTarget();
+  }
+}
+
+function restoreActiveConversationSearchHighlight() {
+  if (
+    state.conversationSearch.activeIndex < 0
+    || state.conversationSearch.totalMatches === 0
+    || !state.conversationSearch.lowerQuery
+  ) {
+    return false;
+  }
+  const active = searchMatchAtIndex(state.conversationSearch.activeIndex);
+  if (!active) {
+    return false;
+  }
+  const wrapper = findRenderedMessageWrapper(active.messageIndex);
+  if (!wrapper) {
+    return false;
+  }
+  if (wrapper.classList.contains("collapsed")) {
+    expandCollapsedMessage(wrapper);
+  }
+  const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
+  ensureMessageBodyRendered(body);
+  body.hidden = false;
+  const mark = highlightNthSearchInElement(
+    body,
+    state.conversationSearch.lowerQuery,
+    state.conversationSearch.queryLength,
+    active.occurrenceIndex
+  );
+  if (!mark) {
+    return false;
+  }
+  state.conversationSearch.activeMarks = [mark];
+  return true;
+}
+
 function rerenderMessagesForCurrentFilters() {
   if (!state.currentThread) {
     return;
@@ -1852,7 +2212,7 @@ function rerenderMessagesForCurrentFilters() {
   const renderRequestId = state.renderRequestId + 1;
   state.renderRequestId = renderRequestId;
   state.toolRunByMessageIndex = new Map();
-  els.messages.replaceChildren();
+  setupVirtualTranscriptDom();
   renderMessages(state.currentThread, branchGroupsFor(state.currentThread), renderRequestId);
 }
 
@@ -2257,17 +2617,81 @@ async function createForkBeforeMessage(message, index, button) {
   }
 }
 
+function findRenderedMessageWrapper(messageIndex, { expandGroups = true } = {}) {
+  if (!Number.isInteger(messageIndex) || !els.messages) {
+    return null;
+  }
+  let wrapper = els.messages.querySelector(`.message[data-message-index="${messageIndex}"]`);
+  if (!wrapper && expandGroups) {
+    wrapper = expandToolRunForMessage(messageIndex);
+  }
+  return wrapper;
+}
+
+function focusElementInMessages(element, { className = "branch-link-focus", duration = 1600 } = {}) {
+  if (!element) {
+    return 0;
+  }
+  scrollElementIntoMessages(element);
+  element.classList.add(className);
+  window.setTimeout(() => element.classList.remove(className), duration);
+  return duration;
+}
+
+function virtualUnitIndexForMessage(messageIndex) {
+  return state.virtualTranscript.messageIndexToUnitIndex.get(messageIndex);
+}
+
+function scrollToVirtualUnitIndex(unitIndex, options = {}) {
+  const transcript = state.virtualTranscript;
+  if (!Number.isInteger(unitIndex) || unitIndex < 0 || unitIndex >= transcript.units.length || !els.messages) {
+    return false;
+  }
+  rebuildVirtualTranscriptOffsets();
+  const unitHeight = virtualUnitHeight(unitIndex);
+  const offset = transcript.offsets[unitIndex] || 0;
+  const target = offset - ((els.messages.clientHeight - unitHeight) / 2);
+  const maxScroll = Math.max(0, els.messages.scrollHeight - els.messages.clientHeight);
+  const clamped = Math.max(0, Math.min(target, maxScroll));
+  const duration = options.animate === false
+    ? setMessagesScrollTop(clamped)
+    : scrollMessagesTo(clamped);
+  scheduleVirtualTranscriptRender({ force: true });
+  schedulePendingScrollResolution(duration + VIRTUAL_TRANSCRIPT_RESOLVE_DELAY_MS);
+  return true;
+}
+
+function setMessagesScrollTop(target) {
+  cancelScrollAnimation();
+  els.messages.scrollTop = target;
+  return 0;
+}
+
+function schedulePendingScrollResolution(delay = VIRTUAL_TRANSCRIPT_RESOLVE_DELAY_MS) {
+  const transcript = state.virtualTranscript;
+  if (transcript.resolveTimer !== null) {
+    window.clearTimeout(transcript.resolveTimer);
+  }
+  transcript.resolveTimer = window.setTimeout(() => {
+    transcript.resolveTimer = null;
+    renderVirtualTranscriptWindow({ force: true });
+    measureRenderedVirtualUnits({ resolve: true });
+  }, Math.max(0, delay));
+}
+
 function scrollToMessageIndex(messageIndex, { defer = false, anchorId = null } = {}) {
   if (!Number.isInteger(messageIndex)) {
     return false;
   }
-  let wrapper = els.messages.querySelector(`.message[data-message-index="${messageIndex}"]`);
-  if (!wrapper) {
-    wrapper = expandToolRunForMessage(messageIndex);
-  }
+  let wrapper = findRenderedMessageWrapper(messageIndex);
   if (!wrapper) {
     if (scrollToAnchor(anchorId)) {
       return true;
+    }
+    const unitIndex = virtualUnitIndexForMessage(messageIndex);
+    if (Number.isInteger(unitIndex)) {
+      state.pendingScrollTarget = { type: "message", messageIndex, anchorId };
+      return scrollToVirtualUnitIndex(unitIndex);
     }
     if (defer) {
       state.pendingScrollTarget = { type: "message", messageIndex, anchorId };
@@ -2278,9 +2702,7 @@ function scrollToMessageIndex(messageIndex, { defer = false, anchorId = null } =
   if (wrapper.classList.contains("collapsed")) {
     expandCollapsedMessage(wrapper);
   }
-  scrollElementIntoMessages(wrapper);
-  wrapper.classList.add("branch-link-focus");
-  window.setTimeout(() => wrapper.classList.remove("branch-link-focus"), 1600);
+  focusElementInMessages(wrapper);
   return true;
 }
 
@@ -2320,11 +2742,14 @@ function scrollToAnchor(anchorId) {
   }
   const anchor = els.messagesDocument.getElementById(anchorId);
   if (!anchor) {
+    const unitIndex = state.virtualTranscript.anchorIdToUnitIndex.get(anchorId);
+    if (Number.isInteger(unitIndex)) {
+      state.pendingScrollTarget = { type: "anchor", anchorId };
+      return scrollToVirtualUnitIndex(unitIndex);
+    }
     return false;
   }
-  scrollElementIntoMessages(anchor);
-  anchor.classList.add("branch-link-focus");
-  window.setTimeout(() => anchor.classList.remove("branch-link-focus"), 1600);
+  focusElementInMessages(anchor);
   state.pendingScrollTarget = null;
   return true;
 }
@@ -2649,22 +3074,18 @@ function scrollToPendingBranch() {
 function jumpToBranch(branchId, { defer = false } = {}) {
   const marker = els.messagesDocument?.getElementById(branchMarkerId(branchId));
   if (!marker) {
+    const unitIndex = state.virtualTranscript.anchorIdToUnitIndex.get(branchMarkerId(branchId));
+    if (Number.isInteger(unitIndex)) {
+      state.pendingScrollTarget = { type: "branch", branchId };
+      return scrollToVirtualUnitIndex(unitIndex);
+    }
     if (defer) {
       state.pendingScrollTarget = { type: "branch", branchId };
     }
     return false;
   }
   state.pendingScrollTarget = null;
-  const markerRect = marker.getBoundingClientRect();
-  const messagesRect = els.messages.getBoundingClientRect();
-  const target = els.messages.scrollTop
-    + markerRect.top
-    - messagesRect.top
-    - ((els.messages.clientHeight - markerRect.height) / 2);
-  const maxScroll = els.messages.scrollHeight - els.messages.clientHeight;
-  const duration = scrollMessagesTo(Math.max(0, Math.min(target, maxScroll)));
-  marker.classList.add("branch-link-focus");
-  window.setTimeout(() => marker.classList.remove("branch-link-focus"), duration + 1200);
+  const duration = focusElementInMessages(marker, { duration: 1600 });
   return true;
 }
 
@@ -2673,14 +3094,100 @@ function resolvePendingScrollTarget({ final = false } = {}) {
   if (!target) {
     return;
   }
+  let resolved = false;
   if (target.type === "message") {
-    scrollToMessageIndex(target.messageIndex, { anchorId: target.anchorId });
+    resolved = focusRenderedMessageTarget(target);
   } else if (target.type === "branch") {
-    jumpToBranch(target.branchId);
+    resolved = focusRenderedAnchor(branchMarkerId(target.branchId));
+  } else if (target.type === "anchor") {
+    resolved = focusRenderedAnchor(target.anchorId);
+  } else if (target.type === "search") {
+    resolved = focusRenderedSearchTarget(target);
+  } else if (target.type === "conversationNavigation") {
+    resolved = focusRenderedConversationNavigationTarget(target);
   }
-  if (final && state.pendingScrollTarget === target) {
+  if ((resolved || final) && state.pendingScrollTarget === target) {
     state.pendingScrollTarget = null;
   }
+}
+
+function focusRenderedAnchor(anchorId) {
+  if (!anchorId || !els.messagesDocument) {
+    return false;
+  }
+  const anchor = els.messagesDocument.getElementById(anchorId);
+  if (!anchor) {
+    return false;
+  }
+  focusElementInMessages(anchor);
+  return true;
+}
+
+function focusRenderedMessageTarget(target) {
+  const wrapper = findRenderedMessageWrapper(target.messageIndex);
+  if (!wrapper) {
+    return false;
+  }
+  if (wrapper.classList.contains("collapsed")) {
+    expandCollapsedMessage(wrapper);
+  }
+  focusElementInMessages(wrapper);
+  return true;
+}
+
+function focusRenderedSearchTarget(target) {
+  const wrapper = findRenderedMessageWrapper(target.messageIndex);
+  if (!wrapper) {
+    return false;
+  }
+  if (wrapper.classList.contains("collapsed")) {
+    expandCollapsedMessage(wrapper);
+  }
+  const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
+  ensureMessageBodyRendered(body);
+  body.hidden = false;
+  const mark = highlightNthSearchInElement(
+    body,
+    state.conversationSearch.lowerQuery,
+    state.conversationSearch.queryLength,
+    target.occurrenceIndex
+  );
+  if (mark) {
+    state.conversationSearch.activeMarks = [mark];
+  }
+  state.conversationSearch.activeIndex = target.activeIndex;
+  updateConversationSearchControls();
+  focusElementInMessages(mark || wrapper);
+  return true;
+}
+
+function focusRenderedConversationNavigationTarget(target) {
+  const wrapper = findRenderedMessageWrapper(target.messageIndex);
+  if (!wrapper) {
+    return false;
+  }
+  if (wrapper.classList.contains("collapsed")) {
+    expandCollapsedMessage(wrapper);
+  }
+  if (target.quote) {
+    const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
+    ensureMessageBodyRendered(body);
+    body.hidden = false;
+    const mark = highlightAskCodexTargetInElement(body, target.quote);
+    if (mark) {
+      state.askCodex.activeMarks = [mark];
+      focusElementInMessages(mark);
+      wrapper.classList.add("branch-link-focus");
+      window.setTimeout(() => wrapper.classList.remove("branch-link-focus"), 1600);
+      els.askCodexStatus.textContent = `Scrolled to text in message ${target.messageIndex + 1}.`;
+      return true;
+    }
+    els.askCodexStatus.textContent = `Text not found in message ${target.messageIndex + 1}; scrolled to the message.`;
+  } else {
+    els.askCodexStatus.textContent = `Scrolled to message ${target.messageIndex + 1}.`;
+  }
+  focusElementInMessages(wrapper);
+  return true;
 }
 
 function scrollMessagesTo(target) {
@@ -3186,32 +3693,44 @@ function setActiveConversationMatch(index, { scroll = true, expandCollapsed = tr
     updateConversationSearchControls();
     return;
   }
-  let wrapper = els.messages.querySelector(`.message[data-message-index="${active.messageIndex}"]`);
-  if (!wrapper && expandCollapsed) {
-    wrapper = expandToolRunForMessage(active.messageIndex);
-  }
+  let wrapper = findRenderedMessageWrapper(active.messageIndex, { expandGroups: expandCollapsed });
   let activeElement = wrapper;
-  if (wrapper) {
-    if (wrapper.classList.contains("collapsed") && expandCollapsed) {
-      expandCollapsedMessage(wrapper);
+  if (!wrapper) {
+    state.conversationSearch.activeIndex = normalizedIndex;
+    updateConversationSearchControls();
+    if (scroll) {
+      const unitIndex = virtualUnitIndexForMessage(active.messageIndex);
+      if (Number.isInteger(unitIndex)) {
+        state.pendingScrollTarget = {
+          type: "search",
+          activeIndex: normalizedIndex,
+          messageIndex: active.messageIndex,
+          occurrenceIndex: active.occurrenceIndex
+        };
+        scrollToVirtualUnitIndex(unitIndex);
+      }
     }
-    const body = wrapper.querySelector(".message-body");
-    if (body && body.dataset.rendered === "false") {
-      ensureMessageBodyRendered(body);
-    }
-    const mark = body && !body.hidden
-      ? highlightNthSearchInElement(
-        body,
-        state.conversationSearch.lowerQuery,
-        state.conversationSearch.queryLength,
-        active.occurrenceIndex
-      )
-      : null;
-    if (mark) {
-      state.conversationSearch.activeMarks = [mark];
-    }
-    activeElement = mark || wrapper;
+    return;
   }
+  if (wrapper.classList.contains("collapsed") && expandCollapsed) {
+    expandCollapsedMessage(wrapper);
+  }
+  const body = wrapper.querySelector(".message-body");
+  if (body && body.dataset.rendered === "false") {
+    ensureMessageBodyRendered(body);
+  }
+  const mark = body && !body.hidden
+    ? highlightNthSearchInElement(
+      body,
+      state.conversationSearch.lowerQuery,
+      state.conversationSearch.queryLength,
+      active.occurrenceIndex
+    )
+    : null;
+  if (mark) {
+    state.conversationSearch.activeMarks = [mark];
+  }
+  activeElement = mark || wrapper;
   state.conversationSearch.activeIndex = normalizedIndex;
   updateConversationSearchControls();
 
@@ -3288,11 +3807,6 @@ function renderMessage(message, index = 0, options = {}) {
   const collapseRolledBack = message.rolled_back && !options.insideRollbackGroup;
   const isCollapsible = bodyRenderMode !== "diffs" && (COLLAPSED_MESSAGE_ROLES.has(message.role) || collapseRolledBack);
   const shouldLazyRenderBody = isCollapsible;
-  const shouldDeferVisibleBody = options.deferBody === true
-    && !isCollapsible
-    && !options.insideRollbackGroup
-    && bodyRenderMode === "full";
-  const shouldDeferActions = shouldDeferVisibleBody;
   const isExpanded = isCollapsible && state.expandedMessages.has(index);
   if (isCollapsible && !isExpanded) {
     wrapper.classList.add("collapsed");
@@ -3338,14 +3852,9 @@ function renderMessage(message, index = 0, options = {}) {
   source.className = "message-source";
   source.textContent = `${text(message.time)} | ${text(message.source)}${phase}${rollback}`;
 
-  const actions = shouldDeferActions ? null : renderMessageActions(message, index);
+  const actions = renderMessageActions(message, index);
   header.append(roleElement, source);
-  if (actions) {
-    header.appendChild(actions);
-  } else if (shouldDeferActions) {
-    wrapper.dataset.actionsRendered = "false";
-    wrapper.__message = message;
-  }
+  header.appendChild(actions);
 
   let body = null;
   if (isCollapsible) {
@@ -3376,14 +3885,6 @@ function renderMessage(message, index = 0, options = {}) {
       body.__messageRenderMode = bodyRenderMode;
       ensureMessageBodyRendered(body);
       body.hidden = !isExpanded;
-    } else if (shouldDeferVisibleBody) {
-      body.id = `message-body-${index}`;
-      body.dataset.rendered = "false";
-      body.__messageText = message.text || "";
-      body.__messageRenderMode = bodyRenderMode;
-      body.classList.add("message-body-lazy");
-      renderLazyMessageBodyPreview(body, message.text || "");
-      registerLazyMessageBody(body);
     } else {
       renderMessageBodyContent(body, message.text || "", bodyRenderMode);
     }
@@ -3455,24 +3956,6 @@ function renderMessageActions(message, index) {
     actions.appendChild(rollback);
   }
   return actions;
-}
-
-function ensureDeferredMessageActions(wrapper) {
-  if (!wrapper || wrapper.dataset.actionsRendered !== "false") {
-    return;
-  }
-  const index = Number(wrapper.dataset.messageIndex);
-  const message = wrapper.__message;
-  if (!message || !Number.isInteger(index)) {
-    wrapper.dataset.actionsRendered = "true";
-    return;
-  }
-  const header = wrapper.querySelector(".message-header");
-  if (header) {
-    header.appendChild(renderMessageActions(message, index));
-  }
-  wrapper.dataset.actionsRendered = "true";
-  delete wrapper.__message;
 }
 
 function createRollbackUndoButton(rollback, label = "Undo as fork") {
@@ -3890,6 +4373,7 @@ function setRollbackGroupExpanded(wrapper, body, toggle, expanded) {
       state.expandedToolRuns.delete(groupId);
     }
   }
+  scheduleVirtualTranscriptMeasure();
 }
 
 function toolRunId(start, end) {
@@ -3946,6 +4430,7 @@ function setToolRunExpanded(wrapper, body, toggle, expanded) {
       state.expandedToolRuns.delete(runId);
     }
   }
+  scheduleVirtualTranscriptMeasure();
 }
 
 function expandToolRunForMessage(messageIndex) {
@@ -4085,27 +4570,14 @@ function setCollapsedMessageExpanded(wrapper, body, toggle, expanded) {
   if (icon) {
     icon.textContent = expanded ? "-" : "+";
   }
-}
-
-function renderLazyMessageBodyPreview(body, value) {
-  const textValue = String(value || "");
-  if (!textValue) {
-    body.textContent = "";
-    return;
-  }
-  setAutoDirection(body, textValue);
-  body.textContent = textValue;
+  scheduleVirtualTranscriptMeasure();
 }
 
 function ensureMessageBodyRendered(body) {
   if (body.dataset.rendered !== "false") {
     return;
   }
-  state.lazyMessageBodies.delete(body);
-  ensureDeferredMessageActions(body.closest(".message"));
   const value = body.__messageText || "";
-  body.classList.remove("message-body-lazy");
-  body.style.minHeight = "";
   renderMessageBodyContent(body, value, body.__messageRenderMode || "full");
   body.dataset.rendered = "true";
 }
@@ -5437,12 +5909,13 @@ function scrollToConversationNavigationTarget(target) {
   clearConversationHighlights();
   clearAskCodexNavigationHighlights();
 
-  let wrapper = els.messages?.querySelector(`.message[data-message-index="${target.messageIndex}"]`);
+  let wrapper = findRenderedMessageWrapper(target.messageIndex);
   if (!wrapper) {
-    wrapper = expandToolRunForMessage(target.messageIndex);
-  }
-  if (!wrapper) {
-    const deferred = scrollToMessageIndex(target.messageIndex, { defer: true });
+    const unitIndex = virtualUnitIndexForMessage(target.messageIndex);
+    const deferred = Number.isInteger(unitIndex) && scrollToVirtualUnitIndex(unitIndex);
+    if (deferred) {
+      state.pendingScrollTarget = { type: "conversationNavigation", ...target };
+    }
     els.askCodexStatus.textContent = deferred
       ? `Scrolled to message ${target.messageIndex + 1}.`
       : `Message ${target.messageIndex + 1} is hidden by the current filters.`;
