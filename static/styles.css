@@ -300,6 +300,10 @@ button:disabled {
   user-select: none;
 }
 
+.resizing-thread-panel .messages-frame {
+  pointer-events: none;
+}
+
 .search-row {
   display: grid;
   gap: var(--space);

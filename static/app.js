@@ -694,28 +694,45 @@ function startThreadPanelResize(event) {
   updateThreadPanelWidthFromPointer(event, { save: false, sync: false });
 
   const pointerId = event.pointerId;
+  try {
+    els.threadPanelResizer.setPointerCapture(pointerId);
+  } catch {
+    // Older WebKitGTK builds can throw if pointer capture is unavailable.
+  }
+
   const onMove = (moveEvent) => {
     if (moveEvent.pointerId === pointerId) {
       updateThreadPanelWidthFromPointer(moveEvent, { save: false, sync: false });
     }
   };
+  let ended = false;
   const onEnd = (endEvent) => {
-    if (endEvent.pointerId !== pointerId) {
+    if (ended || (endEvent.pointerId !== undefined && endEvent.pointerId !== pointerId)) {
       return;
     }
+    ended = true;
     state.threadPanel.dragging = false;
     els.threadPanelResizer.classList.remove("dragging");
     document.body.classList.remove("resizing-thread-panel");
     saveThreadPanelWidth();
     applyThreadPanelLayout({ force: true, frames: 3, delays: [80] });
+    try {
+      if (els.threadPanelResizer.hasPointerCapture(pointerId)) {
+        els.threadPanelResizer.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // Ignore pointer capture cleanup failures.
+    }
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onEnd);
     window.removeEventListener("pointercancel", onEnd);
+    els.threadPanelResizer.removeEventListener("lostpointercapture", onEnd);
   };
 
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onEnd);
   window.addEventListener("pointercancel", onEnd);
+  els.threadPanelResizer.addEventListener("lostpointercapture", onEnd);
 }
 
 function updateThreadPanelWidthFromPointer(event, options = {}) {
