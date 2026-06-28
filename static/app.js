@@ -35,6 +35,7 @@ const MAX_PAIR_SIMILARITY_CELLS = 20000;
 const MIN_INTRALINE_PAIR_SCORE = 0.62;
 const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
+const CONVERSATION_LOADING_DELAY_MS = 150;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
 const SEARCH_WORKER_URL = "/static/search-worker.js";
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
@@ -119,6 +120,13 @@ const state = {
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
   toolRunByMessageIndex: new Map(),
+  conversationLoading: {
+    active: false,
+    visible: false,
+    requestId: null,
+    threadId: null,
+    timer: null
+  },
   confirmDialog: {
     resolve: null,
     previousFocus: null
@@ -180,6 +188,8 @@ const els = {
   threadList: document.getElementById("thread-list"),
   emptyState: document.getElementById("empty-state"),
   emptyStateMessage: document.getElementById("empty-state-message"),
+  conversationLoading: document.getElementById("conversation-loading"),
+  conversationLoadingDetail: document.getElementById("conversation-loading-detail"),
   conversationView: document.getElementById("conversation-view"),
   conversationHeader: document.querySelector(".conversation-header"),
   conversationTitle: document.getElementById("conversation-title"),
@@ -842,10 +852,11 @@ function cancelConversationSearchWork() {
 }
 
 function setAskCodexRunning(running) {
+  const unavailable = !state.currentThread || state.conversationLoading.active;
   els.askCodexButton.textContent = running ? "Asking..." : "Ask";
-  els.askCodexButton.disabled = running || els.askCodexQuestion.value.trim() === "" || !state.currentThread;
+  els.askCodexButton.disabled = running || els.askCodexQuestion.value.trim() === "" || unavailable;
   els.askCodexStopButton.disabled = !running;
-  els.askSelectedButton.disabled = running || !state.askCodex.selectedText || !state.currentThread;
+  els.askSelectedButton.disabled = running || !state.askCodex.selectedText || unavailable;
 }
 
 function cancelAskCodexServerRequest(requestId) {
@@ -916,7 +927,10 @@ function updateSelectedTranscriptText() {
   const textValue = collapseWhitespace(selection ? selection.toString() : "");
   state.askCodex.selectedText = textValue;
   state.askCodex.selectedMessageIndex = selectedMessageIndex(selection);
-  els.askSelectedButton.disabled = Boolean(state.askCodex.serverRequestId) || !textValue || !state.currentThread;
+  els.askSelectedButton.disabled = Boolean(state.askCodex.serverRequestId)
+    || !textValue
+    || !state.currentThread
+    || state.conversationLoading.active;
   if (textValue) {
     const source = Number.isInteger(state.askCodex.selectedMessageIndex)
       ? ` in message ${state.askCodex.selectedMessageIndex + 1}`
@@ -1014,6 +1028,7 @@ async function loadThreads({ preserveSelection = true, preserveHiddenSelection =
 async function setMode(mode) {
   if (state.mode === mode) return;
   cancelThreadSearchTimer();
+  cancelConversationLoading();
   state.mode = mode;
   state.selectedId = null;
   state.currentThread = null;
@@ -1030,6 +1045,7 @@ async function openThread(kind, threadId, options = {}) {
     const clearingServerSearch = state.mode === kind && state.serverSearchActive;
     if (state.mode !== kind) {
       cancelDetailRequest();
+      cancelConversationLoading();
       state.mode = kind;
       state.selectedId = null;
       state.currentThread = null;
@@ -1066,9 +1082,116 @@ function renderMode() {
 
 function updateArchiveButton() {
   const summary = state.currentThread?.summary;
-  const canArchive = state.mode === "main" && summary && !summary.archived;
+  const canArchive = !state.conversationLoading.active && state.mode === "main" && summary && !summary.archived;
   els.archiveButton.disabled = !canArchive;
   els.archiveButton.textContent = summary?.archived ? "Archived" : "Archive";
+}
+
+function threadSummaryForId(threadId) {
+  return state.threads.find((thread) => thread.id === threadId) || null;
+}
+
+function beginConversationLoading(threadId, requestId) {
+  cancelConversationLoading();
+  const summary = threadSummaryForId(threadId);
+  state.conversationLoading = {
+    active: true,
+    visible: false,
+    requestId,
+    threadId,
+    timer: null
+  };
+  state.currentThread = null;
+  cancelScrollAnimation();
+  cancelMessageRender();
+  cancelConversationSearchWork();
+  clearConversationHighlights();
+  clearAskCodexNavigationHighlights();
+  resetConversationSearch();
+  resetAskCodex();
+  setConversationControlsLoading();
+  updateConversationLoadingDetail(summary, threadId);
+  state.conversationLoading.timer = window.setTimeout(() => {
+    showConversationLoading(requestId);
+  }, CONVERSATION_LOADING_DELAY_MS);
+}
+
+function updateConversationLoadingDetail(summary, threadId) {
+  const detail = summary?.preview || threadId || "";
+  if (!detail) {
+    els.conversationLoadingDetail.textContent = "";
+    return;
+  }
+  setAutoDirection(els.conversationLoadingDetail, detail);
+  els.conversationLoadingDetail.textContent = detail;
+}
+
+function showConversationLoading(requestId) {
+  if (!state.conversationLoading.active || state.conversationLoading.requestId !== requestId) {
+    return;
+  }
+  state.conversationLoading.visible = true;
+  els.emptyState.classList.add("hidden");
+  els.conversationView.classList.add("hidden");
+  els.conversationLoading.classList.remove("hidden");
+}
+
+function finishConversationLoading(requestId) {
+  if (state.conversationLoading.requestId !== requestId) {
+    return;
+  }
+  cancelConversationLoading();
+  if (state.currentThread) {
+    els.emptyState.classList.add("hidden");
+    els.conversationView.classList.remove("hidden");
+  }
+  setConversationControlsReady();
+  scheduleMessagesFrameSync({ frames: 4, delays: [40, 160, 500], force: true });
+}
+
+function cancelConversationLoading() {
+  if (state.conversationLoading.timer !== null) {
+    window.clearTimeout(state.conversationLoading.timer);
+  }
+  state.conversationLoading = {
+    active: false,
+    visible: false,
+    requestId: null,
+    threadId: null,
+    timer: null
+  };
+  els.conversationLoading.classList.add("hidden");
+}
+
+function setConversationControlsLoading() {
+  els.exportButton.disabled = true;
+  els.exportFormatSelect.disabled = true;
+  els.copyIdButton.disabled = true;
+  els.conversationSearchInput.disabled = true;
+  setMessageFilterControlsDisabled(true);
+  updateConversationSearchButtons();
+  updateArchiveButton();
+  setAskCodexRunning(false);
+}
+
+function setConversationControlsReady() {
+  const hasThread = Boolean(state.currentThread);
+  els.exportButton.disabled = !hasThread;
+  els.exportFormatSelect.disabled = !hasThread;
+  els.copyIdButton.disabled = !hasThread;
+  els.conversationSearchInput.disabled = !hasThread;
+  els.conversationSearchClear.disabled = els.conversationSearchInput.value.trim() === "";
+  setMessageFilterControlsDisabled(!hasThread);
+  updateConversationSearchButtons();
+  updateArchiveButton();
+  setAskCodexRunning(Boolean(state.askCodex.serverRequestId));
+  updateSelectedTranscriptText();
+}
+
+function setMessageFilterControlsDisabled(disabled) {
+  for (const control of els.messageFilters.querySelectorAll("input, button")) {
+    control.disabled = disabled;
+  }
 }
 
 function renderMessageFilterControls() {
@@ -1303,18 +1426,17 @@ async function selectThread(threadId, options = {}) {
   state.selectedId = threadId;
   renderThreadList();
   scrollSelectedThreadIntoView({ behavior: options.scrollListBehavior || "auto" });
-  els.exportButton.disabled = true;
-  els.exportFormatSelect.disabled = true;
-  els.copyIdButton.disabled = true;
-  updateArchiveButton();
-  resetAskCodex();
+  beginConversationLoading(threadId, requestId);
   try {
     const detail = await fetchJson(modeConfig().detailUrl(threadId), { signal: controller.signal });
     if (requestId !== state.detailRequestId) {
       return;
     }
     state.currentThread = detail;
-    await renderConversation(detail);
+    const rendered = await renderConversation(detail);
+    if (rendered && requestId === state.detailRequestId) {
+      finishConversationLoading(requestId);
+    }
   } catch (error) {
     if (requestId === state.detailRequestId && !isAbortError(error)) {
       showConversationError(error);
@@ -1329,6 +1451,7 @@ async function selectThread(threadId, options = {}) {
 function clearConversation() {
   cancelDetailRequest();
   cancelMessageRender();
+  cancelConversationLoading();
   state.selectedId = null;
   state.currentThread = null;
   state.expandedMessages = new Set();
@@ -1358,13 +1481,9 @@ async function renderConversation(detail) {
   state.renderRequestId = renderRequestId;
   const summary = detail.summary;
   els.emptyState.classList.add("hidden");
-  els.conversationView.classList.remove("hidden");
-  els.exportButton.disabled = false;
-  els.exportFormatSelect.disabled = false;
-  els.copyIdButton.disabled = false;
-  updateArchiveButton();
-  els.conversationSearchInput.disabled = false;
-  els.conversationSearchClear.disabled = els.conversationSearchInput.value.trim() === "";
+  if (!state.conversationLoading.visible) {
+    els.conversationView.classList.remove("hidden");
+  }
   resetAskCodex();
   setAskCodexRunning(false);
 
@@ -1383,18 +1502,19 @@ async function renderConversation(detail) {
 
   await nextFrame();
   if (renderRequestId !== state.renderRequestId) {
-    return;
+    return false;
   }
   setupMessagesFrame();
   syncMessagesFrameViewport();
   await nextFrame();
   if (renderRequestId !== state.renderRequestId) {
-    return;
+    return false;
   }
   syncMessagesFrameViewport();
   els.messages.replaceChildren();
   const branchGroups = branchGroupsFor(detail);
   await renderMessages(detail, branchGroups, renderRequestId);
+  return renderRequestId === state.renderRequestId;
 }
 
 function markFinalAssistantReplies(messages) {
@@ -3109,9 +3229,10 @@ function updateConversationSearchControls() {
 function updateConversationSearchButtons() {
   const query = els.conversationSearchInput.value.trim();
   const total = state.conversationSearch.totalMatches;
-  els.conversationSearchPrev.disabled = total === 0;
-  els.conversationSearchNext.disabled = total === 0;
-  els.conversationSearchClear.disabled = query === "";
+  const unavailable = !state.currentThread || state.conversationLoading.active;
+  els.conversationSearchPrev.disabled = unavailable || total === 0;
+  els.conversationSearchNext.disabled = unavailable || total === 0;
+  els.conversationSearchClear.disabled = unavailable || query === "";
 }
 
 function setActiveConversationMatch(index, { scroll = true, expandCollapsed = true } = {}) {
@@ -5981,6 +6102,7 @@ async function archiveCurrentThread() {
 function showError(error) {
   cancelDetailRequest();
   cancelMessageRender();
+  cancelConversationLoading();
   els.threadList.replaceChildren();
   const box = document.createElement("div");
   box.className = "error";
@@ -5991,6 +6113,7 @@ function showError(error) {
 
 function showConversationError(error) {
   cancelMessageRender();
+  cancelConversationLoading();
   state.currentThread = null;
   resetConversationSearch();
   resetAskCodex();
