@@ -35,8 +35,6 @@ const MAX_PAIR_SIMILARITY_CELLS = 20000;
 const MIN_INTRALINE_PAIR_SCORE = 0.62;
 const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
-const CONVERSATION_LOADING_DELAY_MS = 150;
-const THREAD_SELECTION_DEBOUNCE_MS = 140;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
 const SEARCH_WORKER_URL = "/static/search-worker.js";
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
@@ -110,7 +108,6 @@ const state = {
   listAbortController: null,
   detailRequestId: 0,
   detailAbortController: null,
-  threadSelectionTimer: null,
   renderRequestId: 0,
   fullTextSearch: false,
   serverSearchActive: false,
@@ -118,16 +115,10 @@ const state = {
   messagesFrameResizeObserver: null,
   messagesFrameSyncTimers: [],
   messagesFrameSyncPending: false,
+  messagesFrameScrollbarWidth: null,
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
   toolRunByMessageIndex: new Map(),
-  conversationLoading: {
-    active: false,
-    visible: false,
-    requestId: null,
-    threadId: null,
-    timer: null
-  },
   confirmDialog: {
     resolve: null,
     previousFocus: null
@@ -189,8 +180,6 @@ const els = {
   threadList: document.getElementById("thread-list"),
   emptyState: document.getElementById("empty-state"),
   emptyStateMessage: document.getElementById("empty-state-message"),
-  conversationLoading: document.getElementById("conversation-loading"),
-  conversationLoadingDetail: document.getElementById("conversation-loading-detail"),
   conversationView: document.getElementById("conversation-view"),
   conversationHeader: document.querySelector(".conversation-header"),
   conversationTitle: document.getElementById("conversation-title"),
@@ -493,14 +482,18 @@ function syncMessagesFrameViewport(options = {}) {
   }
   const frameRect = frame.getBoundingClientRect();
   const viewRect = els.conversationView.getBoundingClientRect();
+  const contentWidth = Math.max(1, Math.round(viewRect.width));
+  const scrollbarWidth = measureMessagesFrameScrollbarWidth(doc);
+  const width = contentWidth + scrollbarWidth;
   const height = Math.max(1, Math.round(viewRect.bottom - frameRect.top));
-  if (viewRect.width <= 1 || height <= 1) {
+  if (width <= 1 || height <= 1) {
     return false;
   }
+  const widthPx = `${width}px`;
   const heightPx = `${height}px`;
   let changed = false;
-  if (frame.hasAttribute("width")) {
-    frame.removeAttribute("width");
+  if (frame.getAttribute("width") !== String(width)) {
+    frame.setAttribute("width", String(width));
     changed = true;
   }
   if (frame.getAttribute("height") !== String(height)) {
@@ -511,14 +504,12 @@ function syncMessagesFrameViewport(options = {}) {
     ? [frame, doc.documentElement, doc.body, root]
     : [frame];
   for (const element of sizedElements) {
-    if (element.style.height !== heightPx) {
-      element.style.height = heightPx;
+    if (element.style.width !== widthPx) {
+      element.style.width = widthPx;
       changed = true;
     }
-  }
-  for (const element of [frame, doc.documentElement, doc.body, root]) {
-    if (element.style.width) {
-      element.style.width = "";
+    if (element.style.height !== heightPx) {
+      element.style.height = heightPx;
       changed = true;
     }
   }
@@ -528,6 +519,30 @@ function syncMessagesFrameViewport(options = {}) {
     void root.offsetWidth;
   }
   return changed;
+}
+
+function measureMessagesFrameScrollbarWidth(doc) {
+  if (state.messagesFrameScrollbarWidth !== null) {
+    return state.messagesFrameScrollbarWidth;
+  }
+  const probe = doc.createElement("div");
+  probe.style.cssText = [
+    "position:absolute",
+    "top:-9999px",
+    "left:-9999px",
+    "width:100px",
+    "height:100px",
+    "overflow:scroll",
+    "visibility:hidden"
+  ].join(";");
+  const child = doc.createElement("div");
+  child.style.width = "200px";
+  child.style.height = "200px";
+  probe.appendChild(child);
+  doc.body.appendChild(probe);
+  state.messagesFrameScrollbarWidth = Math.max(0, probe.offsetWidth - probe.clientWidth);
+  probe.remove();
+  return state.messagesFrameScrollbarWidth;
 }
 
 function modeConfig() {
@@ -788,18 +803,10 @@ function newAskCodexServerRequestId() {
 }
 
 function cancelDetailRequest() {
-  cancelQueuedThreadSelection();
   state.detailRequestId += 1;
   if (state.detailAbortController) {
     state.detailAbortController.abort();
     state.detailAbortController = null;
-  }
-}
-
-function cancelQueuedThreadSelection() {
-  if (state.threadSelectionTimer !== null) {
-    window.clearTimeout(state.threadSelectionTimer);
-    state.threadSelectionTimer = null;
   }
 }
 
@@ -835,11 +842,10 @@ function cancelConversationSearchWork() {
 }
 
 function setAskCodexRunning(running) {
-  const unavailable = !state.currentThread || state.conversationLoading.active;
   els.askCodexButton.textContent = running ? "Asking..." : "Ask";
-  els.askCodexButton.disabled = running || els.askCodexQuestion.value.trim() === "" || unavailable;
+  els.askCodexButton.disabled = running || els.askCodexQuestion.value.trim() === "" || !state.currentThread;
   els.askCodexStopButton.disabled = !running;
-  els.askSelectedButton.disabled = running || !state.askCodex.selectedText || unavailable;
+  els.askSelectedButton.disabled = running || !state.askCodex.selectedText || !state.currentThread;
 }
 
 function cancelAskCodexServerRequest(requestId) {
@@ -910,10 +916,7 @@ function updateSelectedTranscriptText() {
   const textValue = collapseWhitespace(selection ? selection.toString() : "");
   state.askCodex.selectedText = textValue;
   state.askCodex.selectedMessageIndex = selectedMessageIndex(selection);
-  els.askSelectedButton.disabled = Boolean(state.askCodex.serverRequestId)
-    || !textValue
-    || !state.currentThread
-    || state.conversationLoading.active;
+  els.askSelectedButton.disabled = Boolean(state.askCodex.serverRequestId) || !textValue || !state.currentThread;
   if (textValue) {
     const source = Number.isInteger(state.askCodex.selectedMessageIndex)
       ? ` in message ${state.askCodex.selectedMessageIndex + 1}`
@@ -1011,7 +1014,6 @@ async function loadThreads({ preserveSelection = true, preserveHiddenSelection =
 async function setMode(mode) {
   if (state.mode === mode) return;
   cancelThreadSearchTimer();
-  cancelConversationLoading();
   state.mode = mode;
   state.selectedId = null;
   state.currentThread = null;
@@ -1028,7 +1030,6 @@ async function openThread(kind, threadId, options = {}) {
     const clearingServerSearch = state.mode === kind && state.serverSearchActive;
     if (state.mode !== kind) {
       cancelDetailRequest();
-      cancelConversationLoading();
       state.mode = kind;
       state.selectedId = null;
       state.currentThread = null;
@@ -1065,120 +1066,9 @@ function renderMode() {
 
 function updateArchiveButton() {
   const summary = state.currentThread?.summary;
-  const canArchive = !state.conversationLoading.active && state.mode === "main" && summary && !summary.archived;
+  const canArchive = state.mode === "main" && summary && !summary.archived;
   els.archiveButton.disabled = !canArchive;
   els.archiveButton.textContent = summary?.archived ? "Archived" : "Archive";
-}
-
-function threadSummaryForId(threadId) {
-  return state.threads.find((thread) => thread.id === threadId) || null;
-}
-
-function beginConversationLoading(threadId, requestId) {
-  cancelConversationLoading();
-  const summary = threadSummaryForId(threadId);
-  state.conversationLoading = {
-    active: true,
-    visible: false,
-    requestId,
-    threadId,
-    timer: null
-  };
-  state.currentThread = null;
-  cancelScrollAnimation();
-  cancelMessageRender();
-  cancelConversationSearchWork();
-  clearConversationHighlights();
-  clearAskCodexNavigationHighlights();
-  resetConversationSearch();
-  resetAskCodex();
-  setConversationControlsLoading();
-  updateConversationLoadingDetail(summary, threadId);
-  state.conversationLoading.timer = window.setTimeout(() => {
-    showConversationLoading(requestId);
-  }, CONVERSATION_LOADING_DELAY_MS);
-}
-
-function updateConversationLoadingDetail(summary, threadId) {
-  const detail = summary?.preview || threadId || "";
-  if (!detail) {
-    els.conversationLoadingDetail.textContent = "";
-    return;
-  }
-  setAutoDirection(els.conversationLoadingDetail, detail);
-  els.conversationLoadingDetail.textContent = detail;
-}
-
-function showConversationLoading(requestId) {
-  if (!state.conversationLoading.active || state.conversationLoading.requestId !== requestId) {
-    return;
-  }
-  state.conversationLoading.visible = true;
-  els.emptyState.classList.add("hidden");
-  if (!els.conversationView.classList.contains("hidden")) {
-    els.conversationView.classList.add("loading-underlay");
-  }
-  els.conversationLoading.classList.remove("hidden");
-}
-
-function finishConversationLoading(requestId) {
-  if (state.conversationLoading.requestId !== requestId) {
-    return;
-  }
-  cancelConversationLoading();
-  if (state.currentThread) {
-    els.emptyState.classList.add("hidden");
-    els.conversationView.classList.remove("loading-underlay");
-    els.conversationView.classList.remove("hidden");
-  }
-  setConversationControlsReady();
-  scheduleMessagesFrameSync({ frames: 4, delays: [40, 160, 500], force: true });
-}
-
-function cancelConversationLoading() {
-  if (state.conversationLoading.timer !== null) {
-    window.clearTimeout(state.conversationLoading.timer);
-  }
-  state.conversationLoading = {
-    active: false,
-    visible: false,
-    requestId: null,
-    threadId: null,
-    timer: null
-  };
-  els.conversationLoading.classList.add("hidden");
-  els.conversationView.classList.remove("loading-underlay");
-}
-
-function setConversationControlsLoading() {
-  els.exportButton.disabled = true;
-  els.exportFormatSelect.disabled = true;
-  els.copyIdButton.disabled = true;
-  els.conversationSearchInput.disabled = true;
-  setMessageFilterControlsDisabled(true);
-  updateConversationSearchButtons();
-  updateArchiveButton();
-  setAskCodexRunning(false);
-}
-
-function setConversationControlsReady() {
-  const hasThread = Boolean(state.currentThread);
-  els.exportButton.disabled = !hasThread;
-  els.exportFormatSelect.disabled = !hasThread;
-  els.copyIdButton.disabled = !hasThread;
-  els.conversationSearchInput.disabled = !hasThread;
-  els.conversationSearchClear.disabled = els.conversationSearchInput.value.trim() === "";
-  setMessageFilterControlsDisabled(!hasThread);
-  updateConversationSearchButtons();
-  updateArchiveButton();
-  setAskCodexRunning(Boolean(state.askCodex.serverRequestId));
-  updateSelectedTranscriptText();
-}
-
-function setMessageFilterControlsDisabled(disabled) {
-  for (const control of els.messageFilters.querySelectorAll("input, button")) {
-    control.disabled = disabled;
-  }
 }
 
 function renderMessageFilterControls() {
@@ -1351,7 +1241,7 @@ function renderThreadList() {
     button.className = `thread-item${thread.id === state.selectedId ? " active" : ""}`;
     button.dataset.threadId = thread.id;
     button.tabIndex = -1;
-    button.addEventListener("click", () => queueThreadSelection(thread.id));
+    button.addEventListener("click", () => selectThread(thread.id));
 
     const time = document.createElement("div");
     time.className = "thread-time";
@@ -1399,8 +1289,7 @@ function scrollSelectedThreadIntoView({ behavior = "auto" } = {}) {
   });
 }
 
-function beginThreadSelection(threadId, options = {}) {
-  cancelQueuedThreadSelection();
+async function selectThread(threadId, options = {}) {
   if (!options.preservePendingBranch) {
     state.pendingBranchId = null;
   }
@@ -1414,37 +1303,18 @@ function beginThreadSelection(threadId, options = {}) {
   state.selectedId = threadId;
   renderThreadList();
   scrollSelectedThreadIntoView({ behavior: options.scrollListBehavior || "auto" });
-  beginConversationLoading(threadId, requestId);
-  return { requestId, controller };
-}
-
-function queueThreadSelection(threadId, options = {}) {
-  const { requestId, controller } = beginThreadSelection(threadId, options);
-  state.threadSelectionTimer = window.setTimeout(() => {
-    state.threadSelectionTimer = null;
-    void loadSelectedThreadDetail(threadId, requestId, controller);
-  }, options.delay ?? THREAD_SELECTION_DEBOUNCE_MS);
-}
-
-async function selectThread(threadId, options = {}) {
-  const { requestId, controller } = beginThreadSelection(threadId, options);
-  await loadSelectedThreadDetail(threadId, requestId, controller);
-}
-
-async function loadSelectedThreadDetail(threadId, requestId, controller) {
-  if (requestId !== state.detailRequestId || controller.signal.aborted) {
-    return;
-  }
+  els.exportButton.disabled = true;
+  els.exportFormatSelect.disabled = true;
+  els.copyIdButton.disabled = true;
+  updateArchiveButton();
+  resetAskCodex();
   try {
     const detail = await fetchJson(modeConfig().detailUrl(threadId), { signal: controller.signal });
     if (requestId !== state.detailRequestId) {
       return;
     }
     state.currentThread = detail;
-    const rendered = await renderConversation(detail);
-    if (rendered && requestId === state.detailRequestId) {
-      finishConversationLoading(requestId);
-    }
+    await renderConversation(detail);
   } catch (error) {
     if (requestId === state.detailRequestId && !isAbortError(error)) {
       showConversationError(error);
@@ -1459,7 +1329,6 @@ async function loadSelectedThreadDetail(threadId, requestId, controller) {
 function clearConversation() {
   cancelDetailRequest();
   cancelMessageRender();
-  cancelConversationLoading();
   state.selectedId = null;
   state.currentThread = null;
   state.expandedMessages = new Set();
@@ -1490,11 +1359,12 @@ async function renderConversation(detail) {
   const summary = detail.summary;
   els.emptyState.classList.add("hidden");
   els.conversationView.classList.remove("hidden");
-  if (state.conversationLoading.visible) {
-    els.conversationView.classList.add("loading-underlay");
-  } else {
-    els.conversationView.classList.remove("loading-underlay");
-  }
+  els.exportButton.disabled = false;
+  els.exportFormatSelect.disabled = false;
+  els.copyIdButton.disabled = false;
+  updateArchiveButton();
+  els.conversationSearchInput.disabled = false;
+  els.conversationSearchClear.disabled = els.conversationSearchInput.value.trim() === "";
   resetAskCodex();
   setAskCodexRunning(false);
 
@@ -1513,19 +1383,18 @@ async function renderConversation(detail) {
 
   await nextFrame();
   if (renderRequestId !== state.renderRequestId) {
-    return false;
+    return;
   }
   setupMessagesFrame();
   syncMessagesFrameViewport();
   await nextFrame();
   if (renderRequestId !== state.renderRequestId) {
-    return false;
+    return;
   }
   syncMessagesFrameViewport();
   els.messages.replaceChildren();
   const branchGroups = branchGroupsFor(detail);
   await renderMessages(detail, branchGroups, renderRequestId);
-  return renderRequestId === state.renderRequestId;
 }
 
 function markFinalAssistantReplies(messages) {
@@ -3240,10 +3109,9 @@ function updateConversationSearchControls() {
 function updateConversationSearchButtons() {
   const query = els.conversationSearchInput.value.trim();
   const total = state.conversationSearch.totalMatches;
-  const unavailable = !state.currentThread || state.conversationLoading.active;
-  els.conversationSearchPrev.disabled = unavailable || total === 0;
-  els.conversationSearchNext.disabled = unavailable || total === 0;
-  els.conversationSearchClear.disabled = unavailable || query === "";
+  els.conversationSearchPrev.disabled = total === 0;
+  els.conversationSearchNext.disabled = total === 0;
+  els.conversationSearchClear.disabled = query === "";
 }
 
 function setActiveConversationMatch(index, { scroll = true, expandCollapsed = true } = {}) {
@@ -6113,7 +5981,6 @@ async function archiveCurrentThread() {
 function showError(error) {
   cancelDetailRequest();
   cancelMessageRender();
-  cancelConversationLoading();
   els.threadList.replaceChildren();
   const box = document.createElement("div");
   box.className = "error";
@@ -6124,7 +5991,6 @@ function showError(error) {
 
 function showConversationError(error) {
   cancelMessageRender();
-  cancelConversationLoading();
   state.currentThread = null;
   resetConversationSearch();
   resetAskCodex();
