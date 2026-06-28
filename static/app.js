@@ -36,6 +36,7 @@ const MIN_INTRALINE_PAIR_SCORE = 0.62;
 const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
 const CONVERSATION_LOADING_DELAY_MS = 150;
+const THREAD_SELECTION_DEBOUNCE_MS = 140;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
 const SEARCH_WORKER_URL = "/static/search-worker.js";
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
@@ -109,6 +110,7 @@ const state = {
   listAbortController: null,
   detailRequestId: 0,
   detailAbortController: null,
+  threadSelectionTimer: null,
   renderRequestId: 0,
   fullTextSearch: false,
   serverSearchActive: false,
@@ -786,10 +788,18 @@ function newAskCodexServerRequestId() {
 }
 
 function cancelDetailRequest() {
+  cancelQueuedThreadSelection();
   state.detailRequestId += 1;
   if (state.detailAbortController) {
     state.detailAbortController.abort();
     state.detailAbortController = null;
+  }
+}
+
+function cancelQueuedThreadSelection() {
+  if (state.threadSelectionTimer !== null) {
+    window.clearTimeout(state.threadSelectionTimer);
+    state.threadSelectionTimer = null;
   }
 }
 
@@ -1341,7 +1351,7 @@ function renderThreadList() {
     button.className = `thread-item${thread.id === state.selectedId ? " active" : ""}`;
     button.dataset.threadId = thread.id;
     button.tabIndex = -1;
-    button.addEventListener("click", () => selectThread(thread.id));
+    button.addEventListener("click", () => queueThreadSelection(thread.id));
 
     const time = document.createElement("div");
     time.className = "thread-time";
@@ -1389,7 +1399,8 @@ function scrollSelectedThreadIntoView({ behavior = "auto" } = {}) {
   });
 }
 
-async function selectThread(threadId, options = {}) {
+function beginThreadSelection(threadId, options = {}) {
+  cancelQueuedThreadSelection();
   if (!options.preservePendingBranch) {
     state.pendingBranchId = null;
   }
@@ -1404,6 +1415,26 @@ async function selectThread(threadId, options = {}) {
   renderThreadList();
   scrollSelectedThreadIntoView({ behavior: options.scrollListBehavior || "auto" });
   beginConversationLoading(threadId, requestId);
+  return { requestId, controller };
+}
+
+function queueThreadSelection(threadId, options = {}) {
+  const { requestId, controller } = beginThreadSelection(threadId, options);
+  state.threadSelectionTimer = window.setTimeout(() => {
+    state.threadSelectionTimer = null;
+    void loadSelectedThreadDetail(threadId, requestId, controller);
+  }, options.delay ?? THREAD_SELECTION_DEBOUNCE_MS);
+}
+
+async function selectThread(threadId, options = {}) {
+  const { requestId, controller } = beginThreadSelection(threadId, options);
+  await loadSelectedThreadDetail(threadId, requestId, controller);
+}
+
+async function loadSelectedThreadDetail(threadId, requestId, controller) {
+  if (requestId !== state.detailRequestId || controller.signal.aborted) {
+    return;
+  }
   try {
     const detail = await fetchJson(modeConfig().detailUrl(threadId), { signal: controller.signal });
     if (requestId !== state.detailRequestId) {
