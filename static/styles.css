@@ -1047,29 +1047,6 @@ button:disabled {
   scrollbar-gutter: stable;
 }
 
-.virtual-transcript-spacer {
-  min-height: 0;
-  pointer-events: none;
-}
-
-.virtual-transcript-window {
-  display: grid;
-  gap: var(--space);
-  min-width: 0;
-}
-
-.virtual-transcript-window > .message,
-.virtual-transcript-window > .branch-marker,
-.virtual-transcript-window > .tool-run,
-.virtual-transcript-window > .rollback-group {
-  margin-top: 0;
-}
-
-.virtual-unit-clamped {
-  contain: layout paint style;
-  pointer-events: none;
-}
-
 .message + .message,
 .message + .branch-marker,
 .message + .tool-run,
@@ -1087,13 +1064,6 @@ button:disabled {
 .rollback-group + .tool-run,
 .rollback-group + .rollback-group {
   margin-top: var(--space);
-}
-
-.virtual-transcript-window > .message,
-.virtual-transcript-window > .branch-marker,
-.virtual-transcript-window > .tool-run,
-.virtual-transcript-window > .rollback-group {
-  margin-top: 0;
 }
 
 .message.filtered-out {
@@ -1545,12 +1515,6 @@ button:disabled {
   overflow-wrap: anywhere;
   text-align: start;
   unicode-bidi: plaintext;
-}
-
-.message-body.fast-drag-message-body {
-  display: block;
-  color: #344246;
-  white-space: normal;
 }
 
 .message-body > *:first-child {
