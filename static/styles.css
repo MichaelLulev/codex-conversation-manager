@@ -444,6 +444,12 @@ button:disabled {
   grid-template-rows: minmax(0, 1fr);
 }
 
+.reader-panel > .empty-state,
+.reader-panel > .conversation-loading,
+.reader-panel > .conversation-view {
+  grid-area: 1 / 1;
+}
+
 .empty-state {
   max-width: 1040px;
   width: 100%;
@@ -539,6 +545,11 @@ button:disabled {
   margin: 0 auto;
   display: grid;
   grid-template-rows: minmax(0, auto) minmax(var(--transcript-min-height), 1fr);
+}
+
+.conversation-view.loading-underlay {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .hidden {

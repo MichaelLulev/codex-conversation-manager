@@ -116,7 +116,6 @@ const state = {
   messagesFrameResizeObserver: null,
   messagesFrameSyncTimers: [],
   messagesFrameSyncPending: false,
-  messagesFrameScrollbarWidth: null,
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
   toolRunByMessageIndex: new Map(),
@@ -492,18 +491,14 @@ function syncMessagesFrameViewport(options = {}) {
   }
   const frameRect = frame.getBoundingClientRect();
   const viewRect = els.conversationView.getBoundingClientRect();
-  const contentWidth = Math.max(1, Math.round(viewRect.width));
-  const scrollbarWidth = measureMessagesFrameScrollbarWidth(doc);
-  const width = contentWidth + scrollbarWidth;
   const height = Math.max(1, Math.round(viewRect.bottom - frameRect.top));
-  if (width <= 1 || height <= 1) {
+  if (viewRect.width <= 1 || height <= 1) {
     return false;
   }
-  const widthPx = `${width}px`;
   const heightPx = `${height}px`;
   let changed = false;
-  if (frame.getAttribute("width") !== String(width)) {
-    frame.setAttribute("width", String(width));
+  if (frame.hasAttribute("width")) {
+    frame.removeAttribute("width");
     changed = true;
   }
   if (frame.getAttribute("height") !== String(height)) {
@@ -514,12 +509,14 @@ function syncMessagesFrameViewport(options = {}) {
     ? [frame, doc.documentElement, doc.body, root]
     : [frame];
   for (const element of sizedElements) {
-    if (element.style.width !== widthPx) {
-      element.style.width = widthPx;
-      changed = true;
-    }
     if (element.style.height !== heightPx) {
       element.style.height = heightPx;
+      changed = true;
+    }
+  }
+  for (const element of [frame, doc.documentElement, doc.body, root]) {
+    if (element.style.width) {
+      element.style.width = "";
       changed = true;
     }
   }
@@ -529,30 +526,6 @@ function syncMessagesFrameViewport(options = {}) {
     void root.offsetWidth;
   }
   return changed;
-}
-
-function measureMessagesFrameScrollbarWidth(doc) {
-  if (state.messagesFrameScrollbarWidth !== null) {
-    return state.messagesFrameScrollbarWidth;
-  }
-  const probe = doc.createElement("div");
-  probe.style.cssText = [
-    "position:absolute",
-    "top:-9999px",
-    "left:-9999px",
-    "width:100px",
-    "height:100px",
-    "overflow:scroll",
-    "visibility:hidden"
-  ].join(";");
-  const child = doc.createElement("div");
-  child.style.width = "200px";
-  child.style.height = "200px";
-  probe.appendChild(child);
-  doc.body.appendChild(probe);
-  state.messagesFrameScrollbarWidth = Math.max(0, probe.offsetWidth - probe.clientWidth);
-  probe.remove();
-  return state.messagesFrameScrollbarWidth;
 }
 
 function modeConfig() {
@@ -1132,7 +1105,9 @@ function showConversationLoading(requestId) {
   }
   state.conversationLoading.visible = true;
   els.emptyState.classList.add("hidden");
-  els.conversationView.classList.add("hidden");
+  if (!els.conversationView.classList.contains("hidden")) {
+    els.conversationView.classList.add("loading-underlay");
+  }
   els.conversationLoading.classList.remove("hidden");
 }
 
@@ -1143,6 +1118,7 @@ function finishConversationLoading(requestId) {
   cancelConversationLoading();
   if (state.currentThread) {
     els.emptyState.classList.add("hidden");
+    els.conversationView.classList.remove("loading-underlay");
     els.conversationView.classList.remove("hidden");
   }
   setConversationControlsReady();
@@ -1161,6 +1137,7 @@ function cancelConversationLoading() {
     timer: null
   };
   els.conversationLoading.classList.add("hidden");
+  els.conversationView.classList.remove("loading-underlay");
 }
 
 function setConversationControlsLoading() {
@@ -1481,8 +1458,11 @@ async function renderConversation(detail) {
   state.renderRequestId = renderRequestId;
   const summary = detail.summary;
   els.emptyState.classList.add("hidden");
-  if (!state.conversationLoading.visible) {
-    els.conversationView.classList.remove("hidden");
+  els.conversationView.classList.remove("hidden");
+  if (state.conversationLoading.visible) {
+    els.conversationView.classList.add("loading-underlay");
+  } else {
+    els.conversationView.classList.remove("loading-underlay");
   }
   resetAskCodex();
   setAskCodexRunning(false);
