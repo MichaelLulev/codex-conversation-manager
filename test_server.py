@@ -419,6 +419,38 @@ class ConversationForkTests(unittest.TestCase):
             ]
             self.assertEqual([item.text for item in fork_messages], ["first prompt", "first answer"])
 
+    def test_fork_after_assistant_response_excludes_next_user_turn_without_interruption(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            conn = create_state_db(home)
+            thread_id = "00000000-0000-0000-0000-000000000302"
+            rollout_path = create_two_turn_rollout(home, thread_id)
+            insert_thread(conn, thread_id, rollout_path, "Fork source")
+            conn.close()
+
+            reader = server.SideConversationReader(home)
+            target = next(
+                item for item in reader.rollout_messages(str(rollout_path))
+                if item.text == "first answer"
+            )
+            result = reader.create_fork_after_assistant_response(thread_id, target.line_number)
+
+            self.assertFalse(result["interrupted_boundary_added"])
+            fork_path = Path(result["rollout_path"])
+            fork_text = fork_path.read_text(encoding="utf-8")
+            self.assertIn("first prompt", fork_text)
+            self.assertIn("first answer", fork_text)
+            self.assertIn("turn_complete", fork_text)
+            self.assertNotIn("second prompt", fork_text)
+            self.assertNotIn("turn-2", fork_text)
+            self.assertNotIn(server.TURN_ABORTED_MARKER_TEXT, fork_text)
+
+            fork_messages = [
+                item for item in reader.rollout_messages(str(fork_path))
+                if item.role in {"user", "assistant"}
+            ]
+            self.assertEqual([item.text for item in fork_messages], ["first prompt", "first answer"])
+
 
 class ExportTests(unittest.TestCase):
     def test_save_export_file_writes_unique_file_under_downloads(self):

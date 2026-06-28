@@ -2841,6 +2841,49 @@ async function createForkBeforeMessage(message, index, button) {
   }
 }
 
+async function createForkAfterAssistantResponse(message, index, button) {
+  const summary = state.currentThread?.summary;
+  const lineNumber = message?.line_number;
+  if (!summary?.id || !Number.isInteger(lineNumber)) {
+    return;
+  }
+  const confirmed = await confirmWriteAction({
+    title: "Create fork after this assistant response?",
+    body: "This writes a new Codex conversation containing the history through this final assistant response. Later messages are not copied. The original conversation is left unchanged.",
+    details: [
+      { label: "Target", value: collapsedMessageHeading(message.text || "") || "Selected assistant response" },
+      { label: "Fork point", value: "Immediately after this assistant response" },
+      { label: "Change", value: "Creates a new resumable Codex conversation" }
+    ],
+    confirmLabel: "Create fork",
+    opener: button
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Creating...";
+  try {
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(summary.id)}/fork-after-assistant`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line_number: lineNumber })
+      }
+    );
+    els.sourceLine.textContent = `Created ${result.resume_command}`;
+    await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
+    await openThread("main", result.id);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = originalText;
+    els.sourceLine.textContent = error.message || String(error);
+  }
+}
+
 function findRenderedMessageWrapper(messageIndex, { expandGroups = true } = {}) {
   if (!Number.isInteger(messageIndex) || !els.messages) {
     return null;
@@ -4151,6 +4194,7 @@ function fastDragMessageBodyText(message) {
 function renderMessageActions(message, index) {
   const compaction = compactionCheckpointForMessage(index);
   const canFork = canForkFromMessage(message);
+  const canForkAfterAssistant = canForkAfterAssistantResponse(message);
   const canRollback = canRollbackToMessage(message, index);
   const rollbackCheckpoint = rollbackCheckpointForMessage(message, index);
   const actions = document.createElement("div");
@@ -4179,6 +4223,16 @@ function renderMessageActions(message, index) {
     fork.textContent = "Fork here";
     fork.title = "Create a new fork from the conversation state immediately after this user message.";
     fork.addEventListener("click", () => createForkFromMessage(message, index, fork));
+    actions.appendChild(fork);
+  }
+
+  if (canForkAfterAssistant) {
+    const fork = document.createElement("button");
+    fork.type = "button";
+    fork.className = "message-action primary";
+    fork.textContent = "Fork after";
+    fork.title = "Create a new fork from the conversation state immediately after this final assistant response.";
+    fork.addEventListener("click", () => createForkAfterAssistantResponse(message, index, fork));
     actions.appendChild(fork);
   }
 
@@ -4270,6 +4324,16 @@ function canForkFromMessage(message) {
     state.mode === "main"
     && state.currentThread?.summary?.id
     && message?.role === "user"
+    && Number.isInteger(message.line_number)
+  );
+}
+
+function canForkAfterAssistantResponse(message) {
+  return (
+    state.mode === "main"
+    && state.currentThread?.summary?.id
+    && message?.role === "assistant"
+    && message.__finalAssistantReply === true
     && Number.isInteger(message.line_number)
   );
 }

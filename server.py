@@ -1303,6 +1303,66 @@ class SideConversationReader:
         fork["target"] = asdict(target)
         return fork
 
+    def create_fork_after_assistant_response(
+        self, thread_id: str, line_number: int
+    ) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        rollout_path = row["rollout_path"]
+        if not rollout_path:
+            raise ValueError("Conversation does not have a rollout path")
+        source_path = Path(rollout_path).expanduser()
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+
+        before_stat = source_path.stat()
+        messages = self.rollout_messages(rollout_path)
+        if source_stat_changed(before_stat, source_path.stat()):
+            raise ValueError("Conversation changed while preparing fork; refresh and try again")
+        target_index = next((index for index, item in enumerate(messages) if item.line_number == line_number), None)
+        target = messages[target_index] if target_index is not None else None
+        if target is None:
+            raise ValueError("Target message was not found in this conversation")
+        if target.role != "assistant":
+            raise ValueError("Forks after an assistant response can only target an assistant message")
+        if not is_final_assistant_response(messages, target_index):
+            raise ValueError("Forks after assistant responses can only target a final assistant response")
+
+        prefix_line_count = self.prefix_line_count_after_assistant_response(source_path, line_number)
+        fork = self.create_synthetic_fork(
+            row=row,
+            source_thread_id=thread_id,
+            source_path=source_path,
+            prefix_line_count=prefix_line_count,
+            title=fork_title_after_assistant_response(target),
+            add_interrupted_boundary=False,
+        )
+        fork["line_number"] = line_number
+        fork["target"] = asdict(target)
+        return fork
+
+    def prefix_line_count_after_assistant_response(self, source_path: Path, line_number: int) -> int:
+        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
+        target_index = line_number - 1
+        if target_index < 0 or target_index >= len(lines):
+            raise ValueError("Target message line is outside the rollout file")
+
+        for index in range(target_index + 1, min(len(lines), target_index + 80)):
+            item = parse_rollout_json_line(lines[index])
+            payload = item.get("payload") if item else None
+            if not isinstance(payload, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "response_item" and response_item_is_real_user_message(payload):
+                break
+            if item_type != "event_msg":
+                continue
+            payload_type = payload.get("type")
+            if payload_type in {"turn_complete", "task_complete", "turn_aborted", "task_aborted"}:
+                return index + 1
+            if payload_type in {"turn_started", "task_started"} or event_item_is_real_user_message(payload):
+                break
+        return line_number
+
     def prefix_line_count_before_user_turn(
         self,
         source_path: Path,
@@ -1356,6 +1416,7 @@ class SideConversationReader:
         prefix_line_count: int,
         checkpoint: CompactionCheckpoint | RollbackCheckpoint | None = None,
         title: str | None = None,
+        add_interrupted_boundary: bool = True,
     ) -> dict[str, Any]:
         if prefix_line_count <= 0:
             raise ValueError("Cannot fork before the first rollout line")
@@ -1383,10 +1444,13 @@ class SideConversationReader:
             row=row,
         )
         copied_lines = strip_leading_session_meta(lines[:prefix_line_count])
-        copied_lines, interrupted_boundary_added = append_interrupted_boundary_if_needed(
-            copied_lines,
-            timestamp,
-        )
+        if add_interrupted_boundary:
+            copied_lines, interrupted_boundary_added = append_interrupted_boundary_if_needed(
+                copied_lines,
+                timestamp,
+            )
+        else:
+            interrupted_boundary_added = False
         self.write_synthetic_rollout(new_path, new_meta_line, copied_lines, fork_id)
 
         backup_path: str | None = None
@@ -2636,6 +2700,23 @@ def fork_title_from_message(message: Message) -> str:
 
 def fork_title_before_message(message: Message) -> str:
     return compact(f"Fork before message: {message.text}", 180)
+
+
+def fork_title_after_assistant_response(message: Message) -> str:
+    return compact(f"Fork after assistant: {message.text}", 180)
+
+
+def is_final_assistant_response(messages: list[Message], target_index: int) -> bool:
+    if target_index < 0 or target_index >= len(messages):
+        return False
+    if messages[target_index].role != "assistant":
+        return False
+    for message in messages[target_index + 1:]:
+        if message.role == "assistant":
+            return False
+        if message.role == "user":
+            return True
+    return True
 
 
 def session_meta_message(payload: dict[str, Any], timestamp: int | None) -> Message:
@@ -4183,6 +4264,7 @@ class AppHandler(BaseHTTPRequestHandler):
             create_rollback_suffix = "/rollback-to-message"
             fork_message_suffix = "/fork-from-message"
             fork_before_message_suffix = "/fork-before-message"
+            fork_after_assistant_suffix = "/fork-after-assistant"
             rollback_suffix = "/fork-before-rollback"
             compaction_suffix = "/fork-before-compaction"
             archive_suffix = "/archive"
@@ -4251,6 +4333,23 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(
                     self.reader.create_fork_from_message(thread_id, line_number),
+                    status=201,
+                )
+                return
+            if path.startswith("/api/main-threads/") and path.endswith(fork_after_assistant_suffix):
+                thread_id = unquote(
+                    path.removeprefix("/api/main-threads/")[: -len(fork_after_assistant_suffix)]
+                ).strip("/")
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread id")
+                    return
+                payload = self.read_json_body()
+                line_number = payload.get("line_number")
+                if not isinstance(line_number, int):
+                    self.send_error_json(400, "Missing target line_number")
+                    return
+                self.send_json(
+                    self.reader.create_fork_after_assistant_response(thread_id, line_number),
                     status=201,
                 )
                 return
