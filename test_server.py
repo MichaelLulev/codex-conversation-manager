@@ -451,6 +451,31 @@ class ConversationForkTests(unittest.TestCase):
             ]
             self.assertEqual([item.text for item in fork_messages], ["first prompt", "first answer"])
 
+    def test_fork_after_assistant_response_requires_completed_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            conn = create_state_db(home)
+            thread_id = "00000000-0000-0000-0000-000000000303"
+            rollout_dir = home / "sessions" / "2026" / "06" / "02"
+            rollout_dir.mkdir(parents=True, exist_ok=True)
+            rollout_path = rollout_dir / f"rollout-2026-06-02T12-31-00-{thread_id}.jsonl"
+            rollout_path.write_text(
+                session_meta_line(thread_id)
+                + response_message_line("user", "first prompt")
+                + response_message_line("assistant", "first answer"),
+                encoding="utf-8",
+            )
+            insert_thread(conn, thread_id, rollout_path, "Fork source")
+            conn.close()
+
+            reader = server.SideConversationReader(home)
+            target = next(
+                item for item in reader.rollout_messages(str(rollout_path))
+                if item.text == "first answer"
+            )
+            with self.assertRaisesRegex(ValueError, "no completed turn boundary"):
+                reader.create_fork_after_assistant_response(thread_id, target.line_number)
+
 
 class ExportTests(unittest.TestCase):
     def test_save_export_file_writes_unique_file_under_downloads(self):

@@ -1357,11 +1357,11 @@ class SideConversationReader:
             if item_type != "event_msg":
                 continue
             payload_type = payload.get("type")
-            if payload_type in {"turn_complete", "task_complete", "turn_aborted", "task_aborted"}:
+            if payload_type in {"turn_complete", "task_complete"}:
                 return index + 1
-            if payload_type in {"turn_started", "task_started"} or event_item_is_real_user_message(payload):
+            if payload_type in {"turn_started", "task_started", "turn_aborted", "task_aborted"} or event_item_is_real_user_message(payload):
                 break
-        return line_number
+        raise ValueError("Cannot fork after this assistant response because no completed turn boundary was found")
 
     def prefix_line_count_before_user_turn(
         self,
