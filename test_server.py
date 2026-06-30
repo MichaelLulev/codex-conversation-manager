@@ -272,6 +272,104 @@ class PatchDiffTests(unittest.TestCase):
         self.assertEqual(server.message_text_for_filters(message, {"patch"}), message.text)
 
 
+class MainHistoryWindowTests(unittest.TestCase):
+    def message(self, index):
+        return server.Message(
+            role="user",
+            text=f"message {index}",
+            timestamp=None,
+            time=None,
+            source="test",
+        )
+
+    def compaction(self, ordinal, message_index):
+        return server.CompactionCheckpoint(
+            ordinal=ordinal,
+            line_number=ordinal * 10,
+            copy_line_count=ordinal * 10 - 1,
+            timestamp=None,
+            time=None,
+            kind="compacted",
+            label="Compacted summary",
+            summary=f"compaction {ordinal}",
+            message_index=message_index,
+        )
+
+    def rollback(self, ordinal, message_index):
+        return server.RollbackCheckpoint(
+            ordinal=ordinal,
+            line_number=ordinal * 20,
+            copy_line_count=ordinal * 20 - 1,
+            timestamp=None,
+            time=None,
+            rollback_turns=1,
+            summary=f"rollback {ordinal}",
+            message_index=message_index,
+        )
+
+    def test_latest_compaction_window_slices_messages_and_remaps_checkpoints(self):
+        messages = [self.message(index) for index in range(6)]
+        compactions = [self.compaction(1, 1), self.compaction(2, 4)]
+        rollbacks = [self.rollback(1, 2), self.rollback(2, 5)]
+
+        display_messages, display_compactions, display_rollbacks, metadata = (
+            server.apply_main_history_window(
+                messages,
+                compactions,
+                rollbacks,
+                server.MAIN_HISTORY_WINDOW_LATEST_COMPACTION,
+            )
+        )
+
+        self.assertEqual([message.text for message in display_messages], ["message 4", "message 5"])
+        self.assertEqual([checkpoint.ordinal for checkpoint in display_compactions], [2])
+        self.assertEqual(display_compactions[0].message_index, 0)
+        self.assertEqual([checkpoint.ordinal for checkpoint in display_rollbacks], [2])
+        self.assertEqual(display_rollbacks[0].message_index, 1)
+        self.assertTrue(metadata["truncated"])
+        self.assertEqual(metadata["start_message_index"], 4)
+        self.assertEqual(metadata["shown_message_count"], 2)
+        self.assertEqual(metadata["total_message_count"], 6)
+
+    def test_latest_compaction_window_keeps_full_messages_when_no_indexed_compaction(self):
+        messages = [self.message(index) for index in range(3)]
+
+        display_messages, display_compactions, display_rollbacks, metadata = (
+            server.apply_main_history_window(
+                messages,
+                [],
+                [],
+                server.MAIN_HISTORY_WINDOW_LATEST_COMPACTION,
+            )
+        )
+
+        self.assertEqual(display_messages, messages)
+        self.assertEqual(display_compactions, [])
+        self.assertEqual(display_rollbacks, [])
+        self.assertFalse(metadata["truncated"])
+        self.assertEqual(metadata["shown_message_count"], 3)
+        self.assertEqual(metadata["total_message_count"], 3)
+
+    def test_full_window_preserves_messages_and_checkpoint_indexes(self):
+        messages = [self.message(index) for index in range(3)]
+        compactions = [self.compaction(1, 1)]
+        rollbacks = [self.rollback(1, 2)]
+
+        display_messages, display_compactions, display_rollbacks, metadata = (
+            server.apply_main_history_window(
+                messages,
+                compactions,
+                rollbacks,
+                server.MAIN_HISTORY_WINDOW_FULL,
+            )
+        )
+
+        self.assertEqual(display_messages, messages)
+        self.assertEqual(display_compactions[0].message_index, 1)
+        self.assertEqual(display_rollbacks[0].message_index, 2)
+        self.assertFalse(metadata["truncated"])
+
+
 def create_state_db(home: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(home / "state_5.sqlite")
     conn.execute(

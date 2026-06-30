@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import asdict
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -39,6 +40,9 @@ DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 SIDE_BOUNDARY_MARKER = "Side conversation boundary."
 WEBSOCKET_MARKER = "websocket event:"
 MAIN_THREAD_FILTERS = {"all", "with_side", "with_forks", "forked", "with_rollback", "archived"}
+MAIN_HISTORY_WINDOW_FULL = "full"
+MAIN_HISTORY_WINDOW_LATEST_COMPACTION = "latest_compaction"
+MAIN_HISTORY_WINDOWS = {MAIN_HISTORY_WINDOW_FULL, MAIN_HISTORY_WINDOW_LATEST_COMPACTION}
 SQLITE_OPEN_ATTEMPTS = 5
 SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
@@ -133,6 +137,72 @@ class RollbackCheckpoint:
     rollback_turns: int | None
     summary: str
     message_index: int | None = None
+
+
+def parse_main_history_window(value: str | None) -> str:
+    return value if value in MAIN_HISTORY_WINDOWS else MAIN_HISTORY_WINDOW_LATEST_COMPACTION
+
+
+def apply_main_history_window(
+    messages: list[Message],
+    compactions: list[CompactionCheckpoint],
+    rollbacks: list[RollbackCheckpoint],
+    history_window: str,
+) -> tuple[
+    list[Message],
+    list[CompactionCheckpoint],
+    list[RollbackCheckpoint],
+    dict[str, Any],
+]:
+    mode = parse_main_history_window(history_window)
+    start_index = 0
+    start_checkpoint: CompactionCheckpoint | None = None
+    if mode == MAIN_HISTORY_WINDOW_LATEST_COMPACTION:
+        start_checkpoint = latest_compaction_with_message_index(compactions)
+        if start_checkpoint and isinstance(start_checkpoint.message_index, int):
+            start_index = max(0, min(start_checkpoint.message_index, len(messages)))
+
+    display_messages = messages[start_index:] if start_index > 0 else messages
+    display_compactions = remap_checkpoints_for_history_window(compactions, start_index)
+    display_rollbacks = remap_checkpoints_for_history_window(rollbacks, start_index)
+    metadata = {
+        "mode": mode,
+        "truncated": start_index > 0,
+        "start_message_index": start_index,
+        "shown_message_count": len(display_messages),
+        "total_message_count": len(messages),
+        "checkpoint": asdict(start_checkpoint) if start_index > 0 and start_checkpoint else None,
+    }
+    return display_messages, display_compactions, display_rollbacks, metadata
+
+
+def latest_compaction_with_message_index(
+    compactions: list[CompactionCheckpoint],
+) -> CompactionCheckpoint | None:
+    indexed = [
+        checkpoint
+        for checkpoint in compactions
+        if isinstance(checkpoint.message_index, int)
+    ]
+    if not indexed:
+        return None
+    return max(indexed, key=lambda checkpoint: checkpoint.message_index or 0)
+
+
+def remap_checkpoints_for_history_window(
+    checkpoints: list[CompactionCheckpoint] | list[RollbackCheckpoint],
+    start_index: int,
+) -> list[CompactionCheckpoint] | list[RollbackCheckpoint]:
+    if start_index <= 0:
+        return checkpoints
+    remapped = []
+    for checkpoint in checkpoints:
+        if not isinstance(checkpoint.message_index, int):
+            continue
+        if checkpoint.message_index < start_index:
+            continue
+        remapped.append(replace(checkpoint, message_index=checkpoint.message_index - start_index))
+    return remapped
 
 
 @dataclass
@@ -1079,17 +1149,30 @@ class SideConversationReader:
                 (1 if archived else 0,),
             ).fetchall()
 
-    def get_main_thread(self, thread_id: str) -> dict[str, Any]:
-        row = self.main_thread_row(thread_id)
+    def main_thread_messages_and_checkpoints(
+        self, row: sqlite3.Row
+    ) -> tuple[list[Message], list[CompactionCheckpoint], list[RollbackCheckpoint]]:
         messages = self.rollout_messages(row["rollout_path"])
         compactions = self.rollout_compaction_checkpoints(row["rollout_path"])
         rollbacks = self.rollout_rollback_checkpoints(row["rollout_path"])
         messages.append(thread_metadata_message(row))
-        messages.extend(self.response_metadata_messages(thread_id))
+        messages.extend(self.response_metadata_messages(row["id"]))
         messages = finalize_messages(messages)
         self.attach_compaction_message_indexes(compactions, messages)
         self.attach_rollback_message_indexes(rollbacks, messages)
+        return messages, compactions, rollbacks
+
+    def get_main_thread(
+        self,
+        thread_id: str,
+        history_window: str = MAIN_HISTORY_WINDOW_LATEST_COMPACTION,
+    ) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        messages, compactions, rollbacks = self.main_thread_messages_and_checkpoints(row)
         summary = self.main_summary_from_row(row, messages)
+        display_messages, display_compactions, display_rollbacks, window_metadata = (
+            apply_main_history_window(messages, compactions, rollbacks, history_window)
+        )
         return {
             "summary": asdict(summary),
             "metadata": {
@@ -1107,9 +1190,10 @@ class SideConversationReader:
                 "git_sha": row["git_sha"],
                 "git_origin_url": row["git_origin_url"],
             },
-            "messages": [asdict(message) for message in messages],
-            "compactions": [asdict(checkpoint) for checkpoint in compactions],
-            "rollbacks": [asdict(checkpoint) for checkpoint in rollbacks],
+            "messages": [asdict(message) for message in display_messages],
+            "compactions": [asdict(checkpoint) for checkpoint in display_compactions],
+            "rollbacks": [asdict(checkpoint) for checkpoint in display_rollbacks],
+            "history_window": window_metadata,
             "related": self.related_for_main_thread(thread_id),
             "recovery_note": "Read from Codex's saved rollout transcript for this persisted session.",
         }
@@ -1120,6 +1204,7 @@ class SideConversationReader:
         thread_id: str,
         query: str,
         filters: set[str] | None = None,
+        history_window: str = MAIN_HISTORY_WINDOW_FULL,
     ) -> dict[str, Any]:
         normalized_query = query.strip()
         if not normalized_query:
@@ -1127,10 +1212,13 @@ class SideConversationReader:
 
         if kind == "main":
             row = self.main_thread_row(thread_id)
-            messages = self.rollout_messages(row["rollout_path"])
-            messages.append(thread_metadata_message(row))
-            messages.extend(self.response_metadata_messages(thread_id))
-            messages = finalize_messages(messages)
+            messages, compactions, rollbacks = self.main_thread_messages_and_checkpoints(row)
+            messages, _, _, _ = apply_main_history_window(
+                messages,
+                compactions,
+                rollbacks,
+                history_window,
+            )
         else:
             candidates = {item["id"]: item for item in self.side_candidates()}
             if thread_id not in candidates:
@@ -4187,13 +4275,24 @@ class AppHandler(BaseHTTPRequestHandler):
                 query = params.get("q", [""])[0]
                 filter_values = params.get("filters", [])
                 filters = parse_filter_param(filter_values[0]) if filter_values else None
+                history_window = parse_main_history_window(
+                    params.get("history_window", [MAIN_HISTORY_WINDOW_FULL])[0]
+                )
                 if not thread_id:
                     self.send_error_json(400, "Missing thread_id")
                     return
                 if kind not in {"main", "side"}:
                     self.send_error_json(400, "Invalid kind")
                     return
-                self.send_json(self.reader.search_thread(kind, thread_id, query, filters))
+                self.send_json(
+                    self.reader.search_thread(
+                        kind,
+                        thread_id,
+                        query,
+                        filters,
+                        history_window,
+                    )
+                )
             elif path == "/api/threads":
                 params = parse_qs(parsed.query)
                 query = params.get("q", [""])[0]
@@ -4216,8 +4315,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     ]
                 )
             elif path.startswith("/api/main-threads/"):
+                params = parse_qs(parsed.query)
                 thread_id = unquote(path.removeprefix("/api/main-threads/"))
-                self.send_json(self.reader.get_main_thread(thread_id))
+                history_window = parse_main_history_window(
+                    params.get("history_window", [MAIN_HISTORY_WINDOW_LATEST_COMPACTION])[0]
+                )
+                self.send_json(self.reader.get_main_thread(thread_id, history_window))
             elif path == "/api/export":
                 params = parse_qs(parsed.query)
                 thread_id = params.get("thread_id", [None])[0]
@@ -4226,7 +4329,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "Missing thread_id")
                     return
                 if kind == "main":
-                    self.send_json(self.reader.get_main_thread(thread_id))
+                    self.send_json(
+                        self.reader.get_main_thread(thread_id, MAIN_HISTORY_WINDOW_FULL)
+                    )
                 else:
                     self.send_json(self.reader.get_thread(thread_id))
             else:

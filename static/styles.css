@@ -542,6 +542,35 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.history-window {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border: 1px solid rgba(0, 143, 131, 0.28);
+  border-radius: 6px;
+  background: rgba(226, 247, 244, 0.72);
+  color: #344246;
+  font-size: 13px;
+}
+
+.history-window span {
+  min-width: 0;
+  flex: 1 1 260px;
+  overflow-wrap: anywhere;
+}
+
+.history-window button {
+  min-height: 32px;
+  padding: 0 10px;
+  border-color: rgba(0, 143, 131, 0.42);
+  background: #f7fffd;
+  color: #006d66;
+  font-weight: 800;
+}
+
 .conversation-search {
   min-width: 0;
   display: grid;

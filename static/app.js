@@ -2,7 +2,14 @@ const MODES = {
   main: {
     label: "Main",
     listUrl: "/api/main-threads",
-    detailUrl: (id) => `/api/main-threads/${encodeURIComponent(id)}`,
+    detailUrl: (id, options = {}) => {
+      const params = new URLSearchParams();
+      if (options.historyWindow) {
+        params.set("history_window", options.historyWindow);
+      }
+      const query = params.toString();
+      return `/api/main-threads/${encodeURIComponent(id)}${query ? `?${query}` : ""}`;
+    },
     searchPlaceholder: "Search main conversations",
     empty: "Select a main conversation to read it.",
     exportPrefix: "codex-main"
@@ -26,6 +33,8 @@ const MAIN_FILTER_LABELS = {
   archived: "archived conversations"
 };
 
+const MAIN_HISTORY_WINDOW_FULL = "full";
+const MAIN_HISTORY_WINDOW_LATEST_COMPACTION = "latest_compaction";
 const MESSAGE_RENDER_BATCH_SIZE = 100;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
@@ -101,6 +110,7 @@ const state = {
   threads: [],
   selectedId: null,
   currentThread: null,
+  fullHistoryThreadIds: new Set(),
   pendingBranchId: null,
   pendingScrollTarget: null,
   scrollAnimationFrame: null,
@@ -187,6 +197,9 @@ const els = {
   metaCount: document.getElementById("meta-count"),
   metaModel: document.getElementById("meta-model"),
   metaCwd: document.getElementById("meta-cwd"),
+  historyWindow: document.getElementById("history-window"),
+  historyWindowText: document.getElementById("history-window-text"),
+  historyWindowFullButton: document.getElementById("history-window-full-button"),
   relatedPanel: document.getElementById("related-panel"),
   conversationSearchInput: document.getElementById("conversation-search-input"),
   conversationSearchCount: document.getElementById("conversation-search-count"),
@@ -785,6 +798,45 @@ function newAskCodexServerRequestId() {
   return `ask-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+function mainHistoryWindowForThread(threadId, options = {}) {
+  if (state.mode !== "main" || !threadId) {
+    return null;
+  }
+  if (options.forceFullHistory || options.branchId || state.fullHistoryThreadIds.has(threadId)) {
+    return MAIN_HISTORY_WINDOW_FULL;
+  }
+  return MAIN_HISTORY_WINDOW_LATEST_COMPACTION;
+}
+
+function currentConversationHistoryWindow() {
+  if (state.mode !== "main") {
+    return null;
+  }
+  return state.currentThread?.history_window?.mode
+    || mainHistoryWindowForThread(state.currentThread?.summary?.id || state.selectedId);
+}
+
+async function loadFullHistoryForCurrentThread(options = {}) {
+  if (state.mode !== "main") {
+    return false;
+  }
+  const threadId = state.currentThread?.summary?.id || state.selectedId;
+  if (!threadId) {
+    return false;
+  }
+  state.fullHistoryThreadIds.add(threadId);
+  if (options.branchId) {
+    state.pendingBranchId = options.branchId;
+  }
+  els.sourceLine.textContent = "Loading full conversation...";
+  await selectThread(threadId, {
+    preservePendingBranch: true,
+    scrollListBehavior: options.scrollListBehavior || "auto",
+    forceFullHistory: true
+  });
+  return true;
+}
+
 function cancelDetailRequest() {
   state.detailRequestId += 1;
   if (state.detailAbortController) {
@@ -1028,7 +1080,11 @@ async function openThread(kind, threadId, options = {}) {
     if (clearingServerSearch && state.mode === kind) {
       await loadThreads({ preserveSelection: true, preserveHiddenSelection: true });
     }
-    await selectThread(threadId, { preservePendingBranch: true, scrollListBehavior: "smooth" });
+    await selectThread(threadId, {
+      preservePendingBranch: true,
+      scrollListBehavior: "smooth",
+      forceFullHistory: Boolean(options.forceFullHistory || options.branchId)
+    });
   } catch (error) {
     if (!isAbortError(error)) {
       showConversationError(error);
@@ -1273,6 +1329,10 @@ function scrollSelectedThreadIntoView({ behavior = "auto" } = {}) {
 }
 
 async function selectThread(threadId, options = {}) {
+  const historyWindow = mainHistoryWindowForThread(threadId, options);
+  if (state.mode === "main" && historyWindow === MAIN_HISTORY_WINDOW_FULL) {
+    state.fullHistoryThreadIds.add(threadId);
+  }
   if (!options.preservePendingBranch) {
     state.pendingBranchId = null;
   }
@@ -1292,7 +1352,10 @@ async function selectThread(threadId, options = {}) {
   updateArchiveButton();
   resetAskCodex();
   try {
-    const detail = await fetchJson(modeConfig().detailUrl(threadId), { signal: controller.signal });
+    const detail = await fetchJson(
+      modeConfig().detailUrl(threadId, { historyWindow }),
+      { signal: controller.signal }
+    );
     if (requestId !== state.detailRequestId) {
       return;
     }
@@ -1323,6 +1386,7 @@ function clearConversation() {
   els.conversationView.classList.add("hidden");
   els.relatedPanel.classList.add("hidden");
   els.relatedPanel.replaceChildren();
+  els.historyWindow?.classList.add("hidden");
   els.exportButton.disabled = true;
   els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
@@ -1354,9 +1418,10 @@ async function renderConversation(detail) {
   els.conversationTitle.textContent = summary.preview || "Conversation";
   els.conversationMeta.textContent = `${text(summary.started)} to ${text(summary.ended || summary.updated)}`;
   els.metaId.textContent = summary.id;
-  els.metaCount.textContent = `${summary.message_count} shown`;
+  updateMessageCount(detail.messages?.length || 0, detail.messages?.length || 0);
   els.metaModel.textContent = text(summary.model);
   els.metaCwd.textContent = text(summary.cwd);
+  renderHistoryWindow(detail);
   renderRelated(
     detail.related || {},
     summary,
@@ -1378,6 +1443,27 @@ async function renderConversation(detail) {
   els.messages.replaceChildren();
   const branchGroups = branchGroupsFor(detail);
   await renderMessages(detail, branchGroups, renderRequestId);
+}
+
+function renderHistoryWindow(detail) {
+  const historyWindow = detail?.history_window;
+  if (!els.historyWindow || !historyWindow?.truncated) {
+    els.historyWindow?.classList.add("hidden");
+    return;
+  }
+  const checkpoint = historyWindow.checkpoint || {};
+  const shown = formatCount(historyWindow.shown_message_count ?? (detail.messages || []).length);
+  const total = formatCount(historyWindow.total_message_count ?? detail.summary?.message_count ?? shown);
+  const checkpointLabel = checkpoint.ordinal
+    ? `compaction #${checkpoint.ordinal}`
+    : "the latest compaction";
+  const checkpointTime = checkpoint.time ? ` at ${checkpoint.time}` : "";
+  els.historyWindowText.textContent = [
+    `Loaded latest segment since ${checkpointLabel}${checkpointTime}: ${shown} of ${total} messages.`,
+    "Search, export, and Ask use this segment until the full conversation is loaded."
+  ].join(" ");
+  els.historyWindowFullButton.disabled = false;
+  els.historyWindow.classList.remove("hidden");
 }
 
 function markFinalAssistantReplies(messages) {
@@ -2579,6 +2665,10 @@ function jumpToBranch(branchId, { defer = false } = {}) {
     if (defer) {
       state.pendingScrollTarget = { type: "branch", branchId };
     }
+    if (state.mode === "main" && state.currentThread?.history_window?.truncated) {
+      void loadFullHistoryForCurrentThread({ branchId });
+      return true;
+    }
     return false;
   }
   state.pendingScrollTarget = null;
@@ -2765,6 +2855,10 @@ function conversationSearchUrl(query) {
     q: query,
     filters: enabledServerMessageFilterKeys().join(",")
   });
+  const historyWindow = currentConversationHistoryWindow();
+  if (historyWindow) {
+    params.set("history_window", historyWindow);
+  }
   return `/api/search?${params.toString()}`;
 }
 
@@ -3948,7 +4042,17 @@ function messageContainsDiff(message) {
 
 function updateMessageCount(visible, total) {
   if (state.currentThread && state.currentThread.summary) {
-    els.metaCount.textContent = `${visible} of ${total} shown`;
+    const historyWindow = state.currentThread.history_window;
+    if (historyWindow?.truncated) {
+      const totalMessages = historyWindow.total_message_count ?? state.currentThread.summary.message_count ?? total;
+      els.metaCount.textContent = visible === total
+        ? `${formatCount(total)} loaded (${formatCount(totalMessages)} total)`
+        : `${formatCount(visible)} of ${formatCount(total)} loaded (${formatCount(totalMessages)} total)`;
+      return;
+    }
+    els.metaCount.textContent = visible === total
+      ? `${formatCount(total)} shown`
+      : `${formatCount(visible)} of ${formatCount(total)} shown`;
   }
 }
 
@@ -5568,7 +5672,7 @@ function currentAskCodexContext() {
   const context = conversationAsCompactAskExport(exportThread);
   return {
     context,
-    truncated: false,
+    truncated: Boolean(exportThread.history_window?.truncated),
     messageCount: exportThread.messages.length
   };
 }
@@ -5609,6 +5713,15 @@ function conversationAsCompactAskExport(detail) {
   }
   if (detail.recovery_note) {
     lines.push(compactObjectLine("NOTE", { recovery: detail.recovery_note }, ["recovery"]));
+  }
+  if (detail.history_window) {
+    lines.push(compactObjectLine("HISTORY_WINDOW", detail.history_window, [
+      "mode",
+      "truncated",
+      "start_message_index",
+      "shown_message_count",
+      "total_message_count"
+    ]));
   }
 
   appendCompactRelated(lines, detail.related || {});
@@ -5712,7 +5825,10 @@ function compactAttributeName(key) {
     rollback_turns: "rb_turns",
     rolled_back: "rb",
     rolled_back_at: "rb_at",
+    shown_message_count: "shown",
+    start_message_index: "start_msg",
     time: "t",
+    total_message_count: "total",
     user_count: "user"
   }[key] || key;
 }
@@ -5831,6 +5947,10 @@ function conversationAsMarkdown(detail) {
     `- Messages: ${messages.length}`,
     ""
   ];
+  const windowLine = historyWindowExportLine(detail);
+  if (windowLine) {
+    lines.splice(lines.length - 1, 0, `- Loaded window: ${windowLine}`);
+  }
 
   for (const [index, message] of messages.entries()) {
     lines.push(`## ${index + 1}. ${exportRoleLabel(message)}`);
@@ -5860,6 +5980,10 @@ function conversationAsPlainText(detail, options = {}) {
     `Messages: ${messages.length}`,
     ""
   ];
+  const windowLine = historyWindowExportLine(detail);
+  if (windowLine) {
+    lines.splice(lines.length - 1, 0, `Loaded window: ${windowLine}`);
+  }
 
   for (const [index, message] of messages.entries()) {
     const messageNumber = options.includeNavigationRefs && Number.isInteger(message.message_number)
@@ -5875,6 +5999,20 @@ function conversationAsPlainText(detail, options = {}) {
     lines.push("", message.text || "", "");
   }
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function historyWindowExportLine(detail) {
+  const historyWindow = detail?.history_window;
+  if (!historyWindow?.truncated) {
+    return "";
+  }
+  const checkpoint = historyWindow.checkpoint || {};
+  const checkpointLabel = checkpoint.ordinal
+    ? `compaction #${checkpoint.ordinal}`
+    : "the latest compaction";
+  const shown = historyWindow.shown_message_count ?? (detail.messages || []).length;
+  const total = historyWindow.total_message_count ?? shown;
+  return `latest segment since ${checkpointLabel}, ${shown} of ${total} messages loaded before message filters`;
 }
 
 function exportRoleLabel(message) {
@@ -5982,6 +6120,7 @@ function showConversationError(error) {
   els.conversationView.classList.add("hidden");
   els.relatedPanel.classList.add("hidden");
   els.relatedPanel.replaceChildren();
+  els.historyWindow?.classList.add("hidden");
   els.exportButton.disabled = true;
   els.exportFormatSelect.disabled = true;
   els.copyIdButton.disabled = true;
@@ -6027,6 +6166,9 @@ async function init() {
   els.copyIdButton.addEventListener("click", copyCurrentId);
   els.archiveButton.addEventListener("click", () => {
     void archiveCurrentThread();
+  });
+  els.historyWindowFullButton?.addEventListener("click", () => {
+    void loadFullHistoryForCurrentThread();
   });
   els.searchInput.addEventListener("input", () => {
     state.filter = els.searchInput.value;
