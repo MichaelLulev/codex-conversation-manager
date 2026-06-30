@@ -42,6 +42,8 @@ const MAX_PAIR_SIMILARITY_CELLS = 20000;
 const MIN_INTRALINE_PAIR_SCORE = 0.62;
 const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
+const SEGMENT_AUTOLOAD_DELAY_MS = 260;
+const SEGMENT_AUTOLOAD_MARGIN_PX = 180;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
 const SEARCH_WORKER_URL = "/static/search-worker.js";
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
@@ -110,7 +112,13 @@ const state = {
   currentThread: null,
   pendingBranchId: null,
   pendingScrollTarget: null,
+  pendingSegmentScrollAnchor: null,
   scrollAnimationFrame: null,
+  segmentAutoLoadTimer: null,
+  segmentAutoLoading: false,
+  segmentLoadPromises: new Map(),
+  messagesPointerDown: false,
+  segmentAutoLoadPausedUntil: 0,
   listRequestId: 0,
   listAbortController: null,
   detailRequestId: 0,
@@ -377,8 +385,138 @@ function setupMessagesFrame() {
     throw new Error("Conversation message root is unavailable");
   }
   installMessagesSelectionTracking();
+  installSegmentGapAutoLoad();
   installMessagesFrameResizeSync();
   scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800], force: true });
+}
+
+function installSegmentGapAutoLoad() {
+  const doc = els.messagesDocument;
+  const root = els.messages;
+  if (!doc || !root) {
+    return;
+  }
+
+  const markPointerDown = () => {
+    state.messagesPointerDown = true;
+    clearSegmentAutoLoadTimer();
+  };
+  const markPointerReleased = () => {
+    if (!state.messagesPointerDown) {
+      return;
+    }
+    state.messagesPointerDown = false;
+    scheduleSegmentGapAutoLoad();
+  };
+
+  root.addEventListener("scroll", () => scheduleSegmentGapAutoLoad(), { passive: true });
+  doc.addEventListener("pointerdown", markPointerDown, { passive: true });
+  doc.addEventListener("mousedown", markPointerDown, { passive: true });
+  doc.addEventListener("pointerup", markPointerReleased, { passive: true });
+  doc.addEventListener("pointercancel", markPointerReleased, { passive: true });
+  doc.addEventListener("mouseup", markPointerReleased, { passive: true });
+  doc.defaultView?.addEventListener("pointerup", markPointerReleased, { passive: true });
+  doc.defaultView?.addEventListener("mouseup", markPointerReleased, { passive: true });
+}
+
+function clearSegmentAutoLoadTimer() {
+  if (state.segmentAutoLoadTimer === null) {
+    return;
+  }
+  window.clearTimeout(state.segmentAutoLoadTimer);
+  state.segmentAutoLoadTimer = null;
+}
+
+function scheduleSegmentGapAutoLoad() {
+  clearSegmentAutoLoadTimer();
+  if (
+    !hasSegmentedConversation()
+    || state.segmentAutoLoading
+    || state.messagesPointerDown
+    || !els.messages
+  ) {
+    return;
+  }
+  if (performance.now() < state.segmentAutoLoadPausedUntil) {
+    return;
+  }
+  state.segmentAutoLoadTimer = window.setTimeout(() => {
+    state.segmentAutoLoadTimer = null;
+    void maybeAutoLoadVisibleSegmentGap();
+  }, SEGMENT_AUTOLOAD_DELAY_MS);
+}
+
+async function maybeAutoLoadVisibleSegmentGap() {
+  if (
+    !hasSegmentedConversation()
+    || state.segmentAutoLoading
+    || state.messagesPointerDown
+    || !els.messages
+  ) {
+    return false;
+  }
+  if (performance.now() < state.segmentAutoLoadPausedUntil) {
+    return false;
+  }
+  const gap = visibleSegmentGapForAutoLoad();
+  const segmentId = gap?.dataset.segmentId || "";
+  if (!segmentId || isSegmentLoaded(segmentId)) {
+    return false;
+  }
+
+  state.segmentAutoLoading = true;
+  gap.classList.add("loading");
+  const scrollAnchor = scrollAnchorForElement(gap, segmentId);
+  try {
+    await loadMainSegment(segmentId, { scheduleSearch: false, scrollAnchor });
+    return true;
+  } catch (error) {
+    els.sourceLine.textContent = error.message || String(error);
+    return false;
+  } finally {
+    state.segmentAutoLoading = false;
+    state.segmentAutoLoadPausedUntil = Math.max(
+      state.segmentAutoLoadPausedUntil,
+      performance.now() + 700
+    );
+    clearSegmentAutoLoadTimer();
+  }
+}
+
+function visibleSegmentGapForAutoLoad() {
+  if (!els.messages) {
+    return null;
+  }
+  const viewport = els.messages.getBoundingClientRect();
+  const minTop = viewport.top - SEGMENT_AUTOLOAD_MARGIN_PX;
+  const maxBottom = viewport.bottom + SEGMENT_AUTOLOAD_MARGIN_PX;
+  const candidates = [];
+  for (const gap of els.messages.querySelectorAll(".segment-gap")) {
+    const segmentId = gap.dataset.segmentId;
+    if (!segmentId || isSegmentLoaded(segmentId)) {
+      continue;
+    }
+    const rect = gap.getBoundingClientRect();
+    if (rect.bottom < minTop || rect.top > maxBottom) {
+      continue;
+    }
+    const distance = rect.bottom < viewport.top
+      ? viewport.top - rect.bottom
+      : (rect.top > viewport.bottom ? rect.top - viewport.bottom : 0);
+    candidates.push({ gap, distance });
+  }
+  candidates.sort((left, right) => left.distance - right.distance);
+  return candidates[0]?.gap || null;
+}
+
+function scrollAnchorForElement(element, segmentId) {
+  if (!element) {
+    return null;
+  }
+  return {
+    segmentId,
+    top: element.getBoundingClientRect().top
+  };
 }
 
 function installMessagesSelectionTracking() {
@@ -847,6 +985,17 @@ function messageByGlobalIndex(messageIndex) {
   ) || null;
 }
 
+function initialSegmentScrollMessageIndex(detail) {
+  const messages = detail?.messages || [];
+  for (const [localIndex, message] of messages.entries()) {
+    if (message?.role === "event" && message.phase === "compaction") {
+      continue;
+    }
+    return messageIndexFor(message, localIndex);
+  }
+  return messageIndexFor(messages[0], 0);
+}
+
 function normalizeSegmentedThread(detail) {
   if (!Array.isArray(detail?.segments)) {
     return detail;
@@ -884,15 +1033,31 @@ async function loadMainSegment(segmentId, options = {}) {
   if (isSegmentLoaded(segmentId, detail)) {
     return true;
   }
-  els.sourceLine.textContent = `Loading ${segmentLabel(segmentById(segmentId, detail))}...`;
-  const result = await fetchJson(
-    `/api/main-threads/${encodeURIComponent(threadId)}/segments/${encodeURIComponent(segmentId)}`
-  );
-  mergeLoadedSegment(result.segment, result.messages || []);
-  if (!options.deferRender) {
-    renderSegmentedConversationAfterLoad(options);
+  if (state.segmentLoadPromises.has(segmentId)) {
+    return state.segmentLoadPromises.get(segmentId);
   }
-  return true;
+  const loadPromise = (async () => {
+    els.sourceLine.textContent = `Loading ${segmentLabel(segmentById(segmentId, detail))}...`;
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(threadId)}/segments/${encodeURIComponent(segmentId)}`
+    );
+    if (state.currentThread?.summary?.id !== threadId) {
+      return false;
+    }
+    mergeLoadedSegment(result.segment, result.messages || []);
+    if (!options.deferRender) {
+      renderSegmentedConversationAfterLoad(options);
+    }
+    return true;
+  })();
+  state.segmentLoadPromises.set(segmentId, loadPromise);
+  try {
+    return await loadPromise;
+  } finally {
+    if (state.segmentLoadPromises.get(segmentId) === loadPromise) {
+      state.segmentLoadPromises.delete(segmentId);
+    }
+  }
 }
 
 function mergeLoadedSegment(segment, messages) {
@@ -914,6 +1079,9 @@ function mergeLoadedSegment(segment, messages) {
 function renderSegmentedConversationAfterLoad(options = {}) {
   if (!state.currentThread) {
     return;
+  }
+  if (options.scrollAnchor) {
+    state.pendingSegmentScrollAnchor = options.scrollAnchor;
   }
   markFinalAssistantReplies(state.currentThread.messages || []);
   renderHistoryWindow(state.currentThread);
@@ -946,7 +1114,8 @@ async function loadSegmentForMessage(messageIndex, options = {}) {
   state.pendingScrollTarget = {
     type: "message",
     messageIndex,
-    anchorId: options.anchorId || null
+    anchorId: options.anchorId || null,
+    expandCollapsed: options.expandCollapsed !== false
   };
   return loadMainSegment(segment.id, { scheduleSearch: false });
 }
@@ -1593,6 +1762,12 @@ async function renderConversation(detail) {
   state.expandedMessages = new Set();
   state.expandedToolRuns = new Set();
   state.toolRunByMessageIndex = new Map();
+  clearSegmentAutoLoadTimer();
+  state.pendingSegmentScrollAnchor = null;
+  state.segmentAutoLoading = false;
+  state.segmentLoadPromises = new Map();
+  state.messagesPointerDown = false;
+  state.segmentAutoLoadPausedUntil = 0;
   const renderRequestId = state.renderRequestId + 1;
   state.renderRequestId = renderRequestId;
   const summary = detail.summary;
@@ -1617,8 +1792,9 @@ async function renderConversation(detail) {
   if (hasSegmentedConversation(detail) && !state.pendingScrollTarget && detail.messages.length > 0) {
     state.pendingScrollTarget = {
       type: "message",
-      messageIndex: messageIndexFor(detail.messages[0], 0),
-      anchorId: null
+      messageIndex: initialSegmentScrollMessageIndex(detail),
+      anchorId: null,
+      expandCollapsed: false
     };
   }
   renderRelated(
@@ -1708,11 +1884,63 @@ async function renderMessages(detail, branchGroups, renderRequestId, options = {
   }
   await renderMessageUnits(units, renderRequestId);
   updateMessageCount(renderedMessages, detail.messages.length);
+  restorePendingSegmentScrollAnchor();
   scheduleMessagesFrameSync({ frames: 4, delays: [80, 240, 700], force: true });
   if (options.scheduleSearch !== false) {
     scheduleConversationSearch({ immediate: true });
   }
   scrollToPendingBranch();
+}
+
+function restorePendingSegmentScrollAnchor() {
+  const anchor = state.pendingSegmentScrollAnchor;
+  state.pendingSegmentScrollAnchor = null;
+  if (!anchor || !els.messages) {
+    return;
+  }
+  const element = firstRenderedElementForSegment(anchor.segmentId);
+  if (!element) {
+    return;
+  }
+  const delta = element.getBoundingClientRect().top - anchor.top;
+  if (Math.abs(delta) >= 1) {
+    els.messages.scrollTop += delta;
+  }
+}
+
+function firstRenderedElementForSegment(segmentId) {
+  const segment = segmentById(segmentId);
+  if (!segment || !els.messages) {
+    return null;
+  }
+  const candidates = [];
+  const selector = [
+    ".message[data-message-index]",
+    ".tool-run[data-tool-run-start]",
+    ".rollback-group[data-rollback-group-start]"
+  ].join(", ");
+  for (const element of els.messages.querySelectorAll(selector)) {
+    const index = renderedElementStartIndex(element);
+    if (index < segment.start_message_index || index > segment.end_message_index) {
+      continue;
+    }
+    candidates.push({ element, index });
+  }
+  candidates.sort((left, right) => left.index - right.index);
+  return candidates[0]?.element || null;
+}
+
+function renderedElementStartIndex(element) {
+  if (element.classList.contains("message")) {
+    return Number(element.dataset.messageIndex);
+  }
+  if (element.classList.contains("tool-run")) {
+    return Number(element.dataset.toolRunStart);
+  }
+  if (element.classList.contains("rollback-group")) {
+    return Number(element.dataset.rollbackGroupStart);
+  }
+  return NaN;
 }
 
 function buildMessageUnits(detail, branchGroups, renderRequestId) {
@@ -2269,7 +2497,7 @@ function renderCompactionItem(checkpoint, summary) {
   wrapper.title = "Scroll to this compaction in the conversation";
   wrapper.addEventListener("click", () => scrollToMessageIndex(
     checkpoint.message_index,
-    { defer: true, anchorId: compactionAnchorId(checkpoint) }
+    { defer: true, anchorId: compactionAnchorId(checkpoint), expandCollapsed: false }
   ));
 
   const title = document.createElement("span");
@@ -2527,7 +2755,11 @@ async function createForkAfterAssistantResponse(message, index, button) {
   }
 }
 
-function scrollToMessageIndex(messageIndex, { defer = false, anchorId = null } = {}) {
+function scrollToMessageIndex(messageIndex, {
+  defer = false,
+  anchorId = null,
+  expandCollapsed = true
+} = {}) {
   if (!Number.isInteger(messageIndex)) {
     return false;
   }
@@ -2540,16 +2772,16 @@ function scrollToMessageIndex(messageIndex, { defer = false, anchorId = null } =
       return true;
     }
     if (defer) {
-      state.pendingScrollTarget = { type: "message", messageIndex, anchorId };
+      state.pendingScrollTarget = { type: "message", messageIndex, anchorId, expandCollapsed };
     }
     if (hasSegmentedConversation() && !messageByGlobalIndex(messageIndex)) {
-      void loadSegmentForMessage(messageIndex, { anchorId });
+      void loadSegmentForMessage(messageIndex, { anchorId, expandCollapsed });
       return true;
     }
     return false;
   }
   state.pendingScrollTarget = null;
-  if (wrapper.classList.contains("collapsed")) {
+  if (wrapper.classList.contains("collapsed") && expandCollapsed) {
     expandCollapsedMessage(wrapper);
   }
   scrollElementIntoMessages(wrapper);
@@ -2748,7 +2980,9 @@ function renderSegmentGap(segment) {
   button.type = "button";
   button.textContent = "Load segment";
   button.addEventListener("click", () => {
-    void loadMainSegment(segment.id);
+    void loadMainSegment(segment.id, {
+      scrollAnchor: scrollAnchorForElement(wrapper, segment.id)
+    });
   });
 
   wrapper.append(copy, button);
@@ -2982,7 +3216,10 @@ function resolvePendingScrollTarget({ final = false } = {}) {
     return;
   }
   if (target.type === "message") {
-    scrollToMessageIndex(target.messageIndex, { anchorId: target.anchorId });
+    scrollToMessageIndex(target.messageIndex, {
+      anchorId: target.anchorId,
+      expandCollapsed: target.expandCollapsed !== false
+    });
   } else if (target.type === "branch") {
     jumpToBranch(target.branchId);
   }
@@ -2996,13 +3233,21 @@ function scrollMessagesTo(target) {
   const start = els.messages.scrollTop;
   const distance = target - start;
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const pauseSegmentAutoLoad = (durationMs) => {
+    state.segmentAutoLoadPausedUntil = Math.max(
+      state.segmentAutoLoadPausedUntil,
+      performance.now() + durationMs
+    );
+  };
 
   if (Math.abs(distance) < 1 || reduceMotion) {
+    pauseSegmentAutoLoad(180);
     els.messages.scrollTop = target;
     return 0;
   }
 
   const duration = Math.min(900, Math.max(280, Math.abs(distance) / 24));
+  pauseSegmentAutoLoad(duration + 180);
   let startedAt = null;
 
   const step = (timestamp) => {
