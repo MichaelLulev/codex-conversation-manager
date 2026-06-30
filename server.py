@@ -39,6 +39,7 @@ DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 SIDE_BOUNDARY_MARKER = "Side conversation boundary."
 WEBSOCKET_MARKER = "websocket event:"
 MAIN_THREAD_FILTERS = {"all", "with_side", "with_forks", "forked", "with_rollback", "archived"}
+LAZY_MESSAGE_TEXT_ROLES = {"thinking", "tool", "event"}
 SQLITE_OPEN_ATTEMPTS = 5
 SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
@@ -246,16 +247,58 @@ def message_dicts_for_segment(
     messages: list[Message],
     segments: list[ConversationSegment],
     segment: ConversationSegment,
+    omit_collapsed_text: bool = True,
 ) -> list[dict[str, Any]]:
     turn_counts_after = active_user_turn_counts_after(messages)
     result = []
     for index in range(segment.start_message_index, segment.end_message_index + 1):
-        message = asdict(messages[index])
-        message["global_message_index"] = index
-        message["segment_id"] = segment.id
-        message["active_user_turns_after"] = turn_counts_after[index]
-        result.append(message)
+        result.append(
+            message_dict_for_index(
+                messages[index],
+                index,
+                segment,
+                turn_counts_after[index],
+                omit_collapsed_text=omit_collapsed_text,
+            )
+        )
     return result
+
+
+def message_dict_for_index(
+    message: Message,
+    index: int,
+    segment: ConversationSegment | None,
+    active_user_turns_after_count: int,
+    omit_collapsed_text: bool = True,
+) -> dict[str, Any]:
+    item = asdict(message)
+    full_text = item.get("text") or ""
+    item["text_preview"] = collapsed_text_preview(full_text)
+    item["text_length"] = len(full_text)
+    item["text_loaded"] = True
+    item["text_omitted"] = False
+    if omit_collapsed_text and should_omit_message_text(message):
+        item["text"] = ""
+        item["text_loaded"] = False
+        item["text_omitted"] = True
+    item["global_message_index"] = index
+    item["segment_id"] = segment.id if segment else None
+    item["active_user_turns_after"] = active_user_turns_after_count
+    return item
+
+
+def should_omit_message_text(message: Message) -> bool:
+    if message_contains_diff(message):
+        return False
+    return message.rolled_back or message.role in LAZY_MESSAGE_TEXT_ROLES
+
+
+def collapsed_text_preview(value: str, limit: int = 90) -> str:
+    for line in str(value or "").splitlines():
+        normalized = normalize_display_text(line)
+        if normalized:
+            return compact(normalized, limit)
+    return ""
 
 
 def checkpoint_dicts_with_segments(
@@ -1336,6 +1379,24 @@ class SideConversationReader:
         return {
             "segment": asdict(segment),
             "messages": message_dicts_for_segment(messages, segments, segment),
+        }
+
+    def get_main_thread_message(self, thread_id: str, message_index: int) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        messages, compactions, _rollbacks = self.main_thread_messages_and_checkpoints(row)
+        if message_index < 0 or message_index >= len(messages):
+            raise KeyError(str(message_index))
+        segments = conversation_segments(messages, compactions)
+        segment = segment_for_message_index(segments, message_index)
+        turn_counts_after = active_user_turn_counts_after(messages)
+        return {
+            "message": message_dict_for_index(
+                messages[message_index],
+                message_index,
+                segment,
+                turn_counts_after[message_index],
+                omit_collapsed_text=False,
+            )
         }
 
     def search_thread(
@@ -4452,6 +4513,19 @@ class AppHandler(BaseHTTPRequestHandler):
                         for item in self.reader.list_main_threads(list_filter, query, full_text)
                     ]
                 )
+            elif path.startswith("/api/main-threads/") and "/messages/" in path:
+                suffix = path.removeprefix("/api/main-threads/")
+                thread_part, message_part = suffix.split("/messages/", 1)
+                thread_id = unquote(thread_part)
+                try:
+                    message_index = int(unquote(message_part))
+                except ValueError:
+                    self.send_error_json(400, "Invalid message_index")
+                    return
+                if not thread_id:
+                    self.send_error_json(400, "Missing thread_id")
+                    return
+                self.send_json(self.reader.get_main_thread_message(thread_id, message_index))
             elif path.startswith("/api/main-threads/") and "/segments/" in path:
                 suffix = path.removeprefix("/api/main-threads/")
                 thread_part, segment_part = suffix.split("/segments/", 1)

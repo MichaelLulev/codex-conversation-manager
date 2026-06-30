@@ -342,6 +342,40 @@ class MainSegmentTests(unittest.TestCase):
         self.assertEqual([item["global_message_index"] for item in message_dicts], [2, 3])
         self.assertEqual({item["segment_id"] for item in message_dicts}, {"segment-2"})
 
+    def test_segment_message_dicts_omit_collapsed_event_text(self):
+        messages = [
+            self.message(0),
+            server.Message(
+                role="event",
+                text="Large event payload\nwith details",
+                timestamp=None,
+                time=None,
+                source="test",
+                phase="context",
+            ),
+            server.Message(
+                role="event",
+                text="Patch event\n\n```diff\n-old\n+new\n```",
+                timestamp=None,
+                time=None,
+                source="test",
+                phase="patch",
+            ),
+        ]
+        segments = server.conversation_segments(messages, [])
+
+        message_dicts = server.message_dicts_for_segment(messages, segments, segments[0])
+
+        self.assertEqual(message_dicts[0]["text"], "message 0")
+        self.assertFalse(message_dicts[0]["text_omitted"])
+        self.assertEqual(message_dicts[1]["text"], "")
+        self.assertTrue(message_dicts[1]["text_omitted"])
+        self.assertFalse(message_dicts[1]["text_loaded"])
+        self.assertEqual(message_dicts[1]["text_preview"], "Large event payload")
+        self.assertEqual(message_dicts[1]["text_length"], len("Large event payload\nwith details"))
+        self.assertIn("```diff", message_dicts[2]["text"])
+        self.assertFalse(message_dicts[2]["text_omitted"])
+
     def test_checkpoint_dicts_include_containing_segment(self):
         messages = [self.message(index) for index in range(6)]
         compactions = [self.compaction(1, 1), self.compaction(2, 4)]

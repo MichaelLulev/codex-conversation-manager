@@ -42,8 +42,6 @@ const MAX_PAIR_SIMILARITY_CELLS = 20000;
 const MIN_INTRALINE_PAIR_SCORE = 0.62;
 const CONVERSATION_SEARCH_DEBOUNCE_MS = 900;
 const CONVERSATION_SEARCH_TIME_BUDGET_MS = 10;
-const SEGMENT_AUTOLOAD_DELAY_MS = 260;
-const SEGMENT_AUTOLOAD_MARGIN_PX = 180;
 const THREAD_FULL_TEXT_SEARCH_DEBOUNCE_MS = 450;
 const SEARCH_WORKER_URL = "/static/search-worker.js";
 const COLLAPSED_MESSAGE_ROLES = new Set(["thinking", "tool", "event"]);
@@ -114,11 +112,8 @@ const state = {
   pendingScrollTarget: null,
   pendingSegmentScrollAnchor: null,
   scrollAnimationFrame: null,
-  segmentAutoLoadTimer: null,
-  segmentAutoLoading: false,
   segmentLoadPromises: new Map(),
-  messagesPointerDown: false,
-  segmentAutoLoadPausedUntil: 0,
+  messageTextPromises: new Map(),
   listRequestId: 0,
   listAbortController: null,
   detailRequestId: 0,
@@ -385,128 +380,8 @@ function setupMessagesFrame() {
     throw new Error("Conversation message root is unavailable");
   }
   installMessagesSelectionTracking();
-  installSegmentGapAutoLoad();
   installMessagesFrameResizeSync();
   scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800], force: true });
-}
-
-function installSegmentGapAutoLoad() {
-  const doc = els.messagesDocument;
-  const root = els.messages;
-  if (!doc || !root) {
-    return;
-  }
-
-  const markPointerDown = () => {
-    state.messagesPointerDown = true;
-    clearSegmentAutoLoadTimer();
-  };
-  const markPointerReleased = () => {
-    if (!state.messagesPointerDown) {
-      return;
-    }
-    state.messagesPointerDown = false;
-    scheduleSegmentGapAutoLoad();
-  };
-
-  root.addEventListener("scroll", () => scheduleSegmentGapAutoLoad(), { passive: true });
-  doc.addEventListener("pointerdown", markPointerDown, { passive: true });
-  doc.addEventListener("mousedown", markPointerDown, { passive: true });
-  doc.addEventListener("pointerup", markPointerReleased, { passive: true });
-  doc.addEventListener("pointercancel", markPointerReleased, { passive: true });
-  doc.addEventListener("mouseup", markPointerReleased, { passive: true });
-  doc.defaultView?.addEventListener("pointerup", markPointerReleased, { passive: true });
-  doc.defaultView?.addEventListener("mouseup", markPointerReleased, { passive: true });
-}
-
-function clearSegmentAutoLoadTimer() {
-  if (state.segmentAutoLoadTimer === null) {
-    return;
-  }
-  window.clearTimeout(state.segmentAutoLoadTimer);
-  state.segmentAutoLoadTimer = null;
-}
-
-function scheduleSegmentGapAutoLoad() {
-  clearSegmentAutoLoadTimer();
-  if (
-    !hasSegmentedConversation()
-    || state.segmentAutoLoading
-    || state.messagesPointerDown
-    || !els.messages
-  ) {
-    return;
-  }
-  if (performance.now() < state.segmentAutoLoadPausedUntil) {
-    return;
-  }
-  state.segmentAutoLoadTimer = window.setTimeout(() => {
-    state.segmentAutoLoadTimer = null;
-    void maybeAutoLoadVisibleSegmentGap();
-  }, SEGMENT_AUTOLOAD_DELAY_MS);
-}
-
-async function maybeAutoLoadVisibleSegmentGap() {
-  if (
-    !hasSegmentedConversation()
-    || state.segmentAutoLoading
-    || state.messagesPointerDown
-    || !els.messages
-  ) {
-    return false;
-  }
-  if (performance.now() < state.segmentAutoLoadPausedUntil) {
-    return false;
-  }
-  const gap = visibleSegmentGapForAutoLoad();
-  const segmentId = gap?.dataset.segmentId || "";
-  if (!segmentId || isSegmentLoaded(segmentId)) {
-    return false;
-  }
-
-  state.segmentAutoLoading = true;
-  gap.classList.add("loading");
-  const scrollAnchor = scrollAnchorForElement(gap, segmentId);
-  try {
-    await loadMainSegment(segmentId, { scheduleSearch: false, scrollAnchor });
-    return true;
-  } catch (error) {
-    els.sourceLine.textContent = error.message || String(error);
-    return false;
-  } finally {
-    state.segmentAutoLoading = false;
-    state.segmentAutoLoadPausedUntil = Math.max(
-      state.segmentAutoLoadPausedUntil,
-      performance.now() + 700
-    );
-    clearSegmentAutoLoadTimer();
-  }
-}
-
-function visibleSegmentGapForAutoLoad() {
-  if (!els.messages) {
-    return null;
-  }
-  const viewport = els.messages.getBoundingClientRect();
-  const minTop = viewport.top - SEGMENT_AUTOLOAD_MARGIN_PX;
-  const maxBottom = viewport.bottom + SEGMENT_AUTOLOAD_MARGIN_PX;
-  const candidates = [];
-  for (const gap of els.messages.querySelectorAll(".segment-gap")) {
-    const segmentId = gap.dataset.segmentId;
-    if (!segmentId || isSegmentLoaded(segmentId)) {
-      continue;
-    }
-    const rect = gap.getBoundingClientRect();
-    if (rect.bottom < minTop || rect.top > maxBottom) {
-      continue;
-    }
-    const distance = rect.bottom < viewport.top
-      ? viewport.top - rect.bottom
-      : (rect.top > viewport.bottom ? rect.top - viewport.bottom : 0);
-    candidates.push({ gap, distance });
-  }
-  candidates.sort((left, right) => left.distance - right.distance);
-  return candidates[0]?.gap || null;
 }
 
 function scrollAnchorForElement(element, segmentId) {
@@ -985,6 +860,59 @@ function messageByGlobalIndex(messageIndex) {
   ) || null;
 }
 
+function isMessageTextOmitted(message) {
+  return message?.text_omitted === true || message?.text_loaded === false;
+}
+
+function messagePreviewText(message) {
+  return message?.text_preview || message?.text || "";
+}
+
+function messageFullText(message) {
+  return isMessageTextOmitted(message) ? "" : (message?.text || "");
+}
+
+async function ensureMessageTextLoaded(message, messageIndex) {
+  if (!message || !isMessageTextOmitted(message)) {
+    return message;
+  }
+  if (state.mode !== "main") {
+    return message;
+  }
+  const threadId = state.currentThread?.summary?.id;
+  if (!threadId || !Number.isInteger(messageIndex)) {
+    return message;
+  }
+  const key = `${threadId}:${messageIndex}`;
+  if (state.messageTextPromises.has(key)) {
+    return state.messageTextPromises.get(key);
+  }
+  const promise = (async () => {
+    const result = await fetchJson(
+      `/api/main-threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(String(messageIndex))}`
+    );
+    if (state.currentThread?.summary?.id !== threadId) {
+      return message;
+    }
+    const loaded = result.message || {};
+    const current = messageByGlobalIndex(messageIndex) || message;
+    Object.assign(current, loaded, {
+      text_loaded: true,
+      text_omitted: false
+    });
+    SEARCH_TEXT_CACHE.delete(current);
+    return current;
+  })();
+  state.messageTextPromises.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    if (state.messageTextPromises.get(key) === promise) {
+      state.messageTextPromises.delete(key);
+    }
+  }
+}
+
 function initialSegmentScrollMessageIndex(detail) {
   const messages = detail?.messages || [];
   for (const [localIndex, message] of messages.entries()) {
@@ -994,6 +922,22 @@ function initialSegmentScrollMessageIndex(detail) {
     return messageIndexFor(message, localIndex);
   }
   return messageIndexFor(messages[0], 0);
+}
+
+function shouldStartAtLoadedSegmentEnd(detail) {
+  if (!hasSegmentedConversation(detail)) {
+    return false;
+  }
+  const segments = detail.segments || [];
+  const latest = segments[segments.length - 1];
+  const selectedSegmentId = detail.history_window?.segment_id;
+  const loaded = loadedSegmentIdSet(detail);
+  return Boolean(
+    latest
+    && selectedSegmentId === latest.id
+    && loaded.size === 1
+    && loaded.has(latest.id)
+  );
 }
 
 function normalizeSegmentedThread(detail) {
@@ -1762,12 +1706,9 @@ async function renderConversation(detail) {
   state.expandedMessages = new Set();
   state.expandedToolRuns = new Set();
   state.toolRunByMessageIndex = new Map();
-  clearSegmentAutoLoadTimer();
   state.pendingSegmentScrollAnchor = null;
-  state.segmentAutoLoading = false;
   state.segmentLoadPromises = new Map();
-  state.messagesPointerDown = false;
-  state.segmentAutoLoadPausedUntil = 0;
+  state.messageTextPromises = new Map();
   const renderRequestId = state.renderRequestId + 1;
   state.renderRequestId = renderRequestId;
   const summary = detail.summary;
@@ -1790,12 +1731,14 @@ async function renderConversation(detail) {
   els.metaCwd.textContent = text(summary.cwd);
   renderHistoryWindow(detail);
   if (hasSegmentedConversation(detail) && !state.pendingScrollTarget && detail.messages.length > 0) {
-    state.pendingScrollTarget = {
-      type: "message",
-      messageIndex: initialSegmentScrollMessageIndex(detail),
-      anchorId: null,
-      expandCollapsed: false
-    };
+    state.pendingScrollTarget = shouldStartAtLoadedSegmentEnd(detail)
+      ? { type: "bottom" }
+      : {
+          type: "message",
+          messageIndex: initialSegmentScrollMessageIndex(detail),
+          anchorId: null,
+          expandCollapsed: false
+        };
   }
   renderRelated(
     detail.related || {},
@@ -2636,7 +2579,7 @@ async function createForkFromMessage(message, index, button) {
     title: "Create fork from this message?",
     body: "This writes a new Codex conversation containing the history through this user message. Later messages are not copied. The original conversation is left unchanged.",
     details: [
-      { label: "Target", value: collapsedMessageHeading(message.text || "") || "Selected user message" },
+      { label: "Target", value: collapsedMessageHeading(messagePreviewText(message)) || "Selected user message" },
       { label: "Fork point", value: "Immediately after this user message" },
       { label: "Change", value: "Creates a new resumable Codex conversation" }
     ],
@@ -2679,7 +2622,7 @@ async function createForkBeforeMessage(message, index, button) {
     title: "Create fork before this message?",
     body: "This writes a new Codex conversation containing the history before this user message. The selected message and later messages are not copied, so resuming the fork continues from the previous conversation state.",
     details: [
-      { label: "Target", value: collapsedMessageHeading(message.text || "") || "Selected user message" },
+      { label: "Target", value: collapsedMessageHeading(messagePreviewText(message)) || "Selected user message" },
       { label: "Fork point", value: "Immediately before this user message" },
       { label: "Change", value: "Creates a new resumable Codex conversation" }
     ],
@@ -2722,7 +2665,7 @@ async function createForkAfterAssistantResponse(message, index, button) {
     title: "Create fork after this assistant response?",
     body: "This writes a new Codex conversation containing the history through this final assistant response. Later messages are not copied. The original conversation is left unchanged.",
     details: [
-      { label: "Target", value: collapsedMessageHeading(message.text || "") || "Selected assistant response" },
+      { label: "Target", value: collapsedMessageHeading(messagePreviewText(message)) || "Selected assistant response" },
       { label: "Fork point", value: "Immediately after this assistant response" },
       { label: "Change", value: "Creates a new resumable Codex conversation" }
     ],
@@ -2782,7 +2725,7 @@ function scrollToMessageIndex(messageIndex, {
   }
   state.pendingScrollTarget = null;
   if (wrapper.classList.contains("collapsed") && expandCollapsed) {
-    expandCollapsedMessage(wrapper);
+    void expandCollapsedMessage(wrapper);
   }
   scrollElementIntoMessages(wrapper);
   wrapper.classList.add("branch-link-focus");
@@ -2958,11 +2901,12 @@ function renderJumpMarker(markers) {
 }
 
 function renderSegmentGap(segment) {
-  const wrapper = document.createElement("section");
+  const wrapper = document.createElement("button");
+  wrapper.type = "button";
   wrapper.className = "segment-gap";
   wrapper.dataset.segmentId = segment.id;
 
-  const copy = document.createElement("div");
+  const copy = document.createElement("span");
   copy.className = "segment-gap-copy";
 
   const title = document.createElement("strong");
@@ -2976,10 +2920,10 @@ function renderSegmentGap(segment) {
 
   copy.append(title, meta);
 
-  const button = document.createElement("button");
-  button.type = "button";
+  const button = document.createElement("span");
+  button.className = "segment-gap-action";
   button.textContent = "Load segment";
-  button.addEventListener("click", () => {
+  wrapper.addEventListener("click", () => {
     void loadMainSegment(segment.id, {
       scrollAnchor: scrollAnchorForElement(wrapper, segment.id)
     });
@@ -3215,7 +3159,9 @@ function resolvePendingScrollTarget({ final = false } = {}) {
   if (!target) {
     return;
   }
-  if (target.type === "message") {
+  if (target.type === "bottom") {
+    scrollConversationToBottom();
+  } else if (target.type === "message") {
     scrollToMessageIndex(target.messageIndex, {
       anchorId: target.anchorId,
       expandCollapsed: target.expandCollapsed !== false
@@ -3228,26 +3174,27 @@ function resolvePendingScrollTarget({ final = false } = {}) {
   }
 }
 
+function scrollConversationToBottom() {
+  if (!els.messages) {
+    return false;
+  }
+  const maxScroll = els.messages.scrollHeight - els.messages.clientHeight;
+  scrollMessagesTo(Math.max(0, maxScroll));
+  return true;
+}
+
 function scrollMessagesTo(target) {
   cancelScrollAnimation();
   const start = els.messages.scrollTop;
   const distance = target - start;
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const pauseSegmentAutoLoad = (durationMs) => {
-    state.segmentAutoLoadPausedUntil = Math.max(
-      state.segmentAutoLoadPausedUntil,
-      performance.now() + durationMs
-    );
-  };
 
   if (Math.abs(distance) < 1 || reduceMotion) {
-    pauseSegmentAutoLoad(180);
     els.messages.scrollTop = target;
     return 0;
   }
 
   const duration = Math.min(900, Math.max(280, Math.abs(distance) / 24));
-  pauseSegmentAutoLoad(duration + 180);
   let startedAt = null;
 
   const step = (timestamp) => {
@@ -3608,10 +3555,11 @@ function isMessageSearchVisible(message) {
 }
 
 function messageViewText(message) {
+  const fullText = messageFullText(message);
   if (shouldUseDiffOnlyView(message)) {
-    return diffOnlyMarkdown(message?.text || "");
+    return diffOnlyMarkdown(fullText);
   }
-  return message?.text || "";
+  return fullText;
 }
 
 function shouldUseDiffOnlyView(message) {
@@ -3731,7 +3679,7 @@ function updateConversationSearchButtons() {
   els.conversationSearchClear.disabled = query === "";
 }
 
-function setActiveConversationMatch(index, { scroll = true, expandCollapsed = true } = {}) {
+async function setActiveConversationMatch(index, { scroll = true, expandCollapsed = true } = {}) {
   const total = state.conversationSearch.totalMatches;
   if (total === 0) {
     state.conversationSearch.activeIndex = -1;
@@ -3756,7 +3704,7 @@ function setActiveConversationMatch(index, { scroll = true, expandCollapsed = tr
     updateConversationSearchControls();
     void loadSegmentForMessage(active.messageIndex).then((loaded) => {
       if (loaded) {
-        setActiveConversationMatch(normalizedIndex, { scroll, expandCollapsed });
+        void setActiveConversationMatch(normalizedIndex, { scroll, expandCollapsed });
       }
     });
     return;
@@ -3764,7 +3712,7 @@ function setActiveConversationMatch(index, { scroll = true, expandCollapsed = tr
   let activeElement = wrapper;
   if (wrapper) {
     if (wrapper.classList.contains("collapsed") && expandCollapsed) {
-      expandCollapsedMessage(wrapper);
+      await expandCollapsedMessage(wrapper);
     }
     const body = wrapper.querySelector(".message-body");
     const mark = body && !body.hidden
@@ -3794,10 +3742,10 @@ function stepConversationSearch(direction) {
   }
   const activeIndex = state.conversationSearch.activeIndex;
   if (activeIndex < 0) {
-    setActiveConversationMatch(direction > 0 ? 0 : state.conversationSearch.totalMatches - 1);
+    void setActiveConversationMatch(direction > 0 ? 0 : state.conversationSearch.totalMatches - 1);
     return;
   }
-  setActiveConversationMatch(activeIndex + direction);
+  void setActiveConversationMatch(activeIndex + direction);
 }
 
 function searchMatchAtIndex(index) {
@@ -3881,7 +3829,7 @@ function renderMessage(message, index = 0, options = {}) {
     const role = renderRoleLabel(message);
     roleElement.append(icon, role);
 
-    const headingText = collapsedMessageHeading(message.text || "");
+    const headingText = collapsedMessageHeading(messagePreviewText(message));
     if (headingText) {
       const heading = document.createElement("span");
       heading.className = "message-heading-preview";
@@ -3911,12 +3859,15 @@ function renderMessage(message, index = 0, options = {}) {
   if (isCollapsible) {
     if (shouldLazyRenderBody) {
       wrapper.dataset.bodyId = bodyId;
-      wrapper.__messageText = message.text || "";
+      wrapper.__message = message;
+      wrapper.__messageIndex = index;
+      wrapper.__messageText = messageFullText(message);
+      wrapper.__messageTextOmitted = isMessageTextOmitted(message);
       wrapper.__messageRenderMode = bodyRenderMode;
     }
     roleElement.addEventListener("click", () => {
       body = body || ensureLazyMessageBody(wrapper);
-      setCollapsedMessageExpanded(
+      void setCollapsedMessageExpanded(
         wrapper,
         body,
         roleElement,
@@ -3932,12 +3883,15 @@ function renderMessage(message, index = 0, options = {}) {
     if (isCollapsible) {
       body.id = bodyId;
       body.dataset.rendered = "false";
-      body.__messageText = message.text || "";
+      body.__message = message;
+      body.__messageIndex = index;
+      body.__messageText = messageFullText(message);
+      body.__messageTextOmitted = isMessageTextOmitted(message);
       body.__messageRenderMode = bodyRenderMode;
       ensureMessageBodyRendered(body);
       body.hidden = !isExpanded;
     } else {
-      renderMessageBodyContent(body, message.text || "", bodyRenderMode);
+      renderMessageBodyContent(body, messageFullText(message), bodyRenderMode);
     }
   }
 
@@ -3963,7 +3917,9 @@ function renderMessageActions(message, index) {
   ask.className = "message-action";
   ask.textContent = "Ask";
   ask.title = "Ask Codex about this specific message.";
-  ask.addEventListener("click", () => askCodexAboutMessage(message, index));
+  ask.addEventListener("click", () => {
+    void askCodexAboutMessage(message, index);
+  });
   actions.appendChild(ask);
 
   if (canFork) {
@@ -4141,7 +4097,7 @@ async function createRollbackToMessage(message, index, button) {
     title: "Create rollback to this message?",
     body: `This appends a Codex rollback marker and marks ${label} as rolled back. The original messages stay preserved.`,
     details: [
-      { label: "Target", value: collapsedMessageHeading(message.text || "") || "Selected user message" },
+      { label: "Target", value: collapsedMessageHeading(messagePreviewText(message)) || "Selected user message" },
       { label: "Turns affected", value: label },
       { label: "Change", value: "Appends a rollback marker to the current conversation" }
     ],
@@ -4355,8 +4311,8 @@ function rollbackGroupId(start, end) {
 }
 
 function rollbackGroupPreview(group) {
-  const firstText = group.find((item) => item.message?.rolled_back && item.message?.text)?.message?.text
-    || group.find((item) => item.message?.text)?.message?.text
+  const firstText = messagePreviewText(group.find((item) => item.message?.rolled_back && messagePreviewText(item.message))?.message)
+    || messagePreviewText(group.find((item) => messagePreviewText(item.message))?.message)
     || "";
   const heading = collapsedMessageHeading(firstText);
   const rolledBackCount = group.filter((item) => item.message?.rolled_back).length;
@@ -4372,8 +4328,8 @@ function rollbackGroupPreview(group) {
 }
 
 function rollbackLinkPreview(group) {
-  const firstText = group.find((item) => item.message?.rolled_back && item.message?.text)?.message?.text
-    || group.find((item) => item.message?.text)?.message?.text
+  const firstText = messagePreviewText(group.find((item) => item.message?.rolled_back && messagePreviewText(item.message))?.message)
+    || messagePreviewText(group.find((item) => messagePreviewText(item.message))?.message)
     || "";
   const heading = collapsedMessageHeading(firstText);
   const rolledBackCount = group.filter((item) => item.message?.rolled_back).length;
@@ -4458,7 +4414,7 @@ function toolRunId(start, end) {
 }
 
 function toolRunPreview(run) {
-  const firstHeading = collapsedMessageHeading(run[0]?.message?.text || "");
+  const firstHeading = collapsedMessageHeading(messagePreviewText(run[0]?.message));
   if (!firstHeading) {
     return `${run.length} tool entries`;
   }
@@ -4611,13 +4567,13 @@ function updateMessageCount(visible, total) {
   }
 }
 
-function expandCollapsedMessage(wrapper) {
+async function expandCollapsedMessage(wrapper) {
   const toggle = wrapper.querySelector(".message-toggle");
   if (!toggle) {
     return;
   }
   const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
-  setCollapsedMessageExpanded(wrapper, body, toggle, true);
+  await setCollapsedMessageExpanded(wrapper, body, toggle, true);
 }
 
 function ensureLazyMessageBody(wrapper) {
@@ -4630,13 +4586,16 @@ function ensureLazyMessageBody(wrapper) {
   body.id = wrapper.dataset.bodyId || `message-body-${wrapper.dataset.messageIndex || "unknown"}`;
   body.hidden = true;
   body.dataset.rendered = "false";
+  body.__message = wrapper.__message || null;
+  body.__messageIndex = Number(wrapper.__messageIndex);
   body.__messageText = wrapper.__messageText || "";
+  body.__messageTextOmitted = wrapper.__messageTextOmitted === true;
   body.__messageRenderMode = wrapper.__messageRenderMode || "full";
   wrapper.appendChild(body);
   return body;
 }
 
-function setCollapsedMessageExpanded(wrapper, body, toggle, expanded) {
+async function setCollapsedMessageExpanded(wrapper, body, toggle, expanded) {
   wrapper.classList.toggle("collapsed", !expanded);
   const messageIndex = Number(wrapper.dataset.messageIndex);
   if (Number.isInteger(messageIndex)) {
@@ -4646,14 +4605,14 @@ function setCollapsedMessageExpanded(wrapper, body, toggle, expanded) {
       state.expandedMessages.delete(messageIndex);
     }
   }
-  if (expanded) {
-    ensureMessageBodyRendered(body);
-  }
   body.hidden = !expanded;
   toggle.setAttribute("aria-expanded", String(expanded));
   const icon = toggle.querySelector(".message-toggle-icon");
   if (icon) {
     icon.textContent = expanded ? "-" : "+";
+  }
+  if (expanded) {
+    await ensureMessageBodyRenderedAsync(body);
   }
 }
 
@@ -4661,9 +4620,39 @@ function ensureMessageBodyRendered(body) {
   if (body.dataset.rendered !== "false") {
     return;
   }
-  const value = body.__messageText || "";
-  renderMessageBodyContent(body, value, body.__messageRenderMode || "full");
-  body.dataset.rendered = "true";
+  void ensureMessageBodyRenderedAsync(body);
+}
+
+async function ensureMessageBodyRenderedAsync(body) {
+  if (body.dataset.rendered === "true") {
+    return;
+  }
+  if (body.__renderPromise) {
+    await body.__renderPromise;
+    return;
+  }
+  body.__renderPromise = (async () => {
+    if (body.__messageTextOmitted) {
+      body.dataset.rendered = "loading";
+      body.replaceChildren(document.createTextNode("Loading message text..."));
+      const messageIndex = Number(body.__messageIndex);
+      const loaded = await ensureMessageTextLoaded(body.__message, messageIndex);
+      body.__message = loaded;
+      body.__messageText = messageFullText(loaded);
+      body.__messageTextOmitted = isMessageTextOmitted(loaded);
+    }
+    const value = body.__messageText || "";
+    renderMessageBodyContent(body, value, body.__messageRenderMode || "full");
+    body.dataset.rendered = "true";
+  })();
+  try {
+    await body.__renderPromise;
+  } catch (error) {
+    body.dataset.rendered = "error";
+    body.replaceChildren(document.createTextNode(error.message || String(error)));
+  } finally {
+    body.__renderPromise = null;
+  }
 }
 
 function renderMessageBodyContent(body, value, renderMode = "full") {
@@ -5976,11 +5965,13 @@ function createConversationNavigationLink(label, target) {
   button.title = target.quote
     ? `Scroll to this text in message ${target.messageIndex + 1}`
     : `Scroll to message ${target.messageIndex + 1}`;
-  button.addEventListener("click", () => scrollToConversationNavigationTarget(target));
+  button.addEventListener("click", () => {
+    void scrollToConversationNavigationTarget(target);
+  });
   return button;
 }
 
-function scrollToConversationNavigationTarget(target) {
+async function scrollToConversationNavigationTarget(target) {
   if (!target || !Number.isInteger(target.messageIndex)) {
     return false;
   }
@@ -5990,7 +5981,7 @@ function scrollToConversationNavigationTarget(target) {
       els.askCodexStatus.textContent = `Loading segment for message ${target.messageIndex + 1}...`;
       void loadSegmentForMessage(target.messageIndex).then((loaded) => {
         if (loaded) {
-          scrollToConversationNavigationTarget(target);
+          void scrollToConversationNavigationTarget(target);
         } else {
           els.askCodexStatus.textContent = `Message ${target.messageIndex + 1} is not in this conversation.`;
         }
@@ -6016,12 +6007,12 @@ function scrollToConversationNavigationTarget(target) {
     return deferred;
   }
   if (wrapper.classList.contains("collapsed")) {
-    expandCollapsedMessage(wrapper);
+    await expandCollapsedMessage(wrapper);
   }
 
   if (target.quote) {
     const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
-    ensureMessageBodyRendered(body);
+    await ensureMessageBodyRenderedAsync(body);
     body.hidden = false;
     const mark = highlightAskCodexTargetInElement(body, target.quote);
     if (mark) {
@@ -6086,13 +6077,17 @@ function askCodexQuoteSegments(value) {
   return segments;
 }
 
-function askCodexAboutMessage(message, index) {
+async function askCodexAboutMessage(message, index) {
   if (!message) {
     return;
   }
+  const loadedMessage = await ensureMessageTextLoaded(message, index);
   const label = `${index + 1}. ${exportRoleLabel(message)}`;
-  const preview = trimForPrompt(collapseWhitespace(message.text || ""), 500);
-  const stage = message.role === "assistant" ? `Assistant stage: ${assistantStage(message)}` : "";
+  const preview = trimForPrompt(
+    collapseWhitespace(messageFullText(loadedMessage) || messagePreviewText(loadedMessage)),
+    500
+  );
+  const stage = loadedMessage.role === "assistant" ? `Assistant stage: ${assistantStage(loadedMessage)}` : "";
   const question = [
     `Explain this specific message: ${label}.`,
     stage,
@@ -6157,7 +6152,7 @@ async function askCodexAboutCurrentThread() {
   state.askCodex.serverRequestId = serverRequestId;
   state.askCodex.abortController = controller;
 
-  const askContext = currentAskCodexContext();
+  const askContext = await currentAskCodexContext();
   const askHistory = askCodexHistoryText();
   setAskCodexRunning(true);
   els.askCodexStatus.textContent = `Sending compact filtered export (${askContext.messageCount} messages, ${formatCount(askContext.context.length)} chars) to Codex...`;
@@ -6233,8 +6228,8 @@ function isValidConversationMessageNumber(messageNumber) {
   );
 }
 
-function currentAskCodexContext() {
-  const exportThread = currentFilteredExportThread({ includeNavigationRefs: true });
+async function currentAskCodexContext() {
+  const exportThread = await currentFilteredExportThread({ includeNavigationRefs: true });
   const context = conversationAsCompactAskExport(exportThread);
   return {
     context,
@@ -6308,7 +6303,7 @@ function conversationAsCompactAskExport(detail) {
       "rollback_group",
       "rollback_turns"
     ]));
-    lines.push("TEXT", message.text || "", "ENDMSG");
+    lines.push("TEXT", messageViewText(message), "ENDMSG");
   }
   return `${lines.join("\n").trimEnd()}\n`;
 }
@@ -6421,7 +6416,7 @@ function compactAttributeValue(value) {
 
 async function exportCurrentThread() {
   if (!state.currentThread) return;
-  const exportThread = currentFilteredExportThread();
+  const exportThread = await currentFilteredExportThread();
   const format = els.exportFormatSelect.value || "markdown";
   const exporters = {
     json: {
@@ -6463,7 +6458,7 @@ async function exportCurrentThread() {
   }
 }
 
-function currentFilteredExportThread(options = {}) {
+async function currentFilteredExportThread(options = {}) {
   const detail = state.currentThread || {};
   const summary = detail.summary || {};
   const messages = [];
@@ -6471,9 +6466,11 @@ function currentFilteredExportThread(options = {}) {
     if (!isMessageVisibleByFilter(message)) {
       continue;
     }
-    messages.push(exportMessageObject(message, {
+    const messageIndex = messageIndexFor(message, localIndex);
+    const loadedMessage = await ensureMessageTextLoaded(message, messageIndex);
+    messages.push(exportMessageObject(loadedMessage, {
       ...options,
-      messageIndex: messageIndexFor(message, localIndex)
+      messageIndex
     }));
   }
   const exportDetail = {
@@ -6535,7 +6532,7 @@ function conversationAsMarkdown(detail) {
     if (meta.length > 0) {
       lines.push("", ...meta.map((item) => `- ${item}`));
     }
-    lines.push("", message.text || "", "");
+    lines.push("", messageViewText(message), "");
   }
   return `${lines.join("\n").trimEnd()}\n`;
 }
@@ -6573,7 +6570,7 @@ function conversationAsPlainText(detail, options = {}) {
     for (const item of exportMessageMetadata(message)) {
       lines.push(item);
     }
-    lines.push("", message.text || "", "");
+    lines.push("", messageViewText(message), "");
   }
   return `${lines.join("\n").trimEnd()}\n`;
 }

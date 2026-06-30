@@ -619,6 +619,7 @@ button:disabled {
 
 .segment-gap {
   display: flex;
+  width: 100%;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-sm);
@@ -627,6 +628,14 @@ button:disabled {
   border-radius: 6px;
   background: rgba(245, 248, 247, 0.78);
   color: var(--muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.segment-gap:hover {
+  border-color: rgba(0, 139, 139, 0.48);
+  background: rgba(234, 248, 247, 0.82);
 }
 
 .segment-gap-copy {
@@ -645,10 +654,17 @@ button:disabled {
   font-size: 12px;
 }
 
-.segment-gap button {
+.segment-gap-action {
   flex: 0 0 auto;
-  min-height: 32px;
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
   padding: 0 10px;
+  border: 1px solid rgba(0, 139, 139, 0.24);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--accent-strong);
+  font-weight: 600;
 }
 
 .message-filters,
