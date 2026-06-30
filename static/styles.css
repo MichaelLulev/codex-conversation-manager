@@ -562,6 +562,13 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.history-window-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  justify-content: flex-end;
+}
+
 .history-window button {
   min-height: 32px;
   padding: 0 10px;
@@ -608,6 +615,40 @@ button:disabled {
   font-size: 12px;
   text-align: right;
   white-space: nowrap;
+}
+
+.segment-gap {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border: 1px dashed rgba(95, 113, 118, 0.34);
+  border-radius: 6px;
+  background: rgba(245, 248, 247, 0.78);
+  color: var(--muted);
+}
+
+.segment-gap-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.segment-gap-copy strong {
+  color: #344246;
+  font-size: 13px;
+}
+
+.segment-gap-copy span {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.segment-gap button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 0 10px;
 }
 
 .message-filters,

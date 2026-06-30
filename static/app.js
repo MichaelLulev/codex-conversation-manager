@@ -4,8 +4,8 @@ const MODES = {
     listUrl: "/api/main-threads",
     detailUrl: (id, options = {}) => {
       const params = new URLSearchParams();
-      if (options.historyWindow) {
-        params.set("history_window", options.historyWindow);
+      if (options.segmentId) {
+        params.set("segment_id", options.segmentId);
       }
       const query = params.toString();
       return `/api/main-threads/${encodeURIComponent(id)}${query ? `?${query}` : ""}`;
@@ -33,8 +33,6 @@ const MAIN_FILTER_LABELS = {
   archived: "archived conversations"
 };
 
-const MAIN_HISTORY_WINDOW_FULL = "full";
-const MAIN_HISTORY_WINDOW_LATEST_COMPACTION = "latest_compaction";
 const MESSAGE_RENDER_BATCH_SIZE = 100;
 const TOOL_RUN_GROUP_MIN_SIZE = 2;
 const MAX_FORMATTED_TEXT_LENGTH = 60000;
@@ -110,7 +108,6 @@ const state = {
   threads: [],
   selectedId: null,
   currentThread: null,
-  fullHistoryThreadIds: new Set(),
   pendingBranchId: null,
   pendingScrollTarget: null,
   scrollAnimationFrame: null,
@@ -199,6 +196,8 @@ const els = {
   metaCwd: document.getElementById("meta-cwd"),
   historyWindow: document.getElementById("history-window"),
   historyWindowText: document.getElementById("history-window-text"),
+  historyWindowPrevButton: document.getElementById("history-window-prev-button"),
+  historyWindowNextButton: document.getElementById("history-window-next-button"),
   historyWindowFullButton: document.getElementById("history-window-full-button"),
   relatedPanel: document.getElementById("related-panel"),
   conversationSearchInput: document.getElementById("conversation-search-input"),
@@ -798,42 +797,239 @@ function newAskCodexServerRequestId() {
   return `ask-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-function mainHistoryWindowForThread(threadId, options = {}) {
-  if (state.mode !== "main" || !threadId) {
-    return null;
-  }
-  if (options.forceFullHistory || options.branchId || state.fullHistoryThreadIds.has(threadId)) {
-    return MAIN_HISTORY_WINDOW_FULL;
-  }
-  return MAIN_HISTORY_WINDOW_LATEST_COMPACTION;
+function hasSegmentedConversation(detail = state.currentThread) {
+  return state.mode === "main" && Array.isArray(detail?.segments) && detail.segments.length > 0;
 }
 
-function currentConversationHistoryWindow() {
-  if (state.mode !== "main") {
-    return null;
-  }
-  return state.currentThread?.history_window?.mode
-    || mainHistoryWindowForThread(state.currentThread?.summary?.id || state.selectedId);
+function loadedSegmentIdSet(detail = state.currentThread) {
+  return new Set(detail?.loaded_segment_ids || []);
 }
 
-async function loadFullHistoryForCurrentThread(options = {}) {
-  if (state.mode !== "main") {
+function isSegmentLoaded(segmentId, detail = state.currentThread) {
+  return Boolean(segmentId && loadedSegmentIdSet(detail).has(segmentId));
+}
+
+function segmentForMessageIndex(messageIndex, detail = state.currentThread) {
+  if (!Number.isInteger(messageIndex)) {
+    return null;
+  }
+  return (detail?.segments || []).find((segment) => (
+    segment.start_message_index <= messageIndex
+    && messageIndex <= segment.end_message_index
+  )) || null;
+}
+
+function segmentForTimestamp(timestamp, detail = state.currentThread) {
+  const value = Number(timestamp);
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+  const segments = detail?.segments || [];
+  return segments.find((segment) => {
+    const start = Number(segment.start_timestamp);
+    const end = Number(segment.end_timestamp);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      return false;
+    }
+    return start <= value && value <= end;
+  }) || null;
+}
+
+function messageIndexFor(message, fallbackIndex = null) {
+  return Number.isInteger(message?.global_message_index)
+    ? message.global_message_index
+    : fallbackIndex;
+}
+
+function messageByGlobalIndex(messageIndex) {
+  return (state.currentThread?.messages || []).find(
+    (message, localIndex) => messageIndexFor(message, localIndex) === messageIndex
+  ) || null;
+}
+
+function normalizeSegmentedThread(detail) {
+  if (!Array.isArray(detail?.segments)) {
+    return detail;
+  }
+  detail.loaded_segment_ids = Array.from(new Set(detail.loaded_segment_ids || []));
+  detail.loadedSegments = detail.loadedSegments || {};
+  for (const segmentId of detail.loaded_segment_ids) {
+    detail.loadedSegments[segmentId] = (detail.messages || []).filter(
+      (message) => message.segment_id === segmentId
+    );
+  }
+  detail.messages = flattenedLoadedSegmentMessages(detail);
+  return detail;
+}
+
+function flattenedLoadedSegmentMessages(detail) {
+  if (!Array.isArray(detail?.segments) || !detail.loadedSegments) {
+    return detail?.messages || [];
+  }
+  const messages = [];
+  for (const segment of detail.segments) {
+    if (Array.isArray(detail.loadedSegments[segment.id])) {
+      messages.push(...detail.loadedSegments[segment.id]);
+    }
+  }
+  return messages;
+}
+
+async function loadMainSegment(segmentId, options = {}) {
+  const detail = state.currentThread;
+  const threadId = detail?.summary?.id;
+  if (!hasSegmentedConversation(detail) || !threadId || !segmentId) {
     return false;
   }
-  const threadId = state.currentThread?.summary?.id || state.selectedId;
-  if (!threadId) {
+  if (isSegmentLoaded(segmentId, detail)) {
+    return true;
+  }
+  els.sourceLine.textContent = `Loading ${segmentLabel(segmentById(segmentId, detail))}...`;
+  const result = await fetchJson(
+    `/api/main-threads/${encodeURIComponent(threadId)}/segments/${encodeURIComponent(segmentId)}`
+  );
+  mergeLoadedSegment(result.segment, result.messages || []);
+  if (!options.deferRender) {
+    renderSegmentedConversationAfterLoad(options);
+  }
+  return true;
+}
+
+function mergeLoadedSegment(segment, messages) {
+  const detail = state.currentThread;
+  if (!detail || !segment?.id) {
+    return;
+  }
+  detail.loadedSegments = detail.loadedSegments || {};
+  detail.loadedSegments[segment.id] = messages;
+  const loaded = loadedSegmentIdSet(detail);
+  loaded.add(segment.id);
+  detail.loaded_segment_ids = [...loaded].sort((left, right) => segmentOrdinal(left) - segmentOrdinal(right));
+  for (const item of detail.segments || []) {
+    item.loaded = loaded.has(item.id);
+  }
+  detail.messages = flattenedLoadedSegmentMessages(detail);
+}
+
+function renderSegmentedConversationAfterLoad(options = {}) {
+  if (!state.currentThread) {
+    return;
+  }
+  markFinalAssistantReplies(state.currentThread.messages || []);
+  renderHistoryWindow(state.currentThread);
+  rerenderMessagesForCurrentFilters({ scheduleSearch: options.scheduleSearch !== false });
+}
+
+function segmentById(segmentId, detail = state.currentThread) {
+  return (detail?.segments || []).find((segment) => segment.id === segmentId) || null;
+}
+
+function segmentLabel(segment) {
+  if (!segment) {
+    return "segment";
+  }
+  return `segment ${segment.ordinal}`;
+}
+
+function segmentOrdinal(segmentId, detail = state.currentThread) {
+  return segmentById(segmentId, detail)?.ordinal || 0;
+}
+
+async function loadSegmentForMessage(messageIndex, options = {}) {
+  const segment = segmentForMessageIndex(messageIndex);
+  if (!segment) {
     return false;
   }
-  state.fullHistoryThreadIds.add(threadId);
-  if (options.branchId) {
-    state.pendingBranchId = options.branchId;
+  if (isSegmentLoaded(segment.id)) {
+    return true;
   }
-  els.sourceLine.textContent = "Loading full conversation...";
-  await selectThread(threadId, {
-    preservePendingBranch: true,
-    scrollListBehavior: options.scrollListBehavior || "auto",
-    forceFullHistory: true
-  });
+  state.pendingScrollTarget = {
+    type: "message",
+    messageIndex,
+    anchorId: options.anchorId || null
+  };
+  return loadMainSegment(segment.id, { scheduleSearch: false });
+}
+
+async function loadSegmentForBranch(branchId) {
+  const item = relatedItemById(branchId);
+  const segment = segmentForTimestamp(item?.started_at || item?.updated_at);
+  if (!segment || isSegmentLoaded(segment.id)) {
+    return false;
+  }
+  state.pendingScrollTarget = { type: "branch", branchId };
+  return loadMainSegment(segment.id, { scheduleSearch: false });
+}
+
+function relatedItemById(itemId) {
+  const related = state.currentThread?.related || {};
+  for (const key of ["parents", "forks", "side"]) {
+    const item = (related[key] || []).find((candidate) => candidate.id === itemId);
+    if (item) {
+      return item;
+    }
+  }
+  return null;
+}
+
+async function loadAdjacentSegment(direction) {
+  const detail = state.currentThread;
+  if (!hasSegmentedConversation(detail)) {
+    return false;
+  }
+  const target = adjacentSegmentTarget(direction, detail);
+  if (!target) {
+    return false;
+  }
+  return loadMainSegment(target.id);
+}
+
+function adjacentSegmentTarget(direction, detail = state.currentThread) {
+  const ranges = loadedOrdinalRanges(detail);
+  if (ranges.length === 0) {
+    return null;
+  }
+  const targetOrdinal = direction < 0
+    ? ranges[ranges.length - 1].start - 1
+    : ranges[0].end + 1;
+  return (detail?.segments || []).find((segment) => segment.ordinal === targetOrdinal) || null;
+}
+
+function loadedOrdinalRanges(detail = state.currentThread) {
+  const loaded = loadedSegmentIdSet(detail);
+  const ordinals = (detail?.segments || [])
+    .filter((segment) => loaded.has(segment.id))
+    .map((segment) => segment.ordinal)
+    .sort((left, right) => left - right);
+  const ranges = [];
+  for (const ordinal of ordinals) {
+    const last = ranges[ranges.length - 1];
+    if (last && ordinal === last.end + 1) {
+      last.end = ordinal;
+    } else {
+      ranges.push({ start: ordinal, end: ordinal });
+    }
+  }
+  return ranges;
+}
+
+function formatOrdinalRanges(ranges) {
+  return ranges
+    .map((range) => range.start === range.end ? String(range.start) : `${range.start}-${range.end}`)
+    .join(", ");
+}
+
+async function loadAllSegments() {
+  const detail = state.currentThread;
+  if (!hasSegmentedConversation(detail)) {
+    return false;
+  }
+  for (const segment of detail.segments || []) {
+    if (!isSegmentLoaded(segment.id, detail)) {
+      await loadMainSegment(segment.id, { scheduleSearch: false, deferRender: true });
+    }
+  }
+  renderSegmentedConversationAfterLoad();
   return true;
 }
 
@@ -1083,7 +1279,7 @@ async function openThread(kind, threadId, options = {}) {
     await selectThread(threadId, {
       preservePendingBranch: true,
       scrollListBehavior: "smooth",
-      forceFullHistory: Boolean(options.forceFullHistory || options.branchId)
+      segmentId: options.segmentId
     });
   } catch (error) {
     if (!isAbortError(error)) {
@@ -1329,10 +1525,6 @@ function scrollSelectedThreadIntoView({ behavior = "auto" } = {}) {
 }
 
 async function selectThread(threadId, options = {}) {
-  const historyWindow = mainHistoryWindowForThread(threadId, options);
-  if (state.mode === "main" && historyWindow === MAIN_HISTORY_WINDOW_FULL) {
-    state.fullHistoryThreadIds.add(threadId);
-  }
   if (!options.preservePendingBranch) {
     state.pendingBranchId = null;
   }
@@ -1353,13 +1545,13 @@ async function selectThread(threadId, options = {}) {
   resetAskCodex();
   try {
     const detail = await fetchJson(
-      modeConfig().detailUrl(threadId, { historyWindow }),
+      modeConfig().detailUrl(threadId, { segmentId: options.segmentId }),
       { signal: controller.signal }
     );
     if (requestId !== state.detailRequestId) {
       return;
     }
-    state.currentThread = detail;
+    state.currentThread = normalizeSegmentedThread(detail);
     await renderConversation(detail);
   } catch (error) {
     if (requestId === state.detailRequestId && !isAbortError(error)) {
@@ -1422,6 +1614,13 @@ async function renderConversation(detail) {
   els.metaModel.textContent = text(summary.model);
   els.metaCwd.textContent = text(summary.cwd);
   renderHistoryWindow(detail);
+  if (hasSegmentedConversation(detail) && !state.pendingScrollTarget && detail.messages.length > 0) {
+    state.pendingScrollTarget = {
+      type: "message",
+      messageIndex: messageIndexFor(detail.messages[0], 0),
+      anchorId: null
+    };
+  }
   renderRelated(
     detail.related || {},
     summary,
@@ -1446,23 +1645,26 @@ async function renderConversation(detail) {
 }
 
 function renderHistoryWindow(detail) {
-  const historyWindow = detail?.history_window;
-  if (!els.historyWindow || !historyWindow?.truncated) {
+  if (!els.historyWindow || !hasSegmentedConversation(detail) || detail.segments.length <= 1) {
     els.historyWindow?.classList.add("hidden");
     return;
   }
-  const checkpoint = historyWindow.checkpoint || {};
-  const shown = formatCount(historyWindow.shown_message_count ?? (detail.messages || []).length);
-  const total = formatCount(historyWindow.total_message_count ?? detail.summary?.message_count ?? shown);
-  const checkpointLabel = checkpoint.ordinal
-    ? `compaction #${checkpoint.ordinal}`
-    : "the latest compaction";
-  const checkpointTime = checkpoint.time ? ` at ${checkpoint.time}` : "";
+  const loaded = loadedSegmentIdSet(detail);
+  const loadedSegments = detail.segments.filter((segment) => loaded.has(segment.id));
+  const loadedMessages = loadedSegments.reduce((sum, segment) => sum + segment.message_count, 0);
+  const totalMessages = detail.summary?.message_count ?? loadedMessages;
+  const ranges = loadedOrdinalRanges(detail);
+  const range = ranges.length > 0 ? formatOrdinalRanges(ranges) : "none";
   els.historyWindowText.textContent = [
-    `Loaded latest segment since ${checkpointLabel}${checkpointTime}: ${shown} of ${total} messages.`,
-    "Search, export, and Ask use this segment until the full conversation is loaded."
+    `Loaded ${formatCount(loadedSegments.length)} of ${formatCount(detail.segments.length)} segments`,
+    `(${formatCount(loadedMessages)} of ${formatCount(totalMessages)} messages).`,
+    `Visible segment range: ${range}.`,
+    "Jumping to an unloaded point loads only its segment."
   ].join(" ");
-  els.historyWindowFullButton.disabled = false;
+
+  els.historyWindowPrevButton.disabled = !adjacentSegmentTarget(-1, detail);
+  els.historyWindowNextButton.disabled = !adjacentSegmentTarget(1, detail);
+  els.historyWindowFullButton.disabled = loadedSegments.length >= detail.segments.length;
   els.historyWindow.classList.remove("hidden");
 }
 
@@ -1495,7 +1697,7 @@ function markFinalAssistantReplies(messages) {
   markLastAssistant();
 }
 
-async function renderMessages(detail, branchGroups, renderRequestId) {
+async function renderMessages(detail, branchGroups, renderRequestId, options = {}) {
   if (renderRequestId !== state.renderRequestId) {
     return;
   }
@@ -1507,7 +1709,9 @@ async function renderMessages(detail, branchGroups, renderRequestId) {
   await renderMessageUnits(units, renderRequestId);
   updateMessageCount(renderedMessages, detail.messages.length);
   scheduleMessagesFrameSync({ frames: 4, delays: [80, 240, 700], force: true });
-  scheduleConversationSearch({ immediate: true });
+  if (options.scheduleSearch !== false) {
+    scheduleConversationSearch({ immediate: true });
+  }
   scrollToPendingBranch();
 }
 
@@ -1536,9 +1740,9 @@ function buildMessageUnits(detail, branchGroups, renderRequestId) {
     units.push(branchUnit(startBranches));
   }
 
-  for (const [index, message] of detail.messages.entries()) {
+  const appendMessage = (message, index) => {
     if (renderRequestId !== state.renderRequestId) {
-      break;
+      return false;
     }
     if (isMessageVisibleByFilter(message)) {
       if (rollbackGroups.groupedIndexes.has(index)) {
@@ -1567,6 +1771,33 @@ function buildMessageUnits(detail, branchGroups, renderRequestId) {
       flushToolRun();
       units.push(jumpMarkerUnit(markers, index));
     }
+    return true;
+  };
+
+  if (hasSegmentedConversation(detail)) {
+    for (const segment of detail.segments || []) {
+      const segmentMessages = detail.loadedSegments?.[segment.id];
+      if (!Array.isArray(segmentMessages)) {
+        flushToolRun();
+        units.push(segmentGapUnit(segment));
+        continue;
+      }
+      for (const [localIndex, message] of segmentMessages.entries()) {
+        const index = messageIndexFor(message, segment.start_message_index + localIndex);
+        if (!appendMessage(message, index)) {
+          break;
+        }
+      }
+    }
+    flushToolRun();
+    return { units, renderedMessages };
+  }
+
+  for (const [localIndex, message] of detail.messages.entries()) {
+    const index = messageIndexFor(message, localIndex);
+    if (!appendMessage(message, index)) {
+      break;
+    }
   }
   flushToolRun();
   return { units, renderedMessages };
@@ -1574,12 +1805,17 @@ function buildMessageUnits(detail, branchGroups, renderRequestId) {
 
 function collectRollbackGroups(messages, options = {}) {
   const respectFilters = options.respectFilters !== false;
+  const entries = messages.map((message, localIndex) => ({
+    message,
+    index: messageIndexFor(message, localIndex),
+    localIndex
+  }));
   const groupsByKey = new Map();
-  for (const [index, message] of messages.entries()) {
+  for (const { message, index, localIndex } of entries) {
     if (!message.rolled_back || (respectFilters && !isMessageVisibleByFilter(message))) {
       continue;
     }
-    const item = { message, index };
+    const item = { message, index, localIndex };
     const key = rollbackGroupKey(item);
     if (!groupsByKey.has(key)) {
       groupsByKey.set(key, []);
@@ -1596,14 +1832,16 @@ function collectRollbackGroups(messages, options = {}) {
     }
     const rollbackTimestamp = group.find((item) => item.message?.rolled_back_by_timestamp)?.message?.rolled_back_by_timestamp;
     const firstRolledIndex = group[0].index;
-    const rollbackEventIndex = rollbackEventIndexForGroup(messages, rollbackTimestamp, firstRolledIndex);
+    const rollbackEventIndex = rollbackEventIndexForGroup(entries, rollbackTimestamp, firstRolledIndex);
     const eventEndIndex = rollbackEventIndex ?? group[group.length - 1].index;
-    for (let index = firstRolledIndex; index <= eventEndIndex; index += 1) {
-      const message = messages[index];
+    for (const { message, index, localIndex } of entries) {
+      if (index < firstRolledIndex || index > eventEndIndex) {
+        continue;
+      }
       if (!message || message.rolled_back || message.role !== "event" || (respectFilters && !isMessageVisibleByFilter(message))) {
         continue;
       }
-      group.push({ message, index });
+      group.push({ message, index, localIndex });
     }
     group.sort((left, right) => left.index - right.index);
     firstIndexToGroup.set(group[0].index, group);
@@ -1615,12 +1853,14 @@ function collectRollbackGroups(messages, options = {}) {
   return { firstIndexToGroup, groupedIndexes, groups };
 }
 
-function rollbackEventIndexForGroup(messages, rollbackTimestamp, startIndex) {
+function rollbackEventIndexForGroup(entries, rollbackTimestamp, startIndex) {
   if (rollbackTimestamp === undefined || rollbackTimestamp === null) {
     return null;
   }
-  for (let index = startIndex; index < messages.length; index += 1) {
-    const message = messages[index];
+  for (const { message, index } of entries) {
+    if (index < startIndex) {
+      continue;
+    }
     if (message?.role === "event" && message.phase === "rollback" && message.timestamp === rollbackTimestamp) {
       return index;
     }
@@ -1676,6 +1916,16 @@ function jumpMarkerUnit(markers, index) {
     markers,
     startIndex: index,
     endIndex: index,
+    messageCount: 0
+  };
+}
+
+function segmentGapUnit(segment) {
+  return {
+    type: "segmentGap",
+    segment,
+    startIndex: segment.start_message_index,
+    endIndex: segment.end_message_index,
     messageCount: 0
   };
 }
@@ -1739,14 +1989,18 @@ function rollbackEventIndexForCheckpoint(checkpoint, messages) {
   if (checkpoint?.timestamp === undefined || checkpoint?.timestamp === null) {
     return null;
   }
-  const index = messages.findIndex((message) => (
-    message?.role === "event"
-    && message.phase === "rollback"
-    && message.timestamp !== undefined
-    && message.timestamp !== null
-    && String(message.timestamp) === String(checkpoint.timestamp)
-  ));
-  return index >= 0 ? index : null;
+  for (const [localIndex, message] of messages.entries()) {
+    if (
+      message?.role === "event"
+      && message.phase === "rollback"
+      && message.timestamp !== undefined
+      && message.timestamp !== null
+      && String(message.timestamp) === String(checkpoint.timestamp)
+    ) {
+      return messageIndexFor(message, localIndex);
+    }
+  }
+  return null;
 }
 
 function rollbackLinkSummary(checkpointSummary, groupSummary) {
@@ -1808,10 +2062,13 @@ function renderUnit(unit) {
   if (unit.type === "jumpMarker") {
     return renderJumpMarker(unit.markers);
   }
+  if (unit.type === "segmentGap") {
+    return renderSegmentGap(unit.segment);
+  }
   return renderBranchMarker(unit.branches);
 }
 
-function rerenderMessagesForCurrentFilters() {
+function rerenderMessagesForCurrentFilters(options = {}) {
   if (!state.currentThread) {
     return;
   }
@@ -1823,7 +2080,7 @@ function rerenderMessagesForCurrentFilters() {
   state.renderRequestId = renderRequestId;
   state.toolRunByMessageIndex = new Map();
   els.messages.replaceChildren();
-  renderMessages(state.currentThread, branchGroupsFor(state.currentThread), renderRequestId);
+  renderMessages(state.currentThread, branchGroupsFor(state.currentThread), renderRequestId, options);
 }
 
 function renderRelated(related, summary, compactions = [], rollbacks = []) {
@@ -2285,6 +2542,10 @@ function scrollToMessageIndex(messageIndex, { defer = false, anchorId = null } =
     if (defer) {
       state.pendingScrollTarget = { type: "message", messageIndex, anchorId };
     }
+    if (hasSegmentedConversation() && !messageByGlobalIndex(messageIndex)) {
+      void loadSegmentForMessage(messageIndex, { anchorId });
+      return true;
+    }
     return false;
   }
   state.pendingScrollTarget = null;
@@ -2402,14 +2663,14 @@ function branchAnchorIndex(messages, startedAt) {
 
   let anchor = -1;
   let sawTimestamp = false;
-  for (const [index, message] of messages.entries()) {
+  for (const [localIndex, message] of messages.entries()) {
     const timestamp = Number(message.timestamp);
     if (!Number.isFinite(timestamp)) {
       continue;
     }
     sawTimestamp = true;
     if (timestamp <= started) {
-      anchor = index;
+      anchor = messageIndexFor(message, localIndex);
     }
   }
 
@@ -2462,6 +2723,36 @@ function renderJumpMarker(markers) {
   }
   marker.appendChild(list);
   return marker;
+}
+
+function renderSegmentGap(segment) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "segment-gap";
+  wrapper.dataset.segmentId = segment.id;
+
+  const copy = document.createElement("div");
+  copy.className = "segment-gap-copy";
+
+  const title = document.createElement("strong");
+  title.textContent = `${segmentLabel(segment)} not loaded`;
+
+  const meta = document.createElement("span");
+  meta.textContent = [
+    `${formatCount(segment.message_count)} messages`,
+    segment.start_time && segment.end_time ? `${segment.start_time} to ${segment.end_time}` : ""
+  ].filter(Boolean).join(" | ");
+
+  copy.append(title, meta);
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "Load segment";
+  button.addEventListener("click", () => {
+    void loadMainSegment(segment.id);
+  });
+
+  wrapper.append(copy, button);
+  return wrapper;
 }
 
 function renderJumpMarkerItem(item) {
@@ -2557,7 +2848,7 @@ function messageHasVisibleScrollTarget(messages, rollbackGroups, index) {
   if (!Number.isInteger(index)) {
     return false;
   }
-  const message = messages[index];
+  const message = messages.find((item, localIndex) => messageIndexFor(item, localIndex) === index);
   return Boolean(message && isMessageVisibleByFilter(message) && (
     !rollbackGroups.groupedIndexes.has(index)
     || rollbackGroups.firstIndexToGroup.has(index)
@@ -2665,8 +2956,8 @@ function jumpToBranch(branchId, { defer = false } = {}) {
     if (defer) {
       state.pendingScrollTarget = { type: "branch", branchId };
     }
-    if (state.mode === "main" && state.currentThread?.history_window?.truncated) {
-      void loadFullHistoryForCurrentThread({ branchId });
+    if (hasSegmentedConversation()) {
+      void loadSegmentForBranch(branchId);
       return true;
     }
     return false;
@@ -2855,10 +3146,6 @@ function conversationSearchUrl(query) {
     q: query,
     filters: enabledServerMessageFilterKeys().join(",")
   });
-  const historyWindow = currentConversationHistoryWindow();
-  if (historyWindow) {
-    params.set("history_window", historyWindow);
-  }
   return `/api/search?${params.toString()}`;
 }
 
@@ -2878,6 +3165,13 @@ function enabledServerMessageFilterKeys() {
 }
 
 function filterSearchResultToVisibleMessages(result) {
+  if (hasSegmentedConversation()) {
+    const totalMatches = (result.matchGroups || []).reduce(
+      (sum, group) => sum + (group.count || 0),
+      0
+    );
+    return { matchGroups: result.matchGroups || [], totalMatches };
+  }
   const messages = state.currentThread?.messages || [];
   const matchGroups = [];
   let totalMatches = 0;
@@ -2897,7 +3191,7 @@ async function applyConversationSearchOnMainThread(requestId, query, lowerQuery)
   const matchGroups = [];
   let totalMatches = 0;
   let lastYield = performance.now();
-  for (const [messageIndex, message] of messages.entries()) {
+  for (const [localIndex, message] of messages.entries()) {
     if (requestId !== state.conversationSearch.requestId) {
       return;
     }
@@ -2907,6 +3201,7 @@ async function applyConversationSearchOnMainThread(requestId, query, lowerQuery)
     const lowerText = cachedLowerSearchText(message, messageViewText(message));
     const count = countSearchOccurrences(lowerText, lowerQuery);
     if (count > 0) {
+      const messageIndex = messageIndexFor(message, localIndex);
       matchGroups.push({ messageIndex, count });
       totalMatches += count;
     }
@@ -2980,7 +3275,7 @@ async function rebuildSearchWorkerIndex() {
   state.conversationSearch.pendingWorkerSearch = false;
   worker.postMessage({ type: "reset", revision });
   let records = [];
-  for (const [messageIndex, message] of state.currentThread.messages.entries()) {
+  for (const [localIndex, message] of state.currentThread.messages.entries()) {
     if (revision !== state.conversationSearch.workerRevision) {
       return;
     }
@@ -2988,7 +3283,7 @@ async function rebuildSearchWorkerIndex() {
       continue;
     }
     records.push({
-      messageIndex,
+      messageIndex: messageIndexFor(message, localIndex),
       text: messageViewText(message)
     });
     if (records.length >= 80) {
@@ -3210,6 +3505,16 @@ function setActiveConversationMatch(index, { scroll = true, expandCollapsed = tr
   let wrapper = els.messages.querySelector(`.message[data-message-index="${active.messageIndex}"]`);
   if (!wrapper && expandCollapsed) {
     wrapper = expandToolRunForMessage(active.messageIndex);
+  }
+  if (!wrapper && hasSegmentedConversation() && !messageByGlobalIndex(active.messageIndex)) {
+    state.conversationSearch.activeIndex = normalizedIndex;
+    updateConversationSearchControls();
+    void loadSegmentForMessage(active.messageIndex).then((loaded) => {
+      if (loaded) {
+        setActiveConversationMatch(normalizedIndex, { scroll, expandCollapsed });
+      }
+    });
+    return;
   }
   let activeElement = wrapper;
   if (wrapper) {
@@ -3558,10 +3863,16 @@ function canRollbackToMessage(message, index) {
 }
 
 function activeUserTurnsAfter(index) {
+  const message = messageByGlobalIndex(index);
+  if (Number.isInteger(message?.active_user_turns_after)) {
+    return message.active_user_turns_after;
+  }
   const messages = state.currentThread?.messages || [];
   let count = 0;
-  for (let cursor = index + 1; cursor < messages.length; cursor += 1) {
-    const message = messages[cursor];
+  for (const [localIndex, message] of messages.entries()) {
+    if (messageIndexFor(message, localIndex) <= index) {
+      continue;
+    }
     if (message?.role === "user" && !message.rolled_back && Number.isInteger(message.line_number)) {
       count += 1;
     }
@@ -4042,9 +4353,8 @@ function messageContainsDiff(message) {
 
 function updateMessageCount(visible, total) {
   if (state.currentThread && state.currentThread.summary) {
-    const historyWindow = state.currentThread.history_window;
-    if (historyWindow?.truncated) {
-      const totalMessages = historyWindow.total_message_count ?? state.currentThread.summary.message_count ?? total;
+    if (hasSegmentedConversation()) {
+      const totalMessages = state.currentThread.summary.message_count ?? total;
       els.metaCount.textContent = visible === total
         ? `${formatCount(total)} loaded (${formatCount(totalMessages)} total)`
         : `${formatCount(visible)} of ${formatCount(total)} loaded (${formatCount(totalMessages)} total)`;
@@ -5429,8 +5739,19 @@ function scrollToConversationNavigationTarget(target) {
   if (!target || !Number.isInteger(target.messageIndex)) {
     return false;
   }
-  const message = state.currentThread?.messages?.[target.messageIndex];
+  const message = messageByGlobalIndex(target.messageIndex);
   if (!message) {
+    if (hasSegmentedConversation()) {
+      els.askCodexStatus.textContent = `Loading segment for message ${target.messageIndex + 1}...`;
+      void loadSegmentForMessage(target.messageIndex).then((loaded) => {
+        if (loaded) {
+          scrollToConversationNavigationTarget(target);
+        } else {
+          els.askCodexStatus.textContent = `Message ${target.messageIndex + 1} is not in this conversation.`;
+        }
+      });
+      return true;
+    }
     els.askCodexStatus.textContent = `Message ${target.messageIndex + 1} is not in this conversation.`;
     return false;
   }
@@ -5663,7 +5984,7 @@ function isValidConversationMessageNumber(messageNumber) {
   return (
     Number.isInteger(messageNumber)
     && messageNumber >= 1
-    && messageNumber <= (state.currentThread?.messages || []).length
+    && messageNumber <= (state.currentThread?.summary?.message_count || (state.currentThread?.messages || []).length)
   );
 }
 
@@ -5672,7 +5993,7 @@ function currentAskCodexContext() {
   const context = conversationAsCompactAskExport(exportThread);
   return {
     context,
-    truncated: Boolean(exportThread.history_window?.truncated),
+    truncated: isSegmentedExportPartial(exportThread),
     messageCount: exportThread.messages.length
   };
 }
@@ -5714,13 +6035,12 @@ function conversationAsCompactAskExport(detail) {
   if (detail.recovery_note) {
     lines.push(compactObjectLine("NOTE", { recovery: detail.recovery_note }, ["recovery"]));
   }
-  if (detail.history_window) {
-    lines.push(compactObjectLine("HISTORY_WINDOW", detail.history_window, [
-      "mode",
-      "truncated",
-      "start_message_index",
-      "shown_message_count",
-      "total_message_count"
+  if (detail.segments) {
+    lines.push(compactObjectLine("SEGMENTS", segmentExportMetadata(detail), [
+      "loaded_segments",
+      "total_segments",
+      "loaded_messages",
+      "total_messages"
     ]));
   }
 
@@ -5816,6 +6136,8 @@ function compactAttributeName(key) {
     assistant_stage: "stage",
     copy_line_count: "copy_lines",
     line_number: "line",
+    loaded_messages: "loaded_messages",
+    loaded_segments: "loaded_segments",
     message_count: "messages",
     message_index: "msg_index",
     navigation_href: "nav",
@@ -5829,6 +6151,8 @@ function compactAttributeName(key) {
     start_message_index: "start_msg",
     time: "t",
     total_message_count: "total",
+    total_messages: "total_messages",
+    total_segments: "total_segments",
     user_count: "user"
   }[key] || key;
 }
@@ -5898,13 +6222,16 @@ function currentFilteredExportThread(options = {}) {
   const detail = state.currentThread || {};
   const summary = detail.summary || {};
   const messages = [];
-  for (const [index, message] of (detail.messages || []).entries()) {
+  for (const [localIndex, message] of (detail.messages || []).entries()) {
     if (!isMessageVisibleByFilter(message)) {
       continue;
     }
-    messages.push(exportMessageObject(message, { ...options, messageIndex: index }));
+    messages.push(exportMessageObject(message, {
+      ...options,
+      messageIndex: messageIndexFor(message, localIndex)
+    }));
   }
-  return {
+  const exportDetail = {
     ...detail,
     summary: {
       ...summary,
@@ -5912,6 +6239,8 @@ function currentFilteredExportThread(options = {}) {
     },
     messages
   };
+  delete exportDetail.loadedSegments;
+  return exportDetail;
 }
 
 function exportMessageObject(message, options = {}) {
@@ -5921,8 +6250,10 @@ function exportMessageObject(message, options = {}) {
   if (message?.role === "assistant") {
     exported.assistant_stage = assistantStage(message);
   }
-  if (options.includeNavigationRefs && Number.isInteger(options.messageIndex)) {
+  if (Number.isInteger(options.messageIndex)) {
     exported.message_number = options.messageIndex + 1;
+  }
+  if (options.includeNavigationRefs && Number.isInteger(options.messageIndex)) {
     exported.navigation_href = `codex-message:${options.messageIndex + 1}`;
   }
   return exported;
@@ -5953,7 +6284,8 @@ function conversationAsMarkdown(detail) {
   }
 
   for (const [index, message] of messages.entries()) {
-    lines.push(`## ${index + 1}. ${exportRoleLabel(message)}`);
+    const messageNumber = Number.isInteger(message.message_number) ? message.message_number : index + 1;
+    lines.push(`## ${messageNumber}. ${exportRoleLabel(message)}`);
     const meta = exportMessageMetadata(message);
     if (meta.length > 0) {
       lines.push("", ...meta.map((item) => `- ${item}`));
@@ -6002,17 +6334,33 @@ function conversationAsPlainText(detail, options = {}) {
 }
 
 function historyWindowExportLine(detail) {
-  const historyWindow = detail?.history_window;
-  if (!historyWindow?.truncated) {
+  if (!detail?.segments) {
     return "";
   }
-  const checkpoint = historyWindow.checkpoint || {};
-  const checkpointLabel = checkpoint.ordinal
-    ? `compaction #${checkpoint.ordinal}`
-    : "the latest compaction";
-  const shown = historyWindow.shown_message_count ?? (detail.messages || []).length;
-  const total = historyWindow.total_message_count ?? shown;
-  return `latest segment since ${checkpointLabel}, ${shown} of ${total} messages loaded before message filters`;
+  const metadata = segmentExportMetadata(detail);
+  if (metadata.loaded_segments >= metadata.total_segments) {
+    return "";
+  }
+  return `${metadata.loaded_segments} of ${metadata.total_segments} segments loaded, ${metadata.loaded_messages} of ${metadata.total_messages} messages loaded before message filters`;
+}
+
+function segmentExportMetadata(detail) {
+  const loaded = loadedSegmentIdSet(detail);
+  const loadedSegments = (detail.segments || []).filter((segment) => loaded.has(segment.id));
+  return {
+    loaded_segments: loadedSegments.length,
+    total_segments: (detail.segments || []).length,
+    loaded_messages: loadedSegments.reduce((sum, segment) => sum + (segment.message_count || 0), 0),
+    total_messages: detail.summary?.message_count || (detail.messages || []).length
+  };
+}
+
+function isSegmentedExportPartial(detail) {
+  if (!detail?.segments) {
+    return false;
+  }
+  const metadata = segmentExportMetadata(detail);
+  return metadata.loaded_segments < metadata.total_segments;
 }
 
 function exportRoleLabel(message) {
@@ -6167,8 +6515,14 @@ async function init() {
   els.archiveButton.addEventListener("click", () => {
     void archiveCurrentThread();
   });
+  els.historyWindowPrevButton?.addEventListener("click", () => {
+    void loadAdjacentSegment(-1);
+  });
+  els.historyWindowNextButton?.addEventListener("click", () => {
+    void loadAdjacentSegment(1);
+  });
   els.historyWindowFullButton?.addEventListener("click", () => {
-    void loadFullHistoryForCurrentThread();
+    void loadAllSegments();
   });
   els.searchInput.addEventListener("input", () => {
     state.filter = els.searchInput.value;

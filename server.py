@@ -20,7 +20,6 @@ import time
 import uuid
 from dataclasses import asdict
 from dataclasses import dataclass
-from dataclasses import replace
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -40,9 +39,6 @@ DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 SIDE_BOUNDARY_MARKER = "Side conversation boundary."
 WEBSOCKET_MARKER = "websocket event:"
 MAIN_THREAD_FILTERS = {"all", "with_side", "with_forks", "forked", "with_rollback", "archived"}
-MAIN_HISTORY_WINDOW_FULL = "full"
-MAIN_HISTORY_WINDOW_LATEST_COMPACTION = "latest_compaction"
-MAIN_HISTORY_WINDOWS = {MAIN_HISTORY_WINDOW_FULL, MAIN_HISTORY_WINDOW_LATEST_COMPACTION}
 SQLITE_OPEN_ATTEMPTS = 5
 SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
@@ -139,70 +135,153 @@ class RollbackCheckpoint:
     message_index: int | None = None
 
 
-def parse_main_history_window(value: str | None) -> str:
-    return value if value in MAIN_HISTORY_WINDOWS else MAIN_HISTORY_WINDOW_LATEST_COMPACTION
+@dataclass
+class ConversationSegment:
+    id: str
+    ordinal: int
+    start_message_index: int
+    end_message_index: int
+    message_count: int
+    start_line_number: int | None
+    end_line_number: int | None
+    start_timestamp: int | float | None
+    end_timestamp: int | float | None
+    start_time: str | None
+    end_time: str | None
+    boundary_compaction: dict[str, Any] | None = None
+    loaded: bool = False
 
 
-def apply_main_history_window(
+def conversation_segments(
     messages: list[Message],
     compactions: list[CompactionCheckpoint],
-    rollbacks: list[RollbackCheckpoint],
-    history_window: str,
-) -> tuple[
-    list[Message],
-    list[CompactionCheckpoint],
-    list[RollbackCheckpoint],
-    dict[str, Any],
-]:
-    mode = parse_main_history_window(history_window)
-    start_index = 0
-    start_checkpoint: CompactionCheckpoint | None = None
-    if mode == MAIN_HISTORY_WINDOW_LATEST_COMPACTION:
-        start_checkpoint = latest_compaction_with_message_index(compactions)
-        if start_checkpoint and isinstance(start_checkpoint.message_index, int):
-            start_index = max(0, min(start_checkpoint.message_index, len(messages)))
+) -> list[ConversationSegment]:
+    if not messages:
+        return []
 
-    display_messages = messages[start_index:] if start_index > 0 else messages
-    display_compactions = remap_checkpoints_for_history_window(compactions, start_index)
-    display_rollbacks = remap_checkpoints_for_history_window(rollbacks, start_index)
-    metadata = {
-        "mode": mode,
-        "truncated": start_index > 0,
-        "start_message_index": start_index,
-        "shown_message_count": len(display_messages),
-        "total_message_count": len(messages),
-        "checkpoint": asdict(start_checkpoint) if start_index > 0 and start_checkpoint else None,
-    }
-    return display_messages, display_compactions, display_rollbacks, metadata
-
-
-def latest_compaction_with_message_index(
-    compactions: list[CompactionCheckpoint],
-) -> CompactionCheckpoint | None:
-    indexed = [
-        checkpoint
-        for checkpoint in compactions
-        if isinstance(checkpoint.message_index, int)
-    ]
-    if not indexed:
-        return None
-    return max(indexed, key=lambda checkpoint: checkpoint.message_index or 0)
-
-
-def remap_checkpoints_for_history_window(
-    checkpoints: list[CompactionCheckpoint] | list[RollbackCheckpoint],
-    start_index: int,
-) -> list[CompactionCheckpoint] | list[RollbackCheckpoint]:
-    if start_index <= 0:
-        return checkpoints
-    remapped = []
-    for checkpoint in checkpoints:
+    starts: dict[int, CompactionCheckpoint | None] = {0: None}
+    for checkpoint in sorted(
+        compactions,
+        key=lambda item: item.message_index if isinstance(item.message_index, int) else -1,
+    ):
         if not isinstance(checkpoint.message_index, int):
             continue
-        if checkpoint.message_index < start_index:
+        if checkpoint.message_index < 0 or checkpoint.message_index >= len(messages):
             continue
-        remapped.append(replace(checkpoint, message_index=checkpoint.message_index - start_index))
-    return remapped
+        starts.setdefault(checkpoint.message_index, checkpoint)
+
+    ordered_starts = sorted(starts.items())
+    segments: list[ConversationSegment] = []
+    for index, (start, boundary) in enumerate(ordered_starts):
+        end_exclusive = (
+            ordered_starts[index + 1][0]
+            if index + 1 < len(ordered_starts)
+            else len(messages)
+        )
+        if start >= end_exclusive:
+            continue
+        segment_id = f"segment-{len(segments) + 1}"
+        segment_messages = messages[start:end_exclusive]
+        segments.append(
+            ConversationSegment(
+                id=segment_id,
+                ordinal=len(segments) + 1,
+                start_message_index=start,
+                end_message_index=end_exclusive - 1,
+                message_count=end_exclusive - start,
+                start_line_number=segment_messages[0].line_number,
+                end_line_number=segment_messages[-1].line_number,
+                start_timestamp=segment_messages[0].timestamp,
+                end_timestamp=segment_messages[-1].timestamp,
+                start_time=segment_messages[0].time,
+                end_time=segment_messages[-1].time,
+                boundary_compaction=asdict(boundary) if boundary else None,
+            )
+        )
+    return segments
+
+
+def segment_for_message_index(
+    segments: list[ConversationSegment], message_index: int | None
+) -> ConversationSegment | None:
+    if not isinstance(message_index, int):
+        return None
+    for segment in segments:
+        if segment.start_message_index <= message_index <= segment.end_message_index:
+            return segment
+    return None
+
+
+def segment_by_id(
+    segments: list[ConversationSegment], segment_id: str | None
+) -> ConversationSegment | None:
+    if not segment_id:
+        return None
+    for segment in segments:
+        if segment.id == segment_id:
+            return segment
+    return None
+
+
+def latest_segment(segments: list[ConversationSegment]) -> ConversationSegment | None:
+    return segments[-1] if segments else None
+
+
+def active_user_turn_counts_after(messages: list[Message]) -> list[int]:
+    counts = [0] * len(messages)
+    count = 0
+    for index in range(len(messages) - 1, -1, -1):
+        counts[index] = count
+        message = messages[index]
+        if (
+            message.role == "user"
+            and not message.rolled_back
+            and isinstance(message.line_number, int)
+        ):
+            count += 1
+    return counts
+
+
+def message_dicts_for_segment(
+    messages: list[Message],
+    segments: list[ConversationSegment],
+    segment: ConversationSegment,
+) -> list[dict[str, Any]]:
+    turn_counts_after = active_user_turn_counts_after(messages)
+    result = []
+    for index in range(segment.start_message_index, segment.end_message_index + 1):
+        message = asdict(messages[index])
+        message["global_message_index"] = index
+        message["segment_id"] = segment.id
+        message["active_user_turns_after"] = turn_counts_after[index]
+        result.append(message)
+    return result
+
+
+def checkpoint_dicts_with_segments(
+    checkpoints: list[CompactionCheckpoint] | list[RollbackCheckpoint],
+    segments: list[ConversationSegment],
+) -> list[dict[str, Any]]:
+    result = []
+    for checkpoint in checkpoints:
+        item = asdict(checkpoint)
+        segment = segment_for_message_index(segments, checkpoint.message_index)
+        item["global_message_index"] = checkpoint.message_index
+        item["segment_id"] = segment.id if segment else None
+        result.append(item)
+    return result
+
+
+def segment_dicts(
+    segments: list[ConversationSegment], loaded_segment_ids: set[str] | None = None
+) -> list[dict[str, Any]]:
+    loaded_segment_ids = loaded_segment_ids or set()
+    result = []
+    for segment in segments:
+        item = asdict(segment)
+        item["loaded"] = segment.id in loaded_segment_ids
+        result.append(item)
+    return result
 
 
 @dataclass
@@ -690,6 +769,16 @@ class SideConversationReader:
         self.rollout_rollback_cache: dict[str, tuple[int, int, bool]] = {}
         self.rollout_parent_cache: dict[str, tuple[int, int, str | None]] = {}
         self.rollout_search_text_cache: dict[str, tuple[int, int, str, list[tuple[str, str]]]] = {}
+        self.main_rollout_detail_cache: dict[
+            str,
+            tuple[
+                int,
+                int,
+                list[Message],
+                list[CompactionCheckpoint],
+                list[RollbackCheckpoint],
+            ],
+        ] = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -1149,12 +1238,39 @@ class SideConversationReader:
                 (1 if archived else 0,),
             ).fetchall()
 
+    def main_rollout_messages_and_checkpoints(
+        self, rollout_path: str | None
+    ) -> tuple[list[Message], list[CompactionCheckpoint], list[RollbackCheckpoint]]:
+        if not rollout_path:
+            return [], [], []
+        path = Path(rollout_path).expanduser()
+        try:
+            stat = path.stat()
+        except OSError:
+            return [], [], []
+
+        cache_key = str(path)
+        cached = self.main_rollout_detail_cache.get(cache_key)
+        if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2], cached[3], cached[4]
+
+        messages = self.rollout_messages(str(path))
+        compactions = self.rollout_compaction_checkpoints(str(path))
+        rollbacks = self.rollout_rollback_checkpoints(str(path))
+        self.main_rollout_detail_cache[cache_key] = (
+            stat.st_mtime_ns,
+            stat.st_size,
+            messages,
+            compactions,
+            rollbacks,
+        )
+        return messages, compactions, rollbacks
+
     def main_thread_messages_and_checkpoints(
         self, row: sqlite3.Row
     ) -> tuple[list[Message], list[CompactionCheckpoint], list[RollbackCheckpoint]]:
-        messages = self.rollout_messages(row["rollout_path"])
-        compactions = self.rollout_compaction_checkpoints(row["rollout_path"])
-        rollbacks = self.rollout_rollback_checkpoints(row["rollout_path"])
+        rollout_messages, compactions, rollbacks = self.main_rollout_messages_and_checkpoints(row["rollout_path"])
+        messages = list(rollout_messages)
         messages.append(thread_metadata_message(row))
         messages.extend(self.response_metadata_messages(row["id"]))
         messages = finalize_messages(messages)
@@ -1165,14 +1281,14 @@ class SideConversationReader:
     def get_main_thread(
         self,
         thread_id: str,
-        history_window: str = MAIN_HISTORY_WINDOW_LATEST_COMPACTION,
+        segment_id: str | None = None,
     ) -> dict[str, Any]:
         row = self.main_thread_row(thread_id)
         messages, compactions, rollbacks = self.main_thread_messages_and_checkpoints(row)
         summary = self.main_summary_from_row(row, messages)
-        display_messages, display_compactions, display_rollbacks, window_metadata = (
-            apply_main_history_window(messages, compactions, rollbacks, history_window)
-        )
+        segments = conversation_segments(messages, compactions)
+        selected_segment = segment_by_id(segments, segment_id) or latest_segment(segments)
+        loaded_segment_ids = {selected_segment.id} if selected_segment else set()
         return {
             "summary": asdict(summary),
             "metadata": {
@@ -1190,12 +1306,36 @@ class SideConversationReader:
                 "git_sha": row["git_sha"],
                 "git_origin_url": row["git_origin_url"],
             },
-            "messages": [asdict(message) for message in display_messages],
-            "compactions": [asdict(checkpoint) for checkpoint in display_compactions],
-            "rollbacks": [asdict(checkpoint) for checkpoint in display_rollbacks],
-            "history_window": window_metadata,
+            "messages": (
+                message_dicts_for_segment(messages, segments, selected_segment)
+                if selected_segment
+                else []
+            ),
+            "segments": segment_dicts(segments, loaded_segment_ids),
+            "loaded_segment_ids": sorted(loaded_segment_ids),
+            "compactions": checkpoint_dicts_with_segments(compactions, segments),
+            "rollbacks": checkpoint_dicts_with_segments(rollbacks, segments),
+            "history_window": {
+                "mode": "segments",
+                "truncated": len(loaded_segment_ids) < len(segments),
+                "shown_message_count": selected_segment.message_count if selected_segment else 0,
+                "total_message_count": len(messages),
+                "segment_id": selected_segment.id if selected_segment else None,
+            },
             "related": self.related_for_main_thread(thread_id),
             "recovery_note": "Read from Codex's saved rollout transcript for this persisted session.",
+        }
+
+    def get_main_thread_segment(self, thread_id: str, segment_id: str) -> dict[str, Any]:
+        row = self.main_thread_row(thread_id)
+        messages, compactions, _rollbacks = self.main_thread_messages_and_checkpoints(row)
+        segments = conversation_segments(messages, compactions)
+        segment = segment_by_id(segments, segment_id)
+        if segment is None:
+            raise KeyError(segment_id)
+        return {
+            "segment": asdict(segment),
+            "messages": message_dicts_for_segment(messages, segments, segment),
         }
 
     def search_thread(
@@ -1204,7 +1344,6 @@ class SideConversationReader:
         thread_id: str,
         query: str,
         filters: set[str] | None = None,
-        history_window: str = MAIN_HISTORY_WINDOW_FULL,
     ) -> dict[str, Any]:
         normalized_query = query.strip()
         if not normalized_query:
@@ -1213,13 +1352,9 @@ class SideConversationReader:
         if kind == "main":
             row = self.main_thread_row(thread_id)
             messages, compactions, rollbacks = self.main_thread_messages_and_checkpoints(row)
-            messages, _, _, _ = apply_main_history_window(
-                messages,
-                compactions,
-                rollbacks,
-                history_window,
-            )
+            segments = conversation_segments(messages, compactions)
         else:
+            segments = []
             candidates = {item["id"]: item for item in self.side_candidates()}
             if thread_id not in candidates:
                 raise KeyError(thread_id)
@@ -1235,7 +1370,14 @@ class SideConversationReader:
                 continue
             count = count_occurrences(search_text.lower(), lower_query)
             if count > 0:
-                match_groups.append({"messageIndex": index, "count": count})
+                segment = segment_for_message_index(segments, index)
+                match_groups.append(
+                    {
+                        "messageIndex": index,
+                        "segmentId": segment.id if segment else None,
+                        "count": count,
+                    }
+                )
                 total_matches += count
         return {"matchGroups": match_groups, "totalMatches": total_matches}
 
@@ -4275,9 +4417,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 query = params.get("q", [""])[0]
                 filter_values = params.get("filters", [])
                 filters = parse_filter_param(filter_values[0]) if filter_values else None
-                history_window = parse_main_history_window(
-                    params.get("history_window", [MAIN_HISTORY_WINDOW_FULL])[0]
-                )
                 if not thread_id:
                     self.send_error_json(400, "Missing thread_id")
                     return
@@ -4290,7 +4429,6 @@ class AppHandler(BaseHTTPRequestHandler):
                         thread_id,
                         query,
                         filters,
-                        history_window,
                     )
                 )
             elif path == "/api/threads":
@@ -4314,13 +4452,20 @@ class AppHandler(BaseHTTPRequestHandler):
                         for item in self.reader.list_main_threads(list_filter, query, full_text)
                     ]
                 )
+            elif path.startswith("/api/main-threads/") and "/segments/" in path:
+                suffix = path.removeprefix("/api/main-threads/")
+                thread_part, segment_part = suffix.split("/segments/", 1)
+                thread_id = unquote(thread_part)
+                segment_id = unquote(segment_part)
+                if not thread_id or not segment_id:
+                    self.send_error_json(400, "Missing thread_id or segment_id")
+                    return
+                self.send_json(self.reader.get_main_thread_segment(thread_id, segment_id))
             elif path.startswith("/api/main-threads/"):
                 params = parse_qs(parsed.query)
                 thread_id = unquote(path.removeprefix("/api/main-threads/"))
-                history_window = parse_main_history_window(
-                    params.get("history_window", [MAIN_HISTORY_WINDOW_LATEST_COMPACTION])[0]
-                )
-                self.send_json(self.reader.get_main_thread(thread_id, history_window))
+                segment_id = params.get("segment_id", [None])[0]
+                self.send_json(self.reader.get_main_thread(thread_id, segment_id))
             elif path == "/api/export":
                 params = parse_qs(parsed.query)
                 thread_id = params.get("thread_id", [None])[0]
@@ -4329,9 +4474,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.send_error_json(400, "Missing thread_id")
                     return
                 if kind == "main":
-                    self.send_json(
-                        self.reader.get_main_thread(thread_id, MAIN_HISTORY_WINDOW_FULL)
-                    )
+                    self.send_json(self.reader.get_main_thread(thread_id))
                 else:
                     self.send_json(self.reader.get_thread(thread_id))
             else:

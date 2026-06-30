@@ -272,7 +272,7 @@ class PatchDiffTests(unittest.TestCase):
         self.assertEqual(server.message_text_for_filters(message, {"patch"}), message.text)
 
 
-class MainHistoryWindowTests(unittest.TestCase):
+class MainSegmentTests(unittest.TestCase):
     def message(self, index):
         return server.Message(
             role="user",
@@ -307,67 +307,52 @@ class MainHistoryWindowTests(unittest.TestCase):
             message_index=message_index,
         )
 
-    def test_latest_compaction_window_slices_messages_and_remaps_checkpoints(self):
+    def test_segments_start_at_compaction_boundaries(self):
         messages = [self.message(index) for index in range(6)]
         compactions = [self.compaction(1, 1), self.compaction(2, 4)]
-        rollbacks = [self.rollback(1, 2), self.rollback(2, 5)]
 
-        display_messages, display_compactions, display_rollbacks, metadata = (
-            server.apply_main_history_window(
-                messages,
-                compactions,
-                rollbacks,
-                server.MAIN_HISTORY_WINDOW_LATEST_COMPACTION,
-            )
+        segments = server.conversation_segments(messages, compactions)
+
+        self.assertEqual(
+            [(segment.start_message_index, segment.end_message_index) for segment in segments],
+            [(0, 0), (1, 3), (4, 5)],
         )
+        self.assertEqual([segment.id for segment in segments], ["segment-1", "segment-2", "segment-3"])
+        self.assertEqual(segments[1].boundary_compaction["ordinal"], 1)
+        self.assertEqual(segments[2].boundary_compaction["ordinal"], 2)
 
-        self.assertEqual([message.text for message in display_messages], ["message 4", "message 5"])
-        self.assertEqual([checkpoint.ordinal for checkpoint in display_compactions], [2])
-        self.assertEqual(display_compactions[0].message_index, 0)
-        self.assertEqual([checkpoint.ordinal for checkpoint in display_rollbacks], [2])
-        self.assertEqual(display_rollbacks[0].message_index, 1)
-        self.assertTrue(metadata["truncated"])
-        self.assertEqual(metadata["start_message_index"], 4)
-        self.assertEqual(metadata["shown_message_count"], 2)
-        self.assertEqual(metadata["total_message_count"], 6)
-
-    def test_latest_compaction_window_keeps_full_messages_when_no_indexed_compaction(self):
+    def test_segments_without_compactions_cover_full_conversation(self):
         messages = [self.message(index) for index in range(3)]
 
-        display_messages, display_compactions, display_rollbacks, metadata = (
-            server.apply_main_history_window(
-                messages,
-                [],
-                [],
-                server.MAIN_HISTORY_WINDOW_LATEST_COMPACTION,
-            )
-        )
+        segments = server.conversation_segments(messages, [])
 
-        self.assertEqual(display_messages, messages)
-        self.assertEqual(display_compactions, [])
-        self.assertEqual(display_rollbacks, [])
-        self.assertFalse(metadata["truncated"])
-        self.assertEqual(metadata["shown_message_count"], 3)
-        self.assertEqual(metadata["total_message_count"], 3)
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].start_message_index, 0)
+        self.assertEqual(segments[0].end_message_index, 2)
+        self.assertEqual(segments[0].message_count, 3)
 
-    def test_full_window_preserves_messages_and_checkpoint_indexes(self):
-        messages = [self.message(index) for index in range(3)]
-        compactions = [self.compaction(1, 1)]
-        rollbacks = [self.rollback(1, 2)]
+    def test_segment_message_dicts_keep_global_indexes(self):
+        messages = [self.message(index) for index in range(4)]
+        compactions = [self.compaction(1, 2)]
+        segments = server.conversation_segments(messages, compactions)
 
-        display_messages, display_compactions, display_rollbacks, metadata = (
-            server.apply_main_history_window(
-                messages,
-                compactions,
-                rollbacks,
-                server.MAIN_HISTORY_WINDOW_FULL,
-            )
-        )
+        message_dicts = server.message_dicts_for_segment(messages, segments, segments[1])
 
-        self.assertEqual(display_messages, messages)
-        self.assertEqual(display_compactions[0].message_index, 1)
-        self.assertEqual(display_rollbacks[0].message_index, 2)
-        self.assertFalse(metadata["truncated"])
+        self.assertEqual([item["text"] for item in message_dicts], ["message 2", "message 3"])
+        self.assertEqual([item["global_message_index"] for item in message_dicts], [2, 3])
+        self.assertEqual({item["segment_id"] for item in message_dicts}, {"segment-2"})
+
+    def test_checkpoint_dicts_include_containing_segment(self):
+        messages = [self.message(index) for index in range(6)]
+        compactions = [self.compaction(1, 1), self.compaction(2, 4)]
+        rollbacks = [self.rollback(1, 5)]
+        segments = server.conversation_segments(messages, compactions)
+
+        rollback_dicts = server.checkpoint_dicts_with_segments(rollbacks, segments)
+
+        self.assertEqual(rollback_dicts[0]["message_index"], 5)
+        self.assertEqual(rollback_dicts[0]["global_message_index"], 5)
+        self.assertEqual(rollback_dicts[0]["segment_id"], "segment-3")
 
 
 def create_state_db(home: Path) -> sqlite3.Connection:
