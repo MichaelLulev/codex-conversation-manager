@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import mimetypes
 import os
@@ -40,6 +41,7 @@ SIDE_BOUNDARY_MARKER = "Side conversation boundary."
 WEBSOCKET_MARKER = "websocket event:"
 MAIN_THREAD_FILTERS = {"all", "with_side", "with_forks", "forked", "with_rollback", "archived"}
 LAZY_MESSAGE_TEXT_ROLES = {"thinking", "tool", "event"}
+ROLLOUT_DETAIL_CACHE_VERSION = 1
 SQLITE_OPEN_ATTEMPTS = 5
 SQLITE_OPEN_RETRY_SECONDS = 0.08
 MAX_EVENT_BLOCK_CHARS = 120000
@@ -809,6 +811,9 @@ class SideConversationReader:
         self.logs_db = codex_home / "logs_2.sqlite"
         self.state_db = codex_home / "state_5.sqlite"
         self.history_path = codex_home / "history.jsonl"
+        cache_root = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+        self.cache_dir = cache_root / "codex-conversation-manager"
+        self.rollout_detail_cache_dir = self.cache_dir / "rollout-details"
         self.rollout_rollback_cache: dict[str, tuple[int, int, bool]] = {}
         self.rollout_parent_cache: dict[str, tuple[int, int, str | None]] = {}
         self.rollout_search_text_cache: dict[str, tuple[int, int, str, list[tuple[str, str]]]] = {}
@@ -916,38 +921,36 @@ class SideConversationReader:
         candidates = self.side_candidates()
         ids = {candidate["id"] for candidate in candidates}
         history = self.history_entries(ids)
+        thread_ids_by_process = self.thread_ids_by_process(
+            {
+                process_uuid
+                for candidate in candidates
+                if isinstance((process_uuid := candidate.get("process_uuid")), str)
+            }
+        )
         summaries: list[SideThreadSummary] = []
         for candidate in candidates:
             thread_id = candidate["id"]
-            assistant = self.assistant_messages(thread_id)
-            messages = self.conversation(thread_id, history.get(thread_id), assistant)
-            user_count = sum(1 for message in messages if message.role == "user")
-            assistant_count = sum(1 for message in messages if message.role == "assistant")
-            preview = self.preview_text(messages)
             metadata = self.thread_metadata(thread_id)
-            parent_thread_id = self.side_parent_thread_id(
+            process_uuid = candidate.get("process_uuid")
+            process_thread_ids = (
+                set(thread_ids_by_process.get(process_uuid, set())) - {thread_id}
+                if isinstance(process_uuid, str)
+                else set()
+            )
+            parent_thread_id = self.side_parent_thread_id_from_process_ids(
                 thread_id,
                 candidate["started_at"],
                 metadata.get("cwd"),
-                candidate.get("process_uuid"),
+                process_thread_ids,
             )
-            summary = SideThreadSummary(
-                id=thread_id,
-                started_at=candidate["started_at"],
-                ended_at=candidate["ended_at"],
-                started=local_time(candidate["started_at"]),
-                ended=local_time(candidate["ended_at"]),
-                log_rows=candidate["log_rows"],
-                user_count=user_count,
-                assistant_count=assistant_count,
-                message_count=len(messages),
-                preview=preview,
-                cwd=metadata.get("cwd"),
-                model=metadata.get("model"),
-                app_version=metadata.get("app_version"),
-                has_persisted_thread=candidate["has_persisted_thread"],
-                parent_thread_id=parent_thread_id,
-                meta_label=f"{user_count} user, {assistant_count} assistant",
+            messages = self.side_messages_for_summary(thread_id, history.get(thread_id))
+            summary = self.side_summary_from_candidate(
+                candidate,
+                history.get(thread_id),
+                metadata,
+                parent_thread_id,
+                messages,
             )
             if normalized_query:
                 summary_match = summary_matches_search(summary, normalized_query)
@@ -960,6 +963,104 @@ class SideConversationReader:
                     continue
                 summary.search_match = text_match
             summaries.append(summary)
+        return summaries
+
+    def side_messages_for_summary(
+        self, thread_id: str, history: list[Message] | None = None
+    ) -> list[Message]:
+        assistant = self.assistant_messages(thread_id)
+        return self.conversation(thread_id, history, assistant)
+
+    def side_parent_thread_id_for_candidate(
+        self, candidate: dict[str, Any], metadata: dict[str, str | None] | None = None
+    ) -> str | None:
+        thread_id = candidate["id"]
+        metadata = metadata if metadata is not None else self.thread_metadata(thread_id)
+        return self.side_parent_thread_id(
+            thread_id,
+            candidate["started_at"],
+            metadata.get("cwd"),
+            candidate.get("process_uuid"),
+        )
+
+    def side_summary_from_candidate(
+        self,
+        candidate: dict[str, Any],
+        history: list[Message] | None = None,
+        metadata: dict[str, str | None] | None = None,
+        parent_thread_id: str | None = None,
+        messages: list[Message] | None = None,
+    ) -> SideThreadSummary:
+        thread_id = candidate["id"]
+        metadata = metadata if metadata is not None else self.thread_metadata(thread_id)
+        messages = (
+            messages
+            if messages is not None
+            else self.side_messages_for_summary(thread_id, history)
+        )
+        user_count = sum(1 for message in messages if message.role == "user")
+        assistant_count = sum(1 for message in messages if message.role == "assistant")
+        if parent_thread_id is None:
+            parent_thread_id = self.side_parent_thread_id_for_candidate(candidate, metadata)
+        return SideThreadSummary(
+            id=thread_id,
+            started_at=candidate["started_at"],
+            ended_at=candidate["ended_at"],
+            started=local_time(candidate["started_at"]),
+            ended=local_time(candidate["ended_at"]),
+            log_rows=candidate["log_rows"],
+            user_count=user_count,
+            assistant_count=assistant_count,
+            message_count=len(messages),
+            preview=self.preview_text(messages),
+            cwd=metadata.get("cwd"),
+            model=metadata.get("model"),
+            app_version=metadata.get("app_version"),
+            has_persisted_thread=candidate["has_persisted_thread"],
+            parent_thread_id=parent_thread_id,
+            meta_label=f"{user_count} user, {assistant_count} assistant",
+        )
+
+    def side_threads_for_parent(self, parent_thread_id: str) -> list[SideThreadSummary]:
+        candidates = self.side_candidates()
+        thread_ids_by_process = self.thread_ids_by_process(
+            {
+                process_uuid
+                for candidate in candidates
+                if isinstance((process_uuid := candidate.get("process_uuid")), str)
+            }
+        )
+        matches: list[tuple[dict[str, Any], dict[str, str | None], str]] = []
+        for candidate in candidates:
+            metadata = self.thread_metadata(candidate["id"])
+            process_uuid = candidate.get("process_uuid")
+            process_thread_ids = (
+                set(thread_ids_by_process.get(process_uuid, set())) - {candidate["id"]}
+                if isinstance(process_uuid, str)
+                else set()
+            )
+            candidate_parent_id = self.side_parent_thread_id_from_process_ids(
+                candidate["id"],
+                candidate["started_at"],
+                metadata.get("cwd"),
+                process_thread_ids,
+            )
+            if candidate_parent_id == parent_thread_id:
+                matches.append((candidate, metadata, candidate_parent_id))
+
+        if not matches:
+            return []
+        history = self.history_entries({candidate["id"] for candidate, _metadata, _parent in matches})
+        summaries = [
+            self.side_summary_from_candidate(
+                candidate,
+                history.get(candidate["id"]),
+                metadata,
+                candidate_parent_id,
+            )
+            for candidate, metadata, candidate_parent_id in matches
+        ]
+        summaries.sort(key=lambda item: (item.started_at or 0, item.id))
         return summaries
 
     def get_thread(self, thread_id: str) -> dict[str, Any]:
@@ -1297,9 +1398,25 @@ class SideConversationReader:
         if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
             return cached[2], cached[3], cached[4]
 
-        messages = self.rollout_messages(str(path))
-        compactions = self.rollout_compaction_checkpoints(str(path))
-        rollbacks = self.rollout_rollback_checkpoints(str(path))
+        persistent = self.load_persistent_rollout_details(path, stat)
+        if persistent is not None:
+            messages, compactions, rollbacks = persistent
+            self.main_rollout_detail_cache[cache_key] = (
+                stat.st_mtime_ns,
+                stat.st_size,
+                messages,
+                compactions,
+                rollbacks,
+            )
+            return messages, compactions, rollbacks
+
+        messages, compactions, rollbacks = self.parse_main_rollout_details(path)
+        try:
+            final_stat = path.stat()
+        except OSError:
+            return messages, compactions, rollbacks
+        if final_stat.st_mtime_ns != stat.st_mtime_ns or final_stat.st_size != stat.st_size:
+            return messages, compactions, rollbacks
         self.main_rollout_detail_cache[cache_key] = (
             stat.st_mtime_ns,
             stat.st_size,
@@ -1307,6 +1424,168 @@ class SideConversationReader:
             compactions,
             rollbacks,
         )
+        self.write_persistent_rollout_details(path, stat, messages, compactions, rollbacks)
+        return messages, compactions, rollbacks
+
+    def persistent_rollout_detail_path(self, rollout_path: Path) -> Path:
+        source = str(rollout_path)
+        digest = hashlib.sha256(source.encode("utf-8", errors="surrogatepass")).hexdigest()
+        return self.rollout_detail_cache_dir / f"{digest}.json"
+
+    def load_persistent_rollout_details(
+        self, path: Path, stat: os.stat_result
+    ) -> tuple[list[Message], list[CompactionCheckpoint], list[RollbackCheckpoint]] | None:
+        cache_path = self.persistent_rollout_detail_path(path)
+        try:
+            with cache_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("version") != ROLLOUT_DETAIL_CACHE_VERSION:
+                return None
+            if payload.get("source_path") != str(path):
+                return None
+            if payload.get("mtime_ns") != stat.st_mtime_ns:
+                return None
+            if payload.get("size") != stat.st_size:
+                return None
+            messages = [Message(**item) for item in payload.get("messages", [])]
+            compactions = [
+                CompactionCheckpoint(**item)
+                for item in payload.get("compactions", [])
+            ]
+            rollbacks = [
+                RollbackCheckpoint(**item)
+                for item in payload.get("rollbacks", [])
+            ]
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+        return messages, compactions, rollbacks
+
+    def write_persistent_rollout_details(
+        self,
+        path: Path,
+        stat: os.stat_result,
+        messages: list[Message],
+        compactions: list[CompactionCheckpoint],
+        rollbacks: list[RollbackCheckpoint],
+    ) -> None:
+        cache_path = self.persistent_rollout_detail_path(path)
+        tmp_path = cache_path.with_name(
+            f"{cache_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        payload = {
+            "version": ROLLOUT_DETAIL_CACHE_VERSION,
+            "source_path": str(path),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "messages": [asdict(message) for message in messages],
+            "compactions": [asdict(checkpoint) for checkpoint in compactions],
+            "rollbacks": [asdict(checkpoint) for checkpoint in rollbacks],
+        }
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp_path, cache_path)
+        except OSError:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    def parse_main_rollout_details(
+        self, path: Path
+    ) -> tuple[list[Message], list[CompactionCheckpoint], list[RollbackCheckpoint]]:
+        messages: list[Message] = []
+        compactions: list[CompactionCheckpoint] = []
+        rollbacks: list[RollbackCheckpoint] = []
+        last_compacted_line: int | None = None
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        item = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+
+                    message = self.message_from_rollout_event(item)
+                    if message is not None and message.text.strip():
+                        message.line_number = line_number
+                        messages.append(message)
+
+                    payload = item.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+
+                    item_type = item.get("type")
+                    compaction_kind: str | None = None
+                    if item_type == "compacted":
+                        compaction_kind = "compacted"
+                        last_compacted_line = line_number
+                    elif (
+                        item_type == "event_msg"
+                        and payload.get("type") == "context_compacted"
+                    ):
+                        if (
+                            last_compacted_line is not None
+                            and line_number - last_compacted_line <= 8
+                        ):
+                            compaction_kind = None
+                        else:
+                            compaction_kind = "context_compacted"
+                    if compaction_kind is not None:
+                        timestamp = timestamp_from_iso(item.get("timestamp"))
+                        compactions.append(
+                            CompactionCheckpoint(
+                                ordinal=len(compactions) + 1,
+                                line_number=line_number,
+                                copy_line_count=line_number - 1,
+                                timestamp=timestamp,
+                                time=local_time(timestamp),
+                                kind=compaction_kind,
+                                label=(
+                                    "Compacted summary"
+                                    if compaction_kind == "compacted"
+                                    else "Compaction event"
+                                ),
+                                summary=compaction_checkpoint_summary(
+                                    payload, compaction_kind
+                                ),
+                            )
+                        )
+
+                    if (
+                        item_type == "event_msg"
+                        and payload.get("type") == "thread_rolled_back"
+                    ):
+                        rollback_turns_value = payload.get("num_turns")
+                        rollback_turns = (
+                            int(rollback_turns_value)
+                            if isinstance(rollback_turns_value, int | float)
+                            else None
+                        )
+                        timestamp = timestamp_from_iso(item.get("timestamp"))
+                        count = rollback_turns if rollback_turns is not None else "unknown"
+                        turn_label = "turn" if rollback_turns == 1 else "turns"
+                        rollbacks.append(
+                            RollbackCheckpoint(
+                                ordinal=len(rollbacks) + 1,
+                                line_number=line_number,
+                                copy_line_count=line_number - 1,
+                                timestamp=timestamp,
+                                time=local_time(timestamp),
+                                rollback_turns=rollback_turns,
+                                summary=f"Rolled back {count} {turn_label}",
+                            )
+                        )
+        except OSError:
+            return [], [], []
+        messages = finalize_messages(messages)
+        annotate_rolled_back_messages(messages)
         return messages, compactions, rollbacks
 
     def main_thread_messages_and_checkpoints(
@@ -2258,12 +2537,7 @@ class SideConversationReader:
         except KeyError:
             pass
         forks = [asdict(item) for item in self.fork_children(thread_id)]
-        side_threads = [
-            asdict(item)
-            for item in self.list_threads()
-            if item.parent_thread_id == thread_id
-        ]
-        side_threads.sort(key=lambda item: (item["started_at"] or 0, item["id"]))
+        side_threads = [asdict(item) for item in self.side_threads_for_parent(thread_id)]
         return {
             "parents": parents,
             "forks": forks,
@@ -2332,9 +2606,22 @@ class SideConversationReader:
         cwd: str | None,
         process_uuid: str | None,
     ) -> str | None:
+        process_thread_ids = self.thread_ids_for_process(process_uuid, side_thread_id)
+        return self.side_parent_thread_id_from_process_ids(
+            side_thread_id, started_at, cwd, process_thread_ids
+        )
+
+    def side_parent_thread_id_from_process_ids(
+        self,
+        side_thread_id: str,
+        started_at: int | None,
+        cwd: str | None,
+        process_thread_ids: set[str],
+    ) -> str | None:
         if started_at is None:
             return None
-        process_thread_ids = self.thread_ids_for_process(process_uuid, side_thread_id)
+        process_thread_ids = set(process_thread_ids)
+        process_thread_ids.discard(side_thread_id)
         try:
             candidates = self.parent_candidates_for_side(started_at, cwd, process_thread_ids)
             if not candidates and cwd:
@@ -2352,6 +2639,33 @@ class SideConversationReader:
 
         candidates.sort(key=score, reverse=True)
         return candidates[0]["id"]
+
+    def thread_ids_by_process(self, process_uuids: set[str]) -> dict[str, set[str]]:
+        process_uuids = {item for item in process_uuids if item}
+        if not process_uuids:
+            return {}
+        placeholders = ",".join("?" for _ in process_uuids)
+        try:
+            with connect_readonly(self.logs_db) as conn:
+                rows = conn.execute(
+                    f"""
+                    select distinct process_uuid, thread_id
+                    from logs
+                    where process_uuid in ({placeholders})
+                      and thread_id is not null
+                      and thread_id != ''
+                    """,
+                    tuple(process_uuids),
+                ).fetchall()
+        except sqlite3.Error:
+            return {}
+        by_process: dict[str, set[str]] = {process_uuid: set() for process_uuid in process_uuids}
+        for row in rows:
+            process_uuid = row["process_uuid"]
+            thread_id = row["thread_id"]
+            if isinstance(process_uuid, str) and isinstance(thread_id, str):
+                by_process.setdefault(process_uuid, set()).add(thread_id)
+        return by_process
 
     def thread_ids_for_process(self, process_uuid: str | None, side_thread_id: str) -> set[str]:
         if not process_uuid:
