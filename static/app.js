@@ -132,6 +132,9 @@ const state = {
     resolve: null,
     previousFocus: null
   },
+  eventDialog: {
+    previousFocus: null
+  },
   askCodex: {
     requestId: 0,
     serverRequestId: null,
@@ -227,6 +230,12 @@ const els = {
   confirmModalDetails: document.getElementById("confirm-modal-details"),
   confirmCancelButton: document.getElementById("confirm-cancel-button"),
   confirmConfirmButton: document.getElementById("confirm-confirm-button"),
+  eventModal: document.getElementById("event-modal"),
+  eventModalDialog: document.getElementById("event-modal-dialog"),
+  eventModalTitle: document.getElementById("event-modal-title"),
+  eventModalMeta: document.getElementById("event-modal-meta"),
+  eventModalContent: document.getElementById("event-modal-content"),
+  eventModalCloseButton: document.getElementById("event-modal-close-button"),
   messagesFrame: document.getElementById("messages-frame"),
   messagesDocument: null,
   messages: null
@@ -335,6 +344,99 @@ function keepFocusInConfirmDialog(event) {
   }
 }
 
+function setupEventModal() {
+  els.eventModalCloseButton.addEventListener("click", closeEventModal);
+  els.eventModal.addEventListener("click", (event) => {
+    if (event.target?.dataset?.eventClose !== undefined) {
+      closeEventModal();
+    }
+  });
+  els.eventModal.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeEventModal();
+      return;
+    }
+    if (event.key === "Tab") {
+      keepFocusInEventDialog(event);
+    }
+  });
+}
+
+function keepFocusInEventDialog(event) {
+  const focusable = [...els.eventModal.querySelectorAll(
+    'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
+  )];
+  if (focusable.length === 0) {
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus({ preventScroll: true });
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus({ preventScroll: true });
+  }
+}
+
+function closeEventModal() {
+  if (els.eventModal.classList.contains("hidden")) {
+    return;
+  }
+  els.eventModal.classList.add("hidden");
+  els.eventModalContent.replaceChildren();
+  els.eventModalTitle.textContent = "Event details";
+  els.eventModalMeta.textContent = "";
+  const previousFocus = state.eventDialog.previousFocus;
+  state.eventDialog.previousFocus = null;
+  if (previousFocus && typeof previousFocus.focus === "function" && previousFocus.isConnected) {
+    window.requestAnimationFrame(() => {
+      previousFocus.focus({ preventScroll: true });
+    });
+  }
+}
+
+async function openMessageDetailModalForWrapper(wrapper, opener = null) {
+  const messageIndex = Number(wrapper?.dataset?.messageIndex);
+  const originalMessage = wrapper?.__message || messageByGlobalIndex(messageIndex);
+  if (!originalMessage) {
+    return null;
+  }
+  state.eventDialog.previousFocus = opener || document.activeElement;
+  const heading = collapsedMessageHeading(messagePreviewText(originalMessage)) || "Event details";
+  els.eventModalTitle.textContent = heading;
+  els.eventModalMeta.textContent = messageSourceLine(originalMessage);
+  els.eventModalContent.replaceChildren(document.createTextNode("Loading event details..."));
+  els.eventModal.classList.remove("hidden");
+  window.requestAnimationFrame(() => {
+    els.eventModalCloseButton.focus({ preventScroll: true });
+  });
+
+  const loadedMessage = await ensureMessageTextLoaded(originalMessage, messageIndex);
+  if (wrapper?.isConnected) {
+    wrapper.__message = loadedMessage;
+    wrapper.__messageText = messageFullText(loadedMessage);
+    wrapper.__messageTextOmitted = isMessageTextOmitted(loadedMessage);
+  }
+  els.eventModalMeta.textContent = messageSourceLine(loadedMessage);
+  renderMessageBodyContent(
+    els.eventModalContent,
+    messageFullText(loadedMessage),
+    wrapper?.__messageRenderMode || "full"
+  );
+  return els.eventModalContent;
+}
+
+function messageSourceLine(message) {
+  const phase = message?.phase ? ` | ${message.phase}` : "";
+  const rollback = message?.rolled_back
+    ? ` | rolled back${message.rolled_back_at ? ` at ${message.rolled_back_at}` : ""}`
+    : "";
+  return `${text(message?.time)} | ${text(message?.source)}${phase}${rollback}`;
+}
+
 function setupMessagesFrame() {
   const frame = els.messagesFrame;
   const doc = frame?.contentDocument || frame?.contentWindow?.document;
@@ -384,13 +486,124 @@ function setupMessagesFrame() {
   scheduleMessagesFrameSync({ frames: 6, delays: [40, 120, 300, 800], force: true });
 }
 
-function scrollAnchorForElement(element, segmentId) {
+function scrollAnchorForCurrentViewport() {
+  if (!els.messages) {
+    return null;
+  }
+  const messagesRect = els.messages.getBoundingClientRect();
+  const selector = [
+    ".message[data-message-index]",
+    ".tool-run[data-tool-run-start]",
+    ".rollback-group[data-rollback-group-start]",
+    ".segment-gap[data-segment-id]"
+  ].join(", ");
+  let best = null;
+  for (const element of els.messages.querySelectorAll(selector)) {
+    const rect = element.getBoundingClientRect();
+    if (rect.bottom < messagesRect.top || rect.top > messagesRect.bottom) {
+      continue;
+    }
+    const descriptor = scrollAnchorDescriptorForElement(element);
+    if (!descriptor) {
+      continue;
+    }
+    const visibleTop = Math.max(rect.top, messagesRect.top);
+    const distance = Math.abs(visibleTop - messagesRect.top);
+    if (!best || distance < best.distance) {
+      best = {
+        ...descriptor,
+        top: rect.top,
+        scrollTop: els.messages.scrollTop,
+        distance
+      };
+    }
+  }
+  return best || { type: "scrollTop", scrollTop: els.messages.scrollTop };
+}
+
+function scrollAnchorDescriptorForElement(element) {
   if (!element) {
     return null;
   }
+  if (element.classList.contains("message")) {
+    return {
+      type: "message",
+      messageIndex: Number(element.dataset.messageIndex)
+    };
+  }
+  if (element.classList.contains("tool-run")) {
+    return {
+      type: "toolRun",
+      startIndex: Number(element.dataset.toolRunStart)
+    };
+  }
+  if (element.classList.contains("rollback-group")) {
+    return {
+      type: "rollbackGroup",
+      groupId: element.dataset.rollbackGroupId || "",
+      startIndex: Number(element.dataset.rollbackGroupStart)
+    };
+  }
+  if (element.classList.contains("segment-gap")) {
+    return {
+      type: "segmentGap",
+      segmentId: element.dataset.segmentId || ""
+    };
+  }
+  return null;
+}
+
+function elementForScrollAnchor(anchor) {
+  if (!anchor || !els.messages) {
+    return null;
+  }
+  if (anchor.type === "message" && Number.isInteger(anchor.messageIndex)) {
+    return els.messages.querySelector(`.message[data-message-index="${anchor.messageIndex}"]`);
+  }
+  if (anchor.type === "toolRun" && Number.isInteger(anchor.startIndex)) {
+    return els.messages.querySelector(`.tool-run[data-tool-run-start="${anchor.startIndex}"]`);
+  }
+  if (anchor.type === "rollbackGroup") {
+    if (anchor.groupId) {
+      const byId = els.messages.querySelector(
+        `.rollback-group[data-rollback-group-id="${cssSelectorString(anchor.groupId)}"]`
+      );
+      if (byId) {
+        return byId;
+      }
+    }
+    if (Number.isInteger(anchor.startIndex)) {
+      return els.messages.querySelector(`.rollback-group[data-rollback-group-start="${anchor.startIndex}"]`);
+    }
+  }
+  if (anchor.type === "segmentGap" && anchor.segmentId) {
+    const gap = els.messages.querySelector(
+      `.segment-gap[data-segment-id="${cssSelectorString(anchor.segmentId)}"]`
+    );
+    if (gap) {
+      return gap;
+    }
+    return firstRenderedElementForSegment(anchor.segmentId);
+  }
+  return null;
+}
+
+function cssSelectorString(value) {
+  if (window.CSS?.escape) {
+    return CSS.escape(String(value));
+  }
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function scrollAnchorForElement(element) {
+  const descriptor = scrollAnchorDescriptorForElement(element);
+  if (!descriptor) {
+    return null;
+  }
   return {
-    segmentId,
-    top: element.getBoundingClientRect().top
+    ...descriptor,
+    top: element.getBoundingClientRect().top,
+    scrollTop: els.messages?.scrollTop || 0
   };
 }
 
@@ -988,9 +1201,16 @@ async function loadMainSegment(segmentId, options = {}) {
     if (state.currentThread?.summary?.id !== threadId) {
       return false;
     }
+    const shouldPreserveViewport = options.preserveViewport !== false && !state.pendingScrollTarget;
+    const scrollAnchor = options.scrollAnchor !== undefined
+      ? options.scrollAnchor
+      : (shouldPreserveViewport && !options.deferRender ? scrollAnchorForCurrentViewport() : null);
     mergeLoadedSegment(result.segment, result.messages || []);
     if (!options.deferRender) {
-      renderSegmentedConversationAfterLoad(options);
+      renderSegmentedConversationAfterLoad({
+        ...options,
+        scrollAnchor
+      });
     }
     return true;
   })();
@@ -1137,12 +1357,13 @@ async function loadAllSegments() {
   if (!hasSegmentedConversation(detail)) {
     return false;
   }
+  const scrollAnchor = scrollAnchorForCurrentViewport();
   for (const segment of detail.segments || []) {
     if (!isSegmentLoaded(segment.id, detail)) {
       await loadMainSegment(segment.id, { scheduleSearch: false, deferRender: true });
     }
   }
-  renderSegmentedConversationAfterLoad();
+  renderSegmentedConversationAfterLoad({ scrollAnchor });
   return true;
 }
 
@@ -1841,8 +2062,14 @@ function restorePendingSegmentScrollAnchor() {
   if (!anchor || !els.messages) {
     return;
   }
-  const element = firstRenderedElementForSegment(anchor.segmentId);
+  const element = elementForScrollAnchor(anchor);
   if (!element) {
+    if (Number.isFinite(anchor.scrollTop)) {
+      els.messages.scrollTop = Math.max(0, Math.min(
+        anchor.scrollTop,
+        els.messages.scrollHeight - els.messages.clientHeight
+      ));
+    }
     return;
   }
   const delta = element.getBoundingClientRect().top - anchor.top;
@@ -2925,7 +3152,7 @@ function renderSegmentGap(segment) {
   button.textContent = "Load segment";
   wrapper.addEventListener("click", () => {
     void loadMainSegment(segment.id, {
-      scrollAnchor: scrollAnchorForElement(wrapper, segment.id)
+      scrollAnchor: scrollAnchorForElement(wrapper)
     });
   });
 
@@ -3711,10 +3938,11 @@ async function setActiveConversationMatch(index, { scroll = true, expandCollapse
   }
   let activeElement = wrapper;
   if (wrapper) {
+    let expandedBody = null;
     if (wrapper.classList.contains("collapsed") && expandCollapsed) {
-      await expandCollapsedMessage(wrapper);
+      expandedBody = await expandCollapsedMessage(wrapper);
     }
-    const body = wrapper.querySelector(".message-body");
+    const body = expandedBody || wrapper.querySelector(".message-body");
     const mark = body && !body.hidden
       ? highlightNthSearchInElement(
         body,
@@ -3726,7 +3954,12 @@ async function setActiveConversationMatch(index, { scroll = true, expandCollapse
     if (mark) {
       state.conversationSearch.activeMarks = [mark];
     }
-    activeElement = mark || wrapper;
+    if (mark && els.eventModal.contains(mark)) {
+      mark.scrollIntoView({ block: "center", inline: "nearest" });
+      activeElement = null;
+    } else {
+      activeElement = mark || wrapper;
+    }
   }
   state.conversationSearch.activeIndex = normalizedIndex;
   updateConversationSearchControls();
@@ -3803,8 +4036,9 @@ function renderMessage(message, index = 0, options = {}) {
   const bodyRenderMode = shouldUseDiffOnlyView(message) ? "diffs" : "full";
   const collapseRolledBack = message.rolled_back && !options.insideRollbackGroup;
   const isCollapsible = bodyRenderMode !== "diffs" && (COLLAPSED_MESSAGE_ROLES.has(message.role) || collapseRolledBack);
-  const shouldLazyRenderBody = isCollapsible;
-  const isExpanded = isCollapsible && state.expandedMessages.has(index);
+  const opensModal = isCollapsible && message.role === "event";
+  const shouldLazyRenderBody = isCollapsible && !opensModal;
+  const isExpanded = isCollapsible && !opensModal && state.expandedMessages.has(index);
   if (isCollapsible && !isExpanded) {
     wrapper.classList.add("collapsed");
   }
@@ -3819,8 +4053,13 @@ function renderMessage(message, index = 0, options = {}) {
     roleElement.type = "button";
     roleElement.className = "message-toggle";
     roleElement.tabIndex = -1;
-    roleElement.setAttribute("aria-expanded", String(isExpanded));
-    roleElement.setAttribute("aria-controls", bodyId);
+    if (opensModal) {
+      roleElement.setAttribute("aria-haspopup", "dialog");
+      roleElement.title = "Open event details";
+    } else {
+      roleElement.setAttribute("aria-expanded", String(isExpanded));
+      roleElement.setAttribute("aria-controls", bodyId);
+    }
 
     const icon = document.createElement("span");
     icon.className = "message-toggle-icon";
@@ -3857,15 +4096,18 @@ function renderMessage(message, index = 0, options = {}) {
 
   let body = null;
   if (isCollapsible) {
-    if (shouldLazyRenderBody) {
-      wrapper.dataset.bodyId = bodyId;
-      wrapper.__message = message;
-      wrapper.__messageIndex = index;
-      wrapper.__messageText = messageFullText(message);
-      wrapper.__messageTextOmitted = isMessageTextOmitted(message);
-      wrapper.__messageRenderMode = bodyRenderMode;
-    }
+    wrapper.dataset.bodyId = bodyId;
+    wrapper.dataset.openMode = opensModal ? "modal" : "inline";
+    wrapper.__message = message;
+    wrapper.__messageIndex = index;
+    wrapper.__messageText = messageFullText(message);
+    wrapper.__messageTextOmitted = isMessageTextOmitted(message);
+    wrapper.__messageRenderMode = bodyRenderMode;
     roleElement.addEventListener("click", () => {
+      if (opensModal) {
+        void openMessageDetailModalForWrapper(wrapper, roleElement);
+        return;
+      }
       body = body || ensureLazyMessageBody(wrapper);
       void setCollapsedMessageExpanded(
         wrapper,
@@ -3875,7 +4117,9 @@ function renderMessage(message, index = 0, options = {}) {
       );
     });
   }
-  if (shouldLazyRenderBody && !isExpanded) {
+  if (opensModal) {
+    body = null;
+  } else if (shouldLazyRenderBody && !isExpanded) {
     body = null;
   } else {
     body = document.createElement("div");
@@ -4570,10 +4814,14 @@ function updateMessageCount(visible, total) {
 async function expandCollapsedMessage(wrapper) {
   const toggle = wrapper.querySelector(".message-toggle");
   if (!toggle) {
-    return;
+    return null;
+  }
+  if (wrapper.dataset.openMode === "modal") {
+    return openMessageDetailModalForWrapper(wrapper, toggle);
   }
   const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
   await setCollapsedMessageExpanded(wrapper, body, toggle, true);
+  return body;
 }
 
 function ensureLazyMessageBody(wrapper) {
@@ -6006,18 +6254,25 @@ async function scrollToConversationNavigationTarget(target) {
       : `Message ${target.messageIndex + 1} is hidden by the current filters.`;
     return deferred;
   }
+  let expandedBody = null;
   if (wrapper.classList.contains("collapsed")) {
-    await expandCollapsedMessage(wrapper);
+    expandedBody = await expandCollapsedMessage(wrapper);
   }
 
   if (target.quote) {
-    const body = wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
-    await ensureMessageBodyRenderedAsync(body);
-    body.hidden = false;
+    const body = expandedBody || wrapper.querySelector(".message-body") || ensureLazyMessageBody(wrapper);
+    if (body !== els.eventModalContent) {
+      await ensureMessageBodyRenderedAsync(body);
+      body.hidden = false;
+    }
     const mark = highlightAskCodexTargetInElement(body, target.quote);
     if (mark) {
       state.askCodex.activeMarks = [mark];
-      scrollElementIntoMessages(mark);
+      if (els.eventModal.contains(mark)) {
+        mark.scrollIntoView({ block: "center", inline: "nearest" });
+      } else {
+        scrollElementIntoMessages(mark);
+      }
       wrapper.classList.add("branch-link-focus");
       window.setTimeout(() => wrapper.classList.remove("branch-link-focus"), 1600);
       els.askCodexStatus.textContent = `Scrolled to text in message ${target.messageIndex + 1}.`;
@@ -6719,6 +6974,7 @@ function showConversationError(error) {
 
 async function init() {
   setupConfirmModal();
+  setupEventModal();
   installThreadPanelControls();
   els.refreshButton.addEventListener("click", async () => {
     try {

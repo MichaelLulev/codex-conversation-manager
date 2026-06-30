@@ -169,6 +169,21 @@
       </section>
     </div>
 
+    <div id="event-modal" class="confirm-modal event-modal hidden" role="dialog" aria-modal="true" aria-labelledby="event-modal-title">
+      <div class="confirm-modal-backdrop" data-event-close></div>
+      <section id="event-modal-dialog" class="confirm-dialog event-dialog" tabindex="-1">
+        <div class="event-dialog-head">
+          <div class="event-dialog-copy">
+            <span class="confirm-dialog-kicker">Transcript event</span>
+            <h2 id="event-modal-title">Event details</h2>
+            <p id="event-modal-meta"></p>
+          </div>
+          <button id="event-modal-close-button" type="button" aria-label="Close event details">Close</button>
+        </div>
+        <div id="event-modal-content" class="event-dialog-content message-body"></div>
+      </section>
+    </div>
+
     <script src="/static/app.js"></script>
   </body>
 </html>

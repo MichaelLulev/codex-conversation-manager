@@ -2047,6 +2047,52 @@ button:disabled {
   color: white;
 }
 
+.event-modal {
+  align-items: stretch;
+  justify-items: center;
+}
+
+.event-dialog {
+  width: min(1100px, 100%);
+  max-height: calc(100vh - (var(--page-pad) * 2));
+  overflow: hidden;
+  grid-template-rows: auto minmax(0, 1fr);
+  box-shadow: none;
+}
+
+.event-dialog-head {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space);
+}
+
+.event-dialog-copy {
+  min-width: 0;
+}
+
+.event-dialog-copy h2 {
+  overflow-wrap: anywhere;
+}
+
+.event-dialog-copy p {
+  margin: var(--space-xs) 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
+}
+
+.event-dialog-content {
+  min-height: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fbfcfd;
+}
+
 @media (max-width: 908px) {
   .topbar {
     align-items: flex-start;
