@@ -115,7 +115,6 @@ const state = {
   messagesFrameResizeObserver: null,
   messagesFrameSyncTimers: [],
   messagesFrameSyncPending: false,
-  messagesFrameScrollbarWidth: null,
   expandedMessages: new Set(),
   expandedToolRuns: new Set(),
   toolRunByMessageIndex: new Map(),
@@ -482,9 +481,7 @@ function syncMessagesFrameViewport(options = {}) {
   }
   const frameRect = frame.getBoundingClientRect();
   const viewRect = els.conversationView.getBoundingClientRect();
-  const contentWidth = Math.max(1, Math.round(viewRect.width));
-  const scrollbarWidth = measureMessagesFrameScrollbarWidth(doc);
-  const width = contentWidth + scrollbarWidth;
+  const width = Math.max(1, Math.round(viewRect.width));
   const height = Math.max(1, Math.round(viewRect.bottom - frameRect.top));
   if (width <= 1 || height <= 1) {
     return false;
@@ -519,30 +516,6 @@ function syncMessagesFrameViewport(options = {}) {
     void root.offsetWidth;
   }
   return changed;
-}
-
-function measureMessagesFrameScrollbarWidth(doc) {
-  if (state.messagesFrameScrollbarWidth !== null) {
-    return state.messagesFrameScrollbarWidth;
-  }
-  const probe = doc.createElement("div");
-  probe.style.cssText = [
-    "position:absolute",
-    "top:-9999px",
-    "left:-9999px",
-    "width:100px",
-    "height:100px",
-    "overflow:scroll",
-    "visibility:hidden"
-  ].join(";");
-  const child = doc.createElement("div");
-  child.style.width = "200px";
-  child.style.height = "200px";
-  probe.appendChild(child);
-  doc.body.appendChild(probe);
-  state.messagesFrameScrollbarWidth = Math.max(0, probe.offsetWidth - probe.clientWidth);
-  probe.remove();
-  return state.messagesFrameScrollbarWidth;
 }
 
 function modeConfig() {
