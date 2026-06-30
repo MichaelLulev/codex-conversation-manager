@@ -481,7 +481,7 @@ function syncMessagesFrameViewport(options = {}) {
   }
   const frameRect = frame.getBoundingClientRect();
   const viewRect = els.conversationView.getBoundingClientRect();
-  const width = Math.max(1, Math.round(viewRect.width));
+  const width = Math.max(1, Math.round(conversationContentWidth() || viewRect.width));
   const height = Math.max(1, Math.round(viewRect.bottom - frameRect.top));
   if (width <= 1 || height <= 1) {
     return false;
@@ -516,6 +516,16 @@ function syncMessagesFrameViewport(options = {}) {
     void root.offsetWidth;
   }
   return changed;
+}
+
+function conversationContentWidth() {
+  if (!els.conversationHeader) {
+    return 0;
+  }
+  const style = window.getComputedStyle(els.conversationHeader);
+  const paddingStart = parseFloat(style.paddingInlineStart) || 0;
+  const paddingEnd = parseFloat(style.paddingInlineEnd) || 0;
+  return els.conversationHeader.clientWidth - paddingStart - paddingEnd;
 }
 
 function modeConfig() {
